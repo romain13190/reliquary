@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+.venv/
+
+# Secrets — hotkey private keys must never be committed
+wallet_deploy/
+.env
+
+# Local Claude Code state
+.claude/
