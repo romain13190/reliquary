@@ -67,6 +67,10 @@ def mine(
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+        # Use 2 GPUs when available (vllm on 0, HF proof on 1). Fall back to
+        # sharing GPU 0 for test boxes that only expose one device.
+        proof_device = "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0"
+
         vllm_model = AutoModelForCausalLM.from_pretrained(
             checkpoint,
             torch_dtype=torch.bfloat16,
@@ -77,7 +81,7 @@ def mine(
             checkpoint,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
-        ).to("cuda:1").eval()
+        ).to(proof_device).eval()
 
         env = load_environment(environment)
         engine = MiningEngine(
@@ -86,6 +90,7 @@ def mine(
             tokenizer,
             wallet,
             env,
+            proof_gpu=0 if proof_device == "cuda:0" else 1,
             validator_url_override=validator_url or None,
         )
 
@@ -94,7 +99,14 @@ def mine(
         while True:
             try:
                 current_block = await subtensor.get_current_block()
-                window_start = (current_block // WINDOW_LENGTH) * WINDOW_LENGTH
+                # Mine the window the validator is currently open on — same
+                # formula as ValidationService._compute_target_window: the
+                # validator processes the window that JUST ENDED so there is
+                # time for late submissions; miners must target that same
+                # window or their POSTs 404 (validator not open on it yet).
+                window_start = (
+                    (current_block // WINDOW_LENGTH) * WINDOW_LENGTH - WINDOW_LENGTH
+                )
                 if window_start > last_window:
                     await engine.mine_window(
                         subtensor, window_start, use_drand=use_drand
