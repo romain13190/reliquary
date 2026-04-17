@@ -14,27 +14,66 @@ usable as training data without trusting any individual miner.
 ## What Reliquary does today
 
 Every ~60 s window the network produces up to **256 verified rollouts**
-(8 prompts × 32 completions/slot) from a pinned reference checkpoint. The
-cycle:
+(8 prompts × 32 completions/slot) from a pinned reference checkpoint.
+The cycle:
 
 1. **Beacon** → miners and validators derive 8 identical prompts from
    `drand ⊕ block_hash`.
-2. **Rollout market** → miners compete per slot by reading the validator's
-   reward histogram (`/window/{n}/state`) and targeting the
-   under-represented reward class. Each batch is atomically verified
-   (GRAIL proof + diversity + signature) or rejected as a whole.
-3. **Settlement** → at 32 accepted completions or 60 s timeout, the slot
-   freezes. Scoring is advantage-based:
-   `score(c) = |c.reward − mean_slot| / std_slot`. Rare class pays more,
-   degenerate slots (`std = 0`) pay zero.
+2. **Rollout market** → miners compete per slot. Each validator exposes
+   a live reward histogram at `/window/{n}/state`; miners read it and
+   target the under-represented reward class to maximise their payout.
+   Each batch is atomically verified (GRAIL proof + diversity +
+   signature) or rejected as a whole.
+3. **Settlement** → the slot freezes at 32 accepted completions or 60 s,
+   whichever comes first. No quota is enforced during collection —
+   balance is a market outcome, not a rule.
 4. **Publication** → the full dataset (prompts + completions + rewards)
    is gzipped and uploaded to R2 at `reliquary/dataset/window-{n}.json.gz`.
 5. **Weights** → every 72 windows (~72 min) the validator aggregates
-   per-miner scores (superlinear exponent 4 for sybil resistance) plus
-   unused budget → `UID_BURN`, and calls `set_weights` on chain.
+   per-miner scores (superlinear exponent 4 for sybil resistance) and
+   routes the unclaimed budget to `UID_BURN` on chain.
 
 The deliverable **today** is the stream of verified GRPO-ready datasets.
 A downstream trainer — any party, any model — can consume it.
+
+---
+
+## The mechanism
+
+Reliquary does not pay miners for *work*. It pays them for **signal** —
+the GRPO-usable information each completion brings to its slot. The
+scoring rule applied after a slot freezes is:
+
+```
+score(c) = |c.reward − mean_slot| / std_slot
+```
+
+Three consequences fall out of that formula, and together they are the
+core of the design:
+
+**Self-balancing without a quota.** A slot that already has 28 corrects
+and 4 wrongs pays ~5× more per wrong than per correct. Miners read
+`/state` live and pivot toward whatever class is scarce. The 50/50
+equilibrium emerges from the incentive; it is never enforced by a cap.
+
+**Collective burn as a coordination device.** A degenerate slot
+(`std = 0`, e.g. {32, 0}) pays *zero* to everyone — even the miners who
+submitted valid completions. The emission share that a balanced slot
+would have produced is explicitly routed to `UID_BURN`. A miner cannot
+monopolise a class without destroying their own payout, which turns
+diversification into a Nash equilibrium rather than a good deed.
+
+**Fixed budget, not re-normalised.** The notional budget per window is
+`PROMPTS_PER_WINDOW × GROUP_SIZE = 256` units of |advantage|. What
+miners fail to claim *burns*; it is not redistributed to the miners who
+did show up. The economic weight of each completion stays stable across
+windows regardless of how many miners compete, and lazy windows
+genuinely shrink supply instead of inflating the remaining participants.
+
+**Signal, not tokens.** The |z-score| formulation is the information
+content of a completion in a GRPO update. The R2 dataset a downstream
+trainer consumes is already filtered and weighted by learning value —
+the market prices exactly what the trainer would have priced anyway.
 
 ---
 
