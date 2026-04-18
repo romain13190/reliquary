@@ -31,6 +31,11 @@ if [ "${RELIQUARY_USE_DRAND:-1}" != "1" ]; then
   drand_flag="--no-use-drand"
 fi
 
+axon_args=""
+if [ -n "${RELIQUARY_EXTERNAL_IP:-}" ]; then
+  axon_args="--external-ip ${RELIQUARY_EXTERNAL_IP} --external-port ${RELIQUARY_EXTERNAL_PORT:-$HTTP_PORT}"
+fi
+
 nohup .venv/bin/python -m reliquary.cli.main validate \
     --network "$BT_NETWORK" \
     --netuid "$NETUID" \
@@ -40,7 +45,7 @@ nohup .venv/bin/python -m reliquary.cli.main validate \
     --http-host "$HTTP_HOST" \
     --http-port "$HTTP_PORT" \
     --log-level INFO \
-    $drand_flag \
+    $drand_flag $axon_args \
     > "$LOG_FILE" 2>&1 &
 
 echo $! > "$PID_FILE"

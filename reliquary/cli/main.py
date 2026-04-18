@@ -133,6 +133,18 @@ def validate(
     environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name"),
     http_host: str = typer.Option("0.0.0.0", help="HTTP bind address"),
     http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port"),
+    external_ip: str = typer.Option(
+        "",
+        help=(
+            "Public IP this validator is reachable at. Published on-chain via "
+            "serve_axon so miners can discover it through the metagraph. "
+            "Leave empty to skip publishing (miners then need --validator-url)."
+        ),
+    ),
+    external_port: int = typer.Option(
+        0,
+        help="Public port to advertise on-chain; defaults to --http-port when 0.",
+    ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Run Reliquary validator."""
@@ -181,6 +193,8 @@ def validate(
             use_drand=use_drand,
             http_host=http_host,
             http_port=http_port,
+            external_ip=external_ip or None,
+            external_port=(external_port or http_port) if external_ip else None,
         )
         await service.run(subtensor)
 

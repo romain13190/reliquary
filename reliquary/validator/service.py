@@ -42,6 +42,8 @@ class ValidationService:
         use_drand: bool = True,
         http_host: str = "0.0.0.0",
         http_port: int = VALIDATOR_HTTP_PORT,
+        external_ip: str | None = None,
+        external_port: int | None = None,
     ) -> None:
         self.wallet = wallet
         self.model = model
@@ -49,6 +51,8 @@ class ValidationService:
         self.env = env
         self.netuid = netuid
         self.use_drand = use_drand
+        self.external_ip = external_ip
+        self.external_port = external_port
 
         self._last_processed_window: int = -1
         self._miner_scores: defaultdict[str, float] = defaultdict(float)
@@ -59,6 +63,7 @@ class ValidationService:
 
     async def run(self, subtensor) -> None:
         await self.server.start()
+        await self._serve_axon_on_chain(subtensor)
         logger.info(
             "Validator started: env=%s, netuid=%d, http=%s:%d, rolling_windows=%d",
             self.env.name, self.netuid, self.server.host, self.server.port,
@@ -87,6 +92,55 @@ class ValidationService:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
             await self.server.stop()
+
+    async def _serve_axon_on_chain(self, subtensor) -> None:
+        """Publish this validator's axon (ip:port) to the chain metagraph.
+
+        Miners read `metagraph.axons[uid].ip/port` via `discover_validator_url`
+        to route their submissions. Skipped with a warning when no external
+        address is configured — miners then need `--validator-url` overrides
+        to find this validator.
+        """
+        if not self.external_ip or not self.external_port:
+            logger.warning(
+                "serve_axon skipped: no external_ip/external_port provided. "
+                "Miners won't discover this validator via metagraph; use "
+                "--validator-url on the miner side."
+            )
+            return
+        try:
+            import bittensor as bt
+
+            axon = bt.Axon(
+                wallet=self.wallet,
+                ip=self.external_ip,
+                port=self.external_port,
+                external_ip=self.external_ip,
+                external_port=self.external_port,
+            )
+            response = await subtensor.serve_axon(
+                netuid=self.netuid,
+                axon=axon,
+                wait_for_inclusion=True,
+                wait_for_finalization=False,
+                raise_error=False,
+            )
+            success = getattr(response, "is_success", None)
+            if success is False:
+                logger.error(
+                    "serve_axon failed: %s:%d not published (response=%s). "
+                    "Likely: hotkey not registered on netuid %d, or chain rejected.",
+                    self.external_ip, self.external_port, response, self.netuid,
+                )
+                return
+            logger.info(
+                "serve_axon published: %s:%d announced on netuid %d",
+                self.external_ip, self.external_port, self.netuid,
+            )
+        except Exception:
+            logger.exception(
+                "serve_axon threw — miners will have to use --validator-url"
+            )
 
     async def _run_window(self, subtensor, target_window: int) -> None:
         randomness = await self._derive_randomness(subtensor, target_window)
