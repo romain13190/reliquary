@@ -72,21 +72,27 @@ def test_submit_409_on_window_mismatch(
     assert r.json()["detail"] == "window_mismatch"
 
 
-def test_submit_delegates_to_batcher(
+def test_submit_queues_for_async_verification(
     server: ValidatorServer, client: TestClient
 ) -> None:
+    """/submit returns 200/queued immediately and drops the request on the
+    async queue — the worker (not exercised by TestClient) does the actual
+    GRAIL verify off-thread. See reliquary/validator/server.py::_submit_worker.
+    """
     fake_batcher = MagicMock()
     fake_batcher.window_start = 1000
-    fake_batcher.accept_submission.return_value = SubmissionResponse(
-        accepted=True, reason="ok", settled=False, slot_count=4
-    )
+    # batcher.slots[idx].count is read to populate the early response
+    fake_batcher.slots = [MagicMock(count=0) for _ in range(8)]
     server.set_active_batcher(fake_batcher)
+
     r = client.post("/submit", json=_payload())
     assert r.status_code == 200
     body = r.json()
     assert body["accepted"] is True
-    assert body["slot_count"] == 4
-    assert fake_batcher.accept_submission.called
+    assert body["reason"] == "queued"
+    # Worker isn't started in the TestClient fixture, so the item should still
+    # be sitting on the queue.
+    assert server._submit_queue.qsize() == 1
 
 
 def test_window_state_404_when_no_batcher(client: TestClient) -> None:

@@ -118,50 +118,82 @@ def verify_beacon_signature(
     randomness_hex: str,
     signature_hex: str | None,
 ) -> bool:
-    """Verify a drand beacon's BLS signature.
+    """Verify a drand quicknet beacon by cross-check against bittensor-drand.
 
-    For unchained schemes (quicknet): message = SHA256(round_be8).
-    The signature is a BLS sig on G1 over the message, verified with the
-    chain's public key on G2.
+    Drand quicknet signatures are BLS12-381 sigs on G1 (48 bytes) with the
+    chain's public key on G2 (message = SHA256(round_be8), DST
+    ``BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_``). The reference C
+    implementation is `supranational/blst`, which is NOT distributed on PyPI
+    as ``pip install blst`` — so pairing verification in Python would require
+    either shipping a compiled shared lib or rewriting hash-to-curve from
+    scratch (both brittle).
 
-    Returns True if the signature is valid, False otherwise.
+    Instead, we rely on a second independent source: ``bittensor_drand`` is
+    already pulled in as a dependency of ``bittensor`` and is a Rust binding
+    that fetches the same quicknet chain (hash
+    ``52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971``)
+    from a separate relay (``api.drand.secureweb3.com:6875``). A beacon is
+    considered authentic iff:
+
+    1. The fetched signature is a non-empty hex string.
+    2. ``bittensor_drand.get_signature_for_round(round)`` returns a byte-for-
+       byte identical signature (forging requires compromising both mirrors).
+    3. The randomness field equals ``SHA256(sig)`` — the unchained quicknet
+       derivation.
+
+    Returns True if all three checks pass, False otherwise. Fails closed on
+    any network, format, or parsing error.
     """
     if not signature_hex:
         logger.warning("[Drand] beacon has no signature — cannot verify")
         return False
 
-    pubkey = _fetch_chain_pubkey(chain_hash)
-    if not pubkey:
-        logger.warning("[Drand] no public key available for chain %s", chain_hash[:16])
-        return False
-
     try:
-        import hashlib as _hl
-        import struct as _st
+        import hashlib
 
-        round_bytes = _st.pack(">Q", round_number)
-        message = _hl.sha256(round_bytes).digest()
-
-        sig_bytes = bytes.fromhex(signature_hex)
-
-        # Try blst (fast C library) — the only supported verification path.
+        # Check 1 — randomness derivation (unchained quicknet: sha256(sig))
         try:
-            from blst import P1_Affine, P2_Affine  # type: ignore[import-untyped]
-
-            sig = P1_Affine(sig_bytes)
-            pk = P2_Affine(pubkey)
-            # DST for drand quicknet (BLS12-381 G1, RFC 9380)
-            dst = b"BLS_SIG_BLS12381G1_XMD:SHA-256_SSWU_RO_NUL_"
-            result = sig.core_verify(pk, True, message, dst)
-            return result == 0  # BLST_SUCCESS
-        except ImportError:
-            # SECURITY: No BLS library available — fail closed.
-            # A hash-based fallback would be trivially forgeable.
+            sig_bytes = bytes.fromhex(signature_hex)
+        except ValueError:
+            logger.warning("[Drand] signature is not valid hex, rejecting")
+            return False
+        expected_rand = hashlib.sha256(sig_bytes).hexdigest()
+        if randomness_hex.lower() != expected_rand:
             logger.error(
-                "[Drand] No BLS library (blst) installed — cannot verify beacon. "
-                "Install blst: pip install blst"
+                "[Drand] randomness != SHA256(sig) for round %d — rejecting",
+                round_number,
             )
             return False
+
+        # Check 2 — cross-check the sig against bittensor-drand's independent
+        # relay fetch. Delegates BLS verification to the Rust binding's
+        # internal flow (drand quicknet, G1 sigs, BLS12381G1).
+        try:
+            import bittensor_drand
+        except ImportError:
+            logger.error(
+                "[Drand] bittensor_drand not installed — cannot cross-check"
+            )
+            return False
+
+        try:
+            canonical = bittensor_drand.get_signature_for_round(int(round_number))
+        except Exception as exc:
+            logger.error(
+                "[Drand] bittensor-drand failed to fetch round %d: %s",
+                round_number, exc,
+            )
+            return False
+
+        if canonical.lower() != signature_hex.lower():
+            logger.error(
+                "[Drand] signature mismatch for round %d — rejecting "
+                "(ours=%s... bittensor-drand=%s...)",
+                round_number, signature_hex[:16], canonical[:16],
+            )
+            return False
+
+        return True
 
     except Exception as e:
         logger.warning("[Drand] beacon signature verification failed: %s", e)

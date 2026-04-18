@@ -44,7 +44,11 @@ class ValidatorServer:
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
-        self._submit_queue: asyncio.Queue | None = None
+        # Queue is created eagerly so the /submit handler can enqueue even
+        # when the server is running under a TestClient (where start()/the
+        # worker are never invoked). Late-binding to the running loop is fine
+        # on Python 3.10+ since asyncio.Queue is loop-agnostic at init.
+        self._submit_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task[Any] | None = None
 
     def set_active_batcher(self, batcher: WindowBatcher | None) -> None:
@@ -69,7 +73,6 @@ class ValidatorServer:
                 raise HTTPException(status_code=503, detail="no_active_window")
             if request.window_start != batcher.window_start:
                 raise HTTPException(status_code=409, detail="window_mismatch")
-            assert self._submit_queue is not None, "server not started"
             await self._submit_queue.put((request, batcher))
             return SubmissionResponse(
                 accepted=True,
@@ -91,7 +94,6 @@ class ValidatorServer:
 
     async def _submit_worker(self) -> None:
         """Drain the submit queue and verify each request off the event loop."""
-        assert self._submit_queue is not None
         while True:
             try:
                 request, batcher = await self._submit_queue.get()
@@ -133,7 +135,6 @@ class ValidatorServer:
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
-        self._submit_queue = asyncio.Queue()
         self._worker_task = asyncio.create_task(self._submit_worker())
         # Yield once so uvicorn can bind before the caller proceeds.
         await asyncio.sleep(0)
