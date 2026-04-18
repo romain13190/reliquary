@@ -24,7 +24,10 @@ logger = logging.getLogger(__name__)
 
 # Retry configuration: 3 attempts, exponential backoff 1s / 2s / 4s.
 _RETRY_DELAYS = (1.0, 2.0, 4.0)
-_DEFAULT_TIMEOUT = 30.0
+# Default timeout is generous: the validator may need several seconds to verify
+# a submission even in the async-queue path (the queue can back up under load).
+# Miners running against slow links (Targon port-forward etc.) benefit further.
+_DEFAULT_TIMEOUT = 60.0
 
 
 class NoValidatorFoundError(RuntimeError):
@@ -116,7 +119,10 @@ async def _post_with_retry(
                 resp = await cli.post(full_url, json=json_payload, timeout=timeout)
             except (httpx.RequestError, httpx.TimeoutException) as e:
                 last_exc = e
-                logger.debug("submit attempt %d failed (transport): %s", attempt, e)
+                logger.warning(
+                    "submit attempt %d to %s failed: %r (type=%s)",
+                    attempt, full_url, e, type(e).__name__,
+                )
                 if attempt < len(_RETRY_DELAYS):
                     await asyncio.sleep(delay)
                 continue
