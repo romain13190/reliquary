@@ -188,7 +188,11 @@ class ValidationService:
 
             archive = batcher.get_archive_data()
             try:
-                await storage.upload_window_dataset(target_window, archive)
+                await storage.upload_window_dataset(
+                    target_window,
+                    archive,
+                    validator_hotkey=self.wallet.hotkey.ss58_address,
+                )
             except Exception:
                 logger.exception("Failed to upload window dataset")
         finally:

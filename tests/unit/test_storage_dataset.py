@@ -79,3 +79,27 @@ async def test_upload_window_dataset_uses_env_bucket_when_not_provided(
         await upload_window_dataset(42, {"slots": []})
 
     assert captured["bucket"] == "from-env"
+
+
+@pytest.mark.asyncio
+async def test_upload_window_dataset_scopes_key_by_validator_hotkey() -> None:
+    """When validator_hotkey is provided the object key is prefixed so multiple
+    validators can share one bucket without clobbering each other's windows."""
+    captured: dict[str, object] = {}
+
+    async def _put(Bucket: str, Key: str, Body: bytes) -> None:
+        captured["key"] = Key
+
+    fake_client = MagicMock(put_object=_put)
+
+    @asynccontextmanager
+    async def _fake_get_client(**kwargs):
+        yield fake_client
+
+    hk = "5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF"
+    with patch("reliquary.infrastructure.storage.get_s3_client", _fake_get_client):
+        await upload_window_dataset(
+            7987940, {"slots": []}, validator_hotkey=hk, bucket_name="b"
+        )
+
+    assert captured["key"] == f"reliquary/dataset/{hk}/window-7987940.json.gz"

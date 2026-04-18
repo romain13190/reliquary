@@ -195,23 +195,34 @@ async def upload_window_rollouts(
 
 
 async def upload_window_dataset(
-    window_start: int, data: dict, **client_kwargs
+    window_start: int,
+    data: dict,
+    *,
+    validator_hotkey: str | None = None,
+    **client_kwargs,
 ) -> bool:
     """Upload the settled GRPO dataset (prompt + 32 completions + rewards) for a window.
 
     The output of this is the actual deliverable of the network: a stream of
     {prompt, completions, rewards} bundles ready to feed a training pipeline.
-    Stored under `reliquary/dataset/window-{n}.json.gz`.
+    Stored under ``reliquary/dataset/<validator_hotkey>/window-{n}.json.gz``
+    when a hotkey is provided (the standard production path — each validator's
+    output is scoped under its own prefix so multiple validators can share a
+    bucket without clobbering), or ``reliquary/dataset/window-{n}.json.gz``
+    when no hotkey is given (legacy / single-validator shortcut).
     """
-    key = f"reliquary/dataset/window-{window_start}.json.gz"
+    if validator_hotkey:
+        key = f"reliquary/dataset/{validator_hotkey}/window-{window_start}.json.gz"
+    else:
+        key = f"reliquary/dataset/window-{window_start}.json.gz"
     payload = json.dumps(data, separators=(",", ":")).encode()
     compressed = gzip.compress(payload)
     async with get_s3_client(**client_kwargs) as client:
         bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
         await client.put_object(Bucket=bucket, Key=key, Body=compressed)
     logger.info(
-        "Uploaded GRPO dataset for window %d (%d slots, %d bytes)",
-        window_start, len(data.get("slots", [])), len(compressed),
+        "Uploaded GRPO dataset for window %d (%d slots, %d bytes, key=%s)",
+        window_start, len(data.get("slots", [])), len(compressed), key,
     )
     return True
 
