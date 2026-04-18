@@ -45,19 +45,39 @@ async def set_weights(
     uids: list[int],
     weights: list[float],
 ) -> bool:
-    """Submit weights on-chain."""
+    """Submit weights on-chain.
+
+    Returns True only when the chain reports success. A rejected extrinsic
+    (no validator permit, rate limit, bad weights, etc.) does NOT raise — it
+    comes back as ``ExtrinsicResponse(success=False, message=...)`` — so we
+    inspect the response explicitly instead of trusting "no exception ==
+    success".
+
+    bittensor's own ``set_weights`` already retries transient failures up to
+    ``max_attempts=5`` times across consecutive blocks, so external retry
+    wrapping here would be redundant.
+    """
     try:
-        result = await subtensor.set_weights(
+        response = await subtensor.set_weights(
             wallet=wallet,
             netuid=netuid,
             uids=uids,
             weights=weights,
         )
-        logger.info("set_weights result: %s", result)
-        return True
     except Exception as e:
-        logger.error("set_weights failed: %s", e)
+        logger.error("set_weights raised: %s", e, exc_info=True)
         return False
+
+    success = bool(getattr(response, "success", False))
+    if success:
+        logger.info("set_weights OK — %d uids committed", len(uids))
+        return True
+    msg = getattr(response, "message", None) or "<no message>"
+    err = getattr(response, "error", None)
+    logger.error(
+        "set_weights rejected by chain: %s (error=%r)", msg, err,
+    )
+    return False
 
 
 def compute_drand_round_for_window(

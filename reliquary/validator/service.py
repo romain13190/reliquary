@@ -81,9 +81,23 @@ class ValidationService:
                     self._last_processed_window = target_window
                     self._windows_in_interval += 1
                     if self._windows_in_interval >= ROLLING_WINDOWS:
-                        await self._submit_weights(subtensor)
-                        self._miner_scores.clear()
-                        self._burn_accumulated = 0.0
+                        submitted = await self._submit_weights(subtensor)
+                        # Only reset the score accumulator when the chain
+                        # actually accepted our weights. If the extrinsic was
+                        # rejected (e.g. no validator_permit yet, weights rate
+                        # limit, network blip beyond bittensor's own 5 retries)
+                        # we keep the scores so the next attempt reflects
+                        # everything we've observed since the last successful
+                        # submission, not just the windows since the last try.
+                        if submitted:
+                            self._miner_scores.clear()
+                            self._burn_accumulated = 0.0
+                        else:
+                            logger.warning(
+                                "set_weights did not succeed — keeping %d "
+                                "hotkey scores and burn=%.2f for next cycle",
+                                len(self._miner_scores), self._burn_accumulated,
+                            )
                         self._windows_in_interval = 0
                 except asyncio.CancelledError:
                     raise
@@ -212,7 +226,9 @@ class ValidationService:
             )
         return chain.compute_window_randomness(block_hash)
 
-    async def _submit_weights(self, subtensor) -> None:
+    async def _submit_weights(self, subtensor) -> bool:
+        """Submit accumulated weights on-chain. Returns True iff the chain
+        reports the extrinsic succeeded (not merely "no exception")."""
         scores = dict(self._miner_scores)
         burn = self._burn_accumulated
         miner_weights, burn_weight = compute_weights(scores, burn_score=burn)
@@ -237,10 +253,12 @@ class ValidationService:
         if burn_weight > 0:
             uids.append(UID_BURN)
             weight_vals.append(burn_weight)
-        if uids:
-            await chain.set_weights(
-                subtensor, self.wallet, self.netuid, uids, weight_vals,
-            )
+        if not uids:
+            logger.info("No non-zero weights to submit; nothing to do.")
+            return True
+        return await chain.set_weights(
+            subtensor, self.wallet, self.netuid, uids, weight_vals,
+        )
 
     @staticmethod
     def _compute_target_window(current_block: int) -> int:
