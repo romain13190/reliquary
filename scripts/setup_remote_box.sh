@@ -11,9 +11,9 @@
 
 set -e
 
-REPO_URL="${RELIQUARY_REPO_URL:-https://github.com/romain13190/Catalyst.git}"
+REPO_URL="${RELIQUARY_REPO_URL:-https://github.com/romain13190/reliquary.git}"
 BRANCH="${RELIQUARY_BRANCH:-main}"
-INSTALL_DIR="${RELIQUARY_INSTALL_DIR:-/root/Catalyst}"
+INSTALL_DIR="${RELIQUARY_INSTALL_DIR:-/root/reliquary}"
 
 echo "[setup] apt install python3.12-venv + git"
 apt update -qq
