@@ -1,8 +1,11 @@
 """FastAPI server: receives miner submissions, exposes window state.
 
 The server holds a reference to the active `WindowBatcher`, which is rotated
-by the validator service at the start of each window. All verification work
-happens inside the batcher; the server is a thin adapter.
+by the validator service at the start of each window. /submit drops requests
+on an asyncio queue and returns immediately; a worker drains the queue and
+runs `accept_submission` in a worker thread so heavy GRAIL verifs don't block
+HTTP responses (otherwise large bodies from real miners would spend the whole
+miner budget waiting for the verifier to return).
 """
 
 from __future__ import annotations
@@ -41,6 +44,8 @@ class ValidatorServer:
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
+        self._submit_queue: asyncio.Queue | None = None
+        self._worker_task: asyncio.Task[Any] | None = None
 
     def set_active_batcher(self, batcher: WindowBatcher | None) -> None:
         self.active_batcher = batcher
@@ -64,8 +69,14 @@ class ValidatorServer:
                 raise HTTPException(status_code=503, detail="no_active_window")
             if request.window_start != batcher.window_start:
                 raise HTTPException(status_code=409, detail="window_mismatch")
-            # Verification can be CPU/GPU heavy. Run off the event loop.
-            return await asyncio.to_thread(batcher.accept_submission, request)
+            assert self._submit_queue is not None, "server not started"
+            await self._submit_queue.put((request, batcher))
+            return SubmissionResponse(
+                accepted=True,
+                reason="queued",
+                settled=False,
+                slot_count=batcher.slots[request.slot_index].count,
+            )
 
         @app.get(
             "/window/{window_start}/state", response_model=WindowStateResponse
@@ -78,8 +89,39 @@ class ValidatorServer:
 
         return app
 
+    async def _submit_worker(self) -> None:
+        """Drain the submit queue and verify each request off the event loop."""
+        assert self._submit_queue is not None
+        while True:
+            try:
+                request, batcher = await self._submit_queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                response = await asyncio.to_thread(
+                    batcher.accept_submission, request
+                )
+                if response.accepted:
+                    logger.info(
+                        "accepted slot %d from %s (count=%d)",
+                        request.slot_index,
+                        request.miner_hotkey[:12],
+                        response.slot_count,
+                    )
+                else:
+                    logger.warning(
+                        "rejected slot %d from %s: %s",
+                        request.slot_index,
+                        request.miner_hotkey[:12],
+                        response.reason,
+                    )
+            except Exception:
+                logger.exception(
+                    "submission worker failed on slot %d", request.slot_index
+                )
+
     async def start(self) -> None:
-        """Start uvicorn in the background; idempotent."""
+        """Start uvicorn + submit worker in the background; idempotent."""
         if self._task is not None:
             return
         config = uvicorn.Config(
@@ -91,11 +133,16 @@ class ValidatorServer:
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
+        self._submit_queue = asyncio.Queue()
+        self._worker_task = asyncio.create_task(self._submit_worker())
         # Yield once so uvicorn can bind before the caller proceeds.
         await asyncio.sleep(0)
         logger.info("Validator HTTP server listening on %s:%d", self.host, self.port)
 
     async def stop(self) -> None:
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            self._worker_task = None
         if self._server is not None:
             self._server.should_exit = True
         if self._task is not None:
