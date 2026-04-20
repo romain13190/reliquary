@@ -42,23 +42,24 @@ batch-inclusion bonus for the first 8 in the "apprenable zone".
   the most recent drand round they saw.
 - Validator re-computes rewards locally (must match miner's claims),
   verifies GRAIL per completion, filters on `k ∈ [2, 6]`, then admits the
-  first 8 valid submissions (FIFO by signed round, distinct prompts) into
-  the training batch.
-- Payment is **flat within tier**: all batch members split BATCH_POOL
-  equally; all participation members split PARTICIPATION_POOL equally.
+  first 8 valid submissions (FIFO by signed round, distinct prompts, not
+  in cooldown) into the training batch.
+- Payment is **flat across the 8 batch members**. Everyone outside the
+  batch earns **zero**. Submissions on prompts currently in cooldown are
+  hard-rejected at `/submit` (cheap early exit, no GRAIL compute).
 
 ### Why this works
 
-**No cherry-pick incentive in payment.** Flat payment within tier means a
-miner who cherry-picks to push `k` from 3 to 4 earns **the same** as one
-who honestly hits `k=2`. The only economic lever is "are you in the
-batch?" — answered by speed, not by `k` quality.
+**No cherry-pick incentive in payment.** Flat payment across the 8 batch
+members means a miner who cherry-picks to push `k` from 3 to 4 earns
+**the same** as one who honestly hits `k=2`. The only economic lever is
+"are you in the batch?" — answered by speed, not by `k` quality.
 
 **Speed beats cherry-picking by construction.** Cherry-picking requires
 generating more than 8 rollouts. More rollouts = later `signed_round` =
 later FIFO position = displaced from the batch by faster honest miners.
-Missing the batch = drop from BATCH_POOL share to PARTICIPATION_POOL
-share (≈ 2–3× loss). The speed penalty exceeds any cherry-pick gain.
+Missing the batch = **zero payment** (no participation tier). The speed
+penalty is catastrophic, not proportional.
 
 **GRAIL guarantees model authenticity.** The existing v1 proof system
 (teacher-forcing + tolerant sketch) prevents a miner from fabricating
@@ -77,8 +78,7 @@ handles hardware heterogeneity — same flow as v1.
 | `top_p_proto`, `top_k_proto`, `MAX_NEW_TOKENS_PROTOCOL_CAP` | fixed | same reason |
 | `ZONE_K_MIN`, `ZONE_K_MAX` | 2, 6 | apprenable zone; `k ∉ [2,6]` → rejected |
 | `B` | 8 | batch size for training step |
-| `BATCH_POOL_FRACTION` | 0.7 | share of window emission to batch members |
-| `PARTICIPATION_POOL_FRACTION` | 0.3 | share of window emission to in-zone non-batch members |
+| `BATCH_PROMPT_COOLDOWN_WINDOWS` | 3 | a batched prompt is ineligible for `B` for the next N windows |
 
 ## Protocol flow
 
@@ -97,31 +97,49 @@ handles hardware heterogeneity — same flow as v1.
 
 ### 2. Validator verification (per submission)
 
-```
-def verify(submission):
-    if not signature_valid(submission): return REJECT
-    if not prompt_idx_valid(submission.prompt_idx): return REJECT
-    problem = env.get_problem(submission.prompt_idx)
+Checks are ordered cheap → expensive so the validator doesn't burn GRAIL
+compute on submissions that will be rejected anyway.
 
+```
+def verify(submission, current_window, cooldown_map):
+    # Cheap gates first.
+    if not signature_valid(submission): return REJECT("bad_signature")
+    if not prompt_idx_valid(submission.prompt_idx): return REJECT("bad_prompt_idx")
+    if not signed_round_in_window(submission.signed_round, current_window):
+        return REJECT("stale_round")
+
+    # Cooldown check — cheap lookup, rejected before any GRAIL compute.
+    last_batched = cooldown_map.get(submission.prompt_idx, -∞)
+    if current_window - last_batched < BATCH_PROMPT_COOLDOWN_WINDOWS:
+        return REJECT("prompt_in_cooldown")
+
+    # Expensive gates.
+    problem = env.get_problem(submission.prompt_idx)
     for (c, claimed_reward, sketch) in submission.triples:
-        if not grail.verify(c, problem.prompt, sketch, model): return REJECT
-        if env.compute_reward(problem, c) != claimed_reward: return REJECT
+        if not grail.verify(c, problem.prompt, sketch, model):
+            return REJECT("grail_fail")
+        if env.compute_reward(problem, c) != claimed_reward:
+            return REJECT("reward_mismatch")
 
     k = sum(submission.rewards)
-    if not (ZONE_K_MIN <= k <= ZONE_K_MAX): return OUT_OF_ZONE   # still rejected
+    if not (ZONE_K_MIN <= k <= ZONE_K_MAX): return REJECT("out_of_zone")
     return VALID
 ```
 
-Three outcomes:
+Two outcomes only:
 
-- `REJECT` (crypto or reward mismatch) → no payment
-- `OUT_OF_ZONE` (`k ∉ [2,6]`) → no payment
-- `VALID` → eligible for batch selection + payment
+- `REJECT(reason)` → no payment; miner may retry with different prompt
+- `VALID` → eligible for batch selection (but not guaranteed if prompt
+  collides with an earlier-round submission on the same prompt)
 
 ### 3. Batch selection (end of window)
 
+Cooldown is also enforced at selection time (defence-in-depth — if a
+cooldown entry was stale at `/submit` but the state advanced before the
+batch seals, we still catch it).
+
 ```
-def select_batch(valid_submissions):
+def select_batch(valid_submissions, current_window, cooldown_map):
     # Deterministic cross-validator order: round, then tie-break hash.
     ordered = sorted(
         valid_submissions,
@@ -132,29 +150,70 @@ def select_batch(valid_submissions):
     for s in ordered:
         if len(batch) == B: break
         if s.prompt_idx in seen_prompts: continue
+        last = cooldown_map.get(s.prompt_idx, -∞)
+        if current_window - last < BATCH_PROMPT_COOLDOWN_WINDOWS: continue
         batch.append(s)
         seen_prompts.add(s.prompt_idx)
+
+    # Refresh cooldown map with the newly-batched prompts.
+    for s in batch:
+        cooldown_map[s.prompt_idx] = current_window
     return batch
 ```
 
+### Cooldown state lifecycle
+
+- **Source of truth**: each validator maintains its own `cooldown_map`
+  in local storage (e.g., `reliquary/state/cooldowns.json`).
+- **Derivable from history**: at startup, a validator rebuilds
+  `cooldown_map` by reading the last `BATCH_PROMPT_COOLDOWN_WINDOWS`
+  entries from the R2 dataset archive. Guarantees fresh validators
+  converge to the same state as long-running ones.
+- **Exposure**: `/window/{n}/state` returns the current cooldown set.
+  Miners poll this endpoint before choosing `prompt_idx` to avoid
+  wasted compute.
+- **Consensus**: validators that see the same batched history produce
+  the same cooldown map → same batch selection → same on-chain weights.
+
 Any valid submission not selected into the batch (because the prompt was
-already taken, or because the batch filled first) still earns
-participation payment.
+already taken by a faster miner on the same round) earns **zero**. There
+is no participation tier — the speed + distinct-prompt competition is
+the sole gate to emission.
 
 ### 4. Payment (weight computation)
 
 ```
 valid = [s for s in all_submissions if s.status == VALID]
-batch = select_batch(valid)
-participation = [s for s in valid if s not in batch]
+batch = select_batch(valid, current_window, cooldown_map)
 
-# Flat within tier.
+# Single tier. Each batch member earns a fixed 1/B share of the window
+# pool. Unused slots (partial batch) burn to UID_BURN — the protocol
+# signals the collective failure to fill the batch rather than over-
+# rewarding the few who showed up.
 for s in batch:
-    reward[s.hotkey] += BATCH_POOL_FRACTION / len(batch)
-for s in participation:
-    reward[s.hotkey] += PARTICIPATION_POOL_FRACTION / len(participation)
-# Unused fractions (empty batch, empty participation) go to UID_BURN.
+    reward[s.hotkey] += 1.0 / B
+
+unused_share = max(0, B - len(batch)) / B
+reward[UID_BURN] += unused_share
+
+# Window emission always sums to 1.0:
+#   miners total = len(batch) / B
+#   burn         = (B - len(batch)) / B
+# Example, batch of 5 out of 8:
+#   each miner gets 1/8 = 0.125
+#   miners total = 5/8 = 0.625
+#   UID_BURN     = 3/8 = 0.375
 ```
+
+The `1/B` flat share (not `1/len(batch)`) is intentional. Two reasons:
+
+1. **Signal the shortfall.** If the subnet routinely produces partial
+   batches, that's a training-efficiency problem we want visible in the
+   burn rate, not masked by over-paying the remaining miners.
+2. **Remove the "lone survivor" incentive.** With `1/len(batch)`, a
+   miner would benefit from other miners failing — would incentivise
+   DoS-ing competitors. With `1/B`, other miners' failures only affect
+   the burn, not the survivor's payout.
 
 ### 5. GRPO training step
 
@@ -183,9 +242,10 @@ To cherry-pick, a miner generates more than 8 rollouts (typically 2–3× the
 budget to reliably hit a target `k`). That extra compute:
 
 - Delays the submission → later `signed_round` → later FIFO position.
-- When the batch fills first (8 fast honest submissions with distinct
-  prompts), the cherry-picker drops to participation → loss factor
-  `BATCH_POOL / PARTICIPATION_POOL ≈ 2.3×` (with the default 0.7/0.3 split).
+- When the batch fills first (8 fast honest submissions with distinct,
+  non-cooldown prompts), the cherry-picker earns **zero** — there is no
+  participation tier to catch late miners. The loss is catastrophic, not
+  proportional.
 
 ### Cherry-picking doesn't help passing the zone gate
 
@@ -205,7 +265,9 @@ into the zone.
 | Temperature inflation | `T_proto` fixed at protocol level |
 | Submit same prompt from many hotkeys | Batch diversity (one prompt per batch slot) |
 | Replay old window's submission | `signed_round` must be in current window |
-| Collusion between miners on same prompt | All but first (by round) fall to participation |
+| Collusion between miners on same prompt | All but first (by round) earn zero |
+| Spam the same "juicy" prompt every window | Cooldown blocks it for `BATCH_PROMPT_COOLDOWN_WINDOWS` |
+| DoS competitors to inflate own share | Flat `1/B` payment — other miners' failures only increase burn |
 
 Residual risk: a miner who is **both** very fast **and** willing to
 spend extra compute might still break even on cherry-picking in borderline
@@ -230,15 +292,16 @@ this is an economic argument, not a cryptographic proof. Monitoring
 
 | File | Change |
 |---|---|
-| `reliquary/constants.py` | Add `ZONE_K_MIN/MAX`, `T_PROTO`, `BATCH_POOL_FRACTION`, `PARTICIPATION_POOL_FRACTION`, `B`. Deprecate `GROUP_SIZE`, `PROMPTS_PER_WINDOW`, `DIVERSITY_PREFIX_LEN`. |
-| `reliquary/protocol/submission.py` | New `SubmissionRequest` with `prompt_idx`, `signed_round`, `rewards`, `merkle_root`. Remove slot fields. |
-| `reliquary/miner/engine.py` | Pick `prompt_idx` freely (strategy = operator's choice; reference impl: random-in-range). Generate `M=8` at `T_PROTO`. Compute local rewards. Sign with latest observed round. |
-| `reliquary/miner/submitter.py` | Send new request shape to `/submit`. |
-| `reliquary/validator/batcher.py` | Rewrite: no more slots; instead a flat list of valid submissions per window. New `select_batch()`. New `get_miner_scores()` returning flat per-tier allocations. |
-| `reliquary/validator/verifier.py` | Add `verify_reward_claims` (re-run `env.compute_reward` on each submitted completion). GRAIL path unchanged. |
-| `reliquary/validator/weights.py` | Simplify: flat within tier, no superlinear on individual scores since scoring is binary in/out of zone. UID_BURN still absorbs unused pool fractions. |
-| `reliquary/validator/server.py` | `/submit` accepts new shape. `/window/{n}/state` returns list of submissions instead of slot histograms. |
-| `reliquary/environment/base.py` | Add `get_problem(idx)` contract (already exists for GSM8K); document that index must be a stable integer in `[0, len(env))`. |
+| `reliquary/constants.py` | Add `ZONE_K_MIN/MAX`, `T_PROTO`, `B`, `BATCH_PROMPT_COOLDOWN_WINDOWS`, bootstrap knobs. Deprecate `GROUP_SIZE`, `PROMPTS_PER_WINDOW`, `DIVERSITY_PREFIX_LEN`, `SUPERLINEAR_EXPONENT`, `UNIQUE_ROLLOUTS_CAP`. |
+| `reliquary/protocol/submission.py` | New `SubmissionRequest` with `prompt_idx`, `signed_round`, `rewards`, `merkle_root`. Remove `slot_index`, `prompt_id`. Add `RejectReason` enum covering new reasons (`prompt_in_cooldown`, `stale_round`, `reward_mismatch`, `out_of_zone`). |
+| `reliquary/miner/engine.py` | Pick `prompt_idx` freely (strategy = operator's choice; reference impl: random-in-range excluding cooldown set from `/state`). Generate `M=8` at `T_PROTO`. Compute local rewards. Sign with latest observed round. |
+| `reliquary/miner/submitter.py` | Send new request shape to `/submit`. Handle new reject reasons (retry with different prompt on `prompt_in_cooldown`). |
+| `reliquary/validator/batcher.py` | Rewrite: no more slots; flat list of valid submissions per window + cooldown map. New `select_batch()`. New `get_miner_scores()` returning flat-`1/B` allocations. |
+| `reliquary/validator/verifier.py` | Add `verify_reward_claims` (re-run `env.compute_reward` on each submitted completion). Add cooldown early-exit check. GRAIL path unchanged. |
+| `reliquary/validator/weights.py` | Simplify to flat `1/B` per batch member, unused slots → UID_BURN. Drop superlinear (scoring is already binary in/out of zone, sybil-resistance comes from batch diversity + cooldown). |
+| `reliquary/validator/server.py` | `/submit` accepts new shape and rejects early on cooldown/stale-round. `/window/{n}/state` returns list of submissions + current cooldown set. |
+| `reliquary/validator/cooldown.py` (new) | `CooldownMap` class with load-from-R2-history, local persistence, expose `is_in_cooldown(prompt_idx, window)` and `record_batched(prompt_idx, window)`. |
+| `reliquary/environment/base.py` | Document `get_problem(idx)` contract: stable integer in `[0, len(env))`. |
 
 ### Tests
 
@@ -250,16 +313,23 @@ New tests under `tests/unit/`:
   - Batch caps at `B`
   - Empty valid pool → empty batch (all emission burns)
   - Tie-breaking determinism (same input → same output across runs)
+  - Cooldown enforced at selection time (late-arriving cooldown entry still filters)
+- `test_cooldown.py`
+  - Batched prompt marks cooldown for `BATCH_PROMPT_COOLDOWN_WINDOWS`
+  - Expired cooldown allows prompt back into batch
+  - `CooldownMap` rebuilt from R2 history matches live map
+  - `/window/state` exposes current cooldown set
 - `test_zone_filter.py`
   - `k ∈ [2, 6]` passes, all other values rejected
-  - `k=0` and `k=M` rejected specifically (no participation payment)
+  - `k=0` and `k=M` rejected with `out_of_zone`
 - `test_reward_verification.py`
   - Miner claim matches validator re-computation → accept
   - Miner claim mismatches → reject with `reward_mismatch`
 - `test_flat_payment.py`
-  - All batch members receive identical payment
-  - All participation members receive identical payment
-  - Pool fractions sum to 1.0 minus UID_BURN leak
+  - Full batch: each member gets `1/B`, burn = 0
+  - Partial batch: each member still gets `1/B`, remainder burns
+  - Empty batch: full emission burns
+  - No "lone survivor" bonus — confirm miner can't gain by DoS-ing competitors
 - `test_anti_cherry_pick_economics.py` (property-based)
   - For a grid of `(true_p, compute_cost_ratio)`, honest strategy dominates
     cherry-pick strategy in expected payment.
@@ -278,12 +348,18 @@ a dead cold start:
 
 - `BOOTSTRAP_WINDOWS = 100` — first 100 windows apply relaxed thresholds
 - `BOOTSTRAP_K_RANGE = (1, 7)` — wider zone during bootstrap
-- `BOOTSTRAP_FLOOR_EMISSION = 0.01` — every crypto-valid submission earns
-  at least a floor, even outside zone, during bootstrap
 - `BOOTSTRAP_M = 4` — smaller groups for easier hit rate (reverts to 8 at
   window 100)
+- `BOOTSTRAP_COOLDOWN = 0` — no cooldown during bootstrap (maximise batch
+  fill rate, reverts to 3 at window 100)
 - Curated env subset in `env_version=bootstrap` — prompts pre-screened to
   fall in `[0.2, 0.8]` for the initial checkpoint
+
+No floor emission: the batch-only payment model means bootstrap is
+handled by **widening the eligibility** (wider zone, smaller `M`, no
+cooldown) rather than paying consolation emission. If miners still can't
+fill the batch under bootstrap settings, the protocol correctly signals
+the shortfall via burn to UID_BURN.
 
 These knobs live in constants; changes require coordinated deployment.
 
@@ -306,14 +382,17 @@ M). Target false-negative rate < 1%, false-positive rate < 0.1%.
 
 ### Assumption 2 — Cherry-picking is economically dominated by speed
 
-The argument is quantitative: factor-2.3× BATCH_POOL / PARTICIPATION_POOL
-advantage, combined with factor-2–3× extra compute for cherry-picking,
-means the honest strategy dominates for typical `(compute_cost, reward)`
-ratios.
+The argument is binary: cherry-picking requires extra generations →
+later `signed_round` → displaced from the batch by faster honest
+miners → **zero emission**. There is no participation tier to catch
+late miners, so missing the batch is catastrophic rather than
+proportional.
 
 **Validation**: run a testnet simulation with 50 miners, half honest and
 half cherry-picking at varying intensities. Measure earnings per compute
-unit; honest should dominate across the regime grid.
+unit; honest should dominate across the regime grid. Specifically track:
+*(i)* fraction of cherry-pickers that ever make the batch, *(ii)* their
+average earnings vs honest miners of similar compute budget.
 
 ### Assumption 3 — `signed_round` consensus is robust
 
@@ -348,8 +427,8 @@ reference.
 
 - **Seed-binding via beacon**: considered and rejected. The cross-GPU
   determinism cost outweighs the security benefit, because the economic
-  deterrence (flat within tier + speed pressure) already closes the
-  cherry-pick loop.
+  deterrence (batch-only flat payment + speed pressure + no safety net
+  for late miners) already closes the cherry-pick loop.
 - **Score-weighted payment within tier**: considered and rejected. Would
   reintroduce marginal cherry-pick incentive. The 5–10% gradient-quality
   loss from flat payment is an acceptable tradeoff.
@@ -383,13 +462,14 @@ pre-announced block height.
 1. Default `T_proto` value: 0.9 vs 1.0 vs 0.7. Will be determined by
    training team based on target sampling distribution for the chosen
    base model.
-2. Should `BATCH_POOL_FRACTION` be fixed at 0.7, or tunable by governance
-   / sudo-key for rebalancing?
-3. Do we want a per-hotkey submission cap from day one (centralisation
+2. Do we want a per-hotkey submission cap from day one (centralisation
    hedge), or ship lean and add only if monitoring shows abuse?
-4. `DIVERSITY_PREFIX_LEN` from v1 — keep as a sanity check (rejects
+3. `DIVERSITY_PREFIX_LEN` from v1 — keep as a sanity check (rejects
    obvious copy-paste across miners) or drop entirely? Prompt-level
    diversity in the batch probably subsumes it.
+4. `BATCH_PROMPT_COOLDOWN_WINDOWS = 3` — first-principles guess. Worth
+   A/B-ing on testnet (3 vs 5 vs 10) to measure impact on env coverage
+   vs curriculum efficiency.
 
 These are surface-level tuning choices; the structural design does not
 depend on the answers.
