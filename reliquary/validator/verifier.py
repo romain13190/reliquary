@@ -1,8 +1,7 @@
-"""GRAIL proof verification — primitives used by the WindowBatcher.
+"""GRAIL proof verification — primitives used by GrpoWindowBatcher.
 
-The orchestration (which prompt, which slot, which miner) lives in
-`reliquary.validator.batcher`. This module only exposes the per-commit
-checks that touch the model or the signature scheme.
+The orchestration lives in `reliquary.validator.batcher`. This module only
+exposes the per-commit checks that touch the model or the signature scheme.
 """
 
 import logging

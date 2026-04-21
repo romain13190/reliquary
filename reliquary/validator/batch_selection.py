@@ -1,7 +1,7 @@
 """Pure batch selection: FIFO by signed_round, distinct prompts, cooldown-aware.
 
 Called once per window to pick the B submissions that go into the training
-step. Separated from the orchestrator (``WindowBatcher``) to make the
+step. Separated from the orchestrator (``GrpoWindowBatcher``) to make the
 selection logic trivially testable in isolation.
 """
 

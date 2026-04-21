@@ -26,7 +26,6 @@ from reliquary.constants import (
 from reliquary.infrastructure import chain
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
-    CompletionSubmission,
     RolloutSubmission,
 )
 
@@ -263,11 +262,11 @@ class MiningEngine:
         completion_text = self.tokenizer.decode(completion_tokens)
         reward = self.env.compute_reward(problem, completion_text)
 
-        completion_sub = self._build_completion_submission(generation, randomness)
+        commit = self._build_grail_commit(generation, randomness)
         return RolloutSubmission(
             tokens=all_tokens,
             reward=reward,
-            commit=completion_sub.commit,
+            commit=commit,
         )
 
     # ------------------------------------------------------------------
@@ -292,12 +291,10 @@ class MiningEngine:
             )
         return chain.compute_window_randomness(block_hash)
 
-    def _build_completion_submission(
-        self, generation: dict, randomness: str
-    ) -> CompletionSubmission:
-        """Construct a GRAIL-proven CompletionSubmission from a generation dict.
+    def _build_grail_commit(self, generation: dict, randomness: str) -> dict:
+        """Construct a GRAIL proof commit dict from a generation dict.
 
-        Reproduces the proof construction from the original _generate_and_prove:
+        Reproduces the proof construction:
           - HF forward pass for hidden_states + logits
           - Commitment batch via GRAILVerifier
           - log-softmax token log-probs
@@ -340,7 +337,7 @@ class MiningEngine:
             commitments, self.wallet,
         )
 
-        commit = {
+        return {
             "tokens": all_tokens,
             "commitments": commitments,
             "proof_version": GRAIL_PROOF_VERSION,
@@ -356,5 +353,3 @@ class MiningEngine:
                 "token_logprobs": token_logprobs,
             },
         }
-
-        return CompletionSubmission(tokens=all_tokens, commit=commit)

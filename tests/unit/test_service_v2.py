@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 from reliquary.constants import B_BATCH
-from reliquary.validator.batcher_v2 import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
 from reliquary.validator.cooldown import CooldownMap
 
 

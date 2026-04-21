@@ -20,7 +20,7 @@ from reliquary.constants import (
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RolloutSubmission
-from reliquary.validator.batcher_v2 import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.weights import compute_weights_v2

@@ -10,7 +10,7 @@ from reliquary.protocol.submission import (
     RolloutSubmission,
     RejectReason,
 )
-from reliquary.validator.batcher_v2 import GrpoWindowBatcher
+from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
 

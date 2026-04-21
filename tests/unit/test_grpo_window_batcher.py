@@ -12,7 +12,7 @@ from reliquary.protocol.submission import (
     RejectReason,
     RolloutSubmission,
 )
-from reliquary.validator.batcher_v2 import GrpoWindowBatcher
+from reliquary.validator.batcher import GrpoWindowBatcher
 
 
 class FakeEnv:

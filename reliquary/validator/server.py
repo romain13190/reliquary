@@ -23,7 +23,7 @@ from reliquary.protocol.submission import (
     GrpoBatchState,
     RejectReason,
 )
-from reliquary.validator.batcher_v2 import GrpoWindowBatcher
+from reliquary.validator.batcher import GrpoWindowBatcher
 
 logger = logging.getLogger(__name__)
 
