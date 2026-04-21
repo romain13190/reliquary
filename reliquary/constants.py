@@ -181,3 +181,41 @@ MAX_ROLLOUTS_PER_FILE = 6000
 
 DATASET_NAME = "karpathy/climbmix-400b-shuffle"
 DATASET_SPLIT = "train"
+
+# ────────────────  GRPO MARKET (v2)  ────────────────
+
+# Apprenable zone: a group with k successes ∈ [ZONE_K_MIN, ZONE_K_MAX]
+# inclusive is eligible for the training batch. Outside this range means
+# the group has ~no GRPO signal (too easy or too hard) and is rejected.
+ZONE_K_MIN = 2
+ZONE_K_MAX = 6
+
+# Number of rollouts per submission (= size of each GRPO group).
+M_ROLLOUTS = 8
+
+# Training batch size — the first B valid in-zone submissions (FIFO by
+# signed_round, distinct prompts, not in cooldown) feed the GRPO step.
+B_BATCH = 8
+
+# Sampling temperature fixed at protocol level. Miners who use a different
+# T would produce samples from a different distribution → biased GRPO
+# gradient. Value chosen in the GRPO-friendly range (non-zero).
+T_PROTO = 0.9
+
+# Top-p and top-k for sampling (fixed alongside T_PROTO).
+TOP_P_PROTO = 1.0
+TOP_K_PROTO = 0
+
+# A prompt that entered the training batch is ineligible for B_BATCH for
+# the next N windows (= training steps). Forces curriculum rotation so
+# the policy has time to shift between reuses.
+BATCH_PROMPT_COOLDOWN_WINDOWS = 50
+
+# Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
+# relaxed thresholds to keep the batch filling while miner pop + env
+# coverage are thin.
+BOOTSTRAP_WINDOWS = 100
+BOOTSTRAP_ZONE_K_MIN = 1
+BOOTSTRAP_ZONE_K_MAX = 7
+BOOTSTRAP_M_ROLLOUTS = 4
+BOOTSTRAP_COOLDOWN_WINDOWS = 10
