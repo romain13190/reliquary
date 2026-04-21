@@ -130,6 +130,12 @@ async def _post_with_retry(
                 if attempt < len(_RETRY_DELAYS):
                     await asyncio.sleep(delay)
                 continue
+            # 503 "no active window" is informational for BatchSubmissionResponse —
+            # don't retry, surface as a structured reject.
+            if resp.status_code == 503 and response_model is BatchSubmissionResponse:
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE
+                )
             # 4xx means the request is malformed or the validator rejected it
             # for a deterministic reason — retrying is pointless. Parse and return.
             if 400 <= resp.status_code < 500:
@@ -144,8 +150,6 @@ async def _post_with_retry(
                 if response_model is BatchSubmissionResponse:
                     if resp.status_code == 409:
                         reason = RejectReason.WINDOW_MISMATCH
-                    elif resp.status_code == 503:
-                        reason = RejectReason.WINDOW_NOT_ACTIVE
                     else:
                         reason = RejectReason.BAD_PROMPT_IDX
                     return BatchSubmissionResponse(accepted=False, reason=reason)

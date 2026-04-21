@@ -305,3 +305,35 @@ async def test_get_window_state_v2(monkeypatch):
     assert s.window_start == 100
     assert set(s.cooldown_prompts) == {42, 7}
     await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_503_maps_to_window_not_active(monkeypatch):
+    """HTTP 503 from /submit short-circuits to WINDOW_NOT_ACTIVE (no retry)."""
+    call_count = {"n": 0}
+
+    async def _post(self, url, json=None, timeout=None):
+        call_count["n"] += 1
+        return httpx.Response(503, json={"detail": "no_active_window"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.WINDOW_NOT_ACTIVE
+    # Crucially: no retries. One call, not three.
+    assert call_count["n"] == 1
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_409_maps_to_window_mismatch(monkeypatch):
+    async def _post(self, url, json=None, timeout=None):
+        return httpx.Response(409, json={"detail": "window_mismatch"})
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.WINDOW_MISMATCH
+    await client.aclose()
