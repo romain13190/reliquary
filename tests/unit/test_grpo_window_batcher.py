@@ -170,3 +170,69 @@ def test_reject_reward_mismatch():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.REWARD_MISMATCH
+
+
+# --- seal_batch + cooldown lifecycle ---
+
+def test_seal_batch_empty_pool_returns_empty():
+    b = _make_batcher()
+    assert b.seal_batch() == []
+
+
+def test_seal_batch_fifo_across_many_submissions():
+    b = _make_batcher(current_round=1010)
+    for i, round_num in enumerate([1003, 1001, 1005, 1002, 1004,
+                                    1006, 1007, 1008, 1009, 1010]):
+        req = _request(
+            prompt_idx=i, signed_round=round_num, hotkey=f"hk{i}",
+        )
+        resp = b.accept_submission(req)
+        assert resp.accepted, f"unexpected reject for {i}: {resp.reason}"
+    batch = b.seal_batch()
+    assert len(batch) == B_BATCH
+    rounds = [s.signed_round for s in batch]
+    assert rounds == sorted(rounds)
+
+
+def test_seal_batch_cooldown_recorded():
+    b = _make_batcher()
+    req = _request(prompt_idx=42, signed_round=1000)
+    b.accept_submission(req)
+    batch = b.seal_batch()
+    assert len(batch) == 1
+    assert b._cooldown.is_in_cooldown(42, b.window_start + 1) is True
+
+
+def test_sealed_batch_respects_cooldown_from_previous_window():
+    from reliquary.validator.cooldown import CooldownMap
+    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
+    cd = CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+    cd.record_batched(prompt_idx=42, window=100)
+    b = _make_batcher(window_start=120, cooldown_map=cd)
+    req = _request(prompt_idx=42, signed_round=1000, window_start=120)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_IN_COOLDOWN
+
+
+def test_state_endpoint_exposes_cooldown():
+    from reliquary.validator.cooldown import CooldownMap
+    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
+    cd = CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
+    cd.record_batched(prompt_idx=42, window=100)
+    cd.record_batched(prompt_idx=7, window=105)
+    b = _make_batcher(window_start=110, cooldown_map=cd)
+    state = b.get_state()
+    assert set(state.cooldown_prompts) == {42, 7}
+    assert state.valid_submissions == 0
+
+
+def test_distinct_prompts_in_batch_only():
+    b = _make_batcher(current_round=1002)
+    b.accept_submission(_request(prompt_idx=42, signed_round=1000, hotkey="alice"))
+    b.accept_submission(_request(prompt_idx=42, signed_round=1001, hotkey="bob"))
+    b.accept_submission(_request(prompt_idx=7, signed_round=1002, hotkey="carol"))
+    batch = b.seal_batch()
+    assert len(batch) == 2
+    hotkeys = {s.hotkey for s in batch}
+    assert hotkeys == {"alice", "carol"}
