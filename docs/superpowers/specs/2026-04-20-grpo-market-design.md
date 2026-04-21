@@ -163,12 +163,21 @@ def select_batch(valid_submissions, current_window, cooldown_map):
 
 ### Cooldown state lifecycle
 
-- **Source of truth**: each validator maintains its own `cooldown_map`
-  in local storage (e.g., `reliquary/state/cooldowns.json`).
-- **Derivable from history**: at startup, a validator rebuilds
-  `cooldown_map` by reading the last `BATCH_PROMPT_COOLDOWN_WINDOWS`
-  entries from the R2 dataset archive. Guarantees fresh validators
-  converge to the same state as long-running ones.
+- **Source of truth**: R2 is the durable store. Every window's sealed
+  batch is uploaded by the validator as
+  `reliquary/dataset/<hotkey>/window-{n}.json.gz`, and the `batch` field
+  of that archive carries the `prompt_idx` entries the cooldown map
+  needs.
+- **Rebuild at startup**: the validator calls
+  `storage.list_recent_datasets(hotkey, current_window, n=50)` to
+  download the last `BATCH_PROMPT_COOLDOWN_WINDOWS` archives and passes
+  them to `CooldownMap.rebuild_from_history()`. No local state file
+  needed; a fresh validator joining an active subnet picks up the
+  current cooldown state without coordination.
+- **Multi-validator consistency**: each validator rebuilds from its own
+  R2 prefix (self-consistent), or from a shared prefix (cross-validator
+  consistent) depending on bucket policy. The protocol behavior is
+  identical in both cases.
 - **Exposure**: `/window/{n}/state` returns the current cooldown set.
   Miners poll this endpoint before choosing `prompt_idx` to avoid
   wasted compute.

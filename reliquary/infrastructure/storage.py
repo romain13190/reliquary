@@ -227,6 +227,54 @@ async def upload_window_dataset(
     return True
 
 
+async def list_recent_datasets(
+    hotkey: str,
+    current_window: int,
+    n: int,
+    **client_kwargs,
+) -> list[dict]:
+    """Download the last *n* window datasets for *hotkey* in ascending order.
+
+    Returns a list of parsed archive payloads (the dicts written by
+    ``upload_window_dataset``). Tries windows in ``[current_window - n,
+    current_window)``; skips any that don't exist or fail to parse.
+
+    Used by the validator at startup to reconstruct ``CooldownMap`` state
+    via ``CooldownMap.rebuild_from_history``.
+    """
+    from botocore.exceptions import ClientError
+
+    if n <= 0 or current_window <= 0:
+        return []
+
+    start = max(0, current_window - n)
+    keys = [
+        (w, f"reliquary/dataset/{hotkey}/window-{w}.json.gz")
+        for w in range(start, current_window)
+    ]
+
+    archives: list[dict] = []
+    async with get_s3_client(**client_kwargs) as client:
+        bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+        for window_start, key in keys:
+            try:
+                resp = await client.get_object(Bucket=bucket, Key=key)
+                body = await resp["Body"].read()
+                data = json.loads(gzip.decompress(body))
+                archives.append(data)
+            except ClientError as e:
+                code = e.response.get("Error", {}).get("Code", "")
+                if code in ("NoSuchKey", "404"):
+                    logger.debug("skip missing window %d (%s)", window_start, key)
+                    continue
+                logger.warning(
+                    "skip window %d: %s (%s)", window_start, code, e,
+                )
+            except Exception as e:
+                logger.warning("skip window %d: parse failed (%s)", window_start, e)
+    return archives
+
+
 async def download_window_rollouts(
     hotkey: str, window_start: int, **client_kwargs
 ) -> tuple[list[dict] | None, float | None]:

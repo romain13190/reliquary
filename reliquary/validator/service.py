@@ -115,9 +115,42 @@ class ValidationService:
 
         self.server = ValidatorServer(host=http_host, port=http_port)
 
+    async def _rebuild_cooldown_from_history(self, subtensor) -> None:
+        """At startup, reconstruct CooldownMap from the last
+        BATCH_PROMPT_COOLDOWN_WINDOWS archived windows on R2.
+
+        R2 is the durable source of truth — each window's sealed batch is
+        uploaded by ``_run_window``. Rebuilding from that history means:
+          * local disk state isn't needed (no JSON file to manage)
+          * multi-validator consistency: any validator rebuilding from the
+            same R2 prefix converges to the same cooldown map
+          * a fresh validator joining an active subnet picks up the
+            current cooldown state without coordination
+        """
+        try:
+            current_block = await chain.get_current_block(subtensor)
+            current_window = self._compute_target_window(current_block)
+            archives = await storage.list_recent_datasets(
+                hotkey=self.wallet.hotkey.ss58_address,
+                current_window=current_window,
+                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
+            )
+            self._cooldown_map.rebuild_from_history(
+                archives, current_window=current_window,
+            )
+            logger.info(
+                "Rebuilt cooldown from %d archive windows (current=%d, map size=%d)",
+                len(archives), current_window, len(self._cooldown_map),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to rebuild cooldown from history; starting with empty state"
+            )
+
     async def run(self, subtensor) -> None:
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
+        await self._rebuild_cooldown_from_history(subtensor)
         logger.info(
             "Validator started: env=%s, netuid=%d, http=%s:%d, rolling_windows=%d",
             self.env.name, self.netuid, self.server.host, self.server.port,

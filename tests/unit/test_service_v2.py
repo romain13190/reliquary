@@ -2,7 +2,9 @@
 close, computes weights v2-flavoured."""
 
 from dataclasses import dataclass
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from reliquary.constants import B_BATCH
 from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
@@ -33,6 +35,45 @@ def test_service_creates_grpo_window_batcher():
     assert isinstance(batcher, GrpoWindowBatcher)
     assert batcher.window_start == 100
     assert batcher._cooldown is shared_cooldown
+
+
+@pytest.mark.asyncio
+async def test_rebuild_cooldown_from_history_populates_map():
+    """ValidationService._rebuild_cooldown_from_history fetches archives
+    from R2 and populates the cooldown map."""
+    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
+    from reliquary.validator.service import ValidationService
+
+    # Build a fake service — minimal state to call the rebuild method.
+    class FakeWallet:
+        class _Hk:
+            ss58_address = "5FHk"
+        hotkey = _Hk()
+
+    svc = ValidationService(
+        wallet=FakeWallet(),
+        model=None,
+        tokenizer=None,
+        env=_FakeEnv(),
+        netuid=99,
+    )
+
+    archives = [
+        {"window_start": 100, "batch": [{"prompt_idx": 42}]},
+        {"window_start": 101, "batch": [{"prompt_idx": 7}]},
+    ]
+
+    with patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=AsyncMock(return_value=archives),
+    ), patch(
+        "reliquary.infrastructure.chain.get_current_block",
+        new=AsyncMock(return_value=110),  # _compute_target_window(110) = 105; horizon = 105-50 = 55 < 100
+    ):
+        await svc._rebuild_cooldown_from_history(subtensor=object())
+
+    # Should now know about prompts 42 and 7.
+    assert len(svc._cooldown_map) == 2
 
 
 def test_service_compute_weights_for_sealed_batch():
