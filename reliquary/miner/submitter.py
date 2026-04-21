@@ -192,3 +192,27 @@ async def get_window_state_v2(
         f"{url}/window/{window_start}/state", GrpoBatchState,
         client=client, timeout=timeout,
     )
+
+
+async def download_checkpoint(url: str, *, client: httpx.AsyncClient | None = None) -> str:
+    """Download a checkpoint URL to a temp file. Returns local path.
+
+    Single-shot (not retried). Caller catches SubmissionError to decide
+    whether to retry at a higher level.
+    """
+    import tempfile
+    import os
+
+    own = client is None
+    cli = client or httpx.AsyncClient(timeout=300)
+    try:
+        resp = await cli.get(url)
+        if resp.status_code >= 400:
+            raise SubmissionError(f"checkpoint download HTTP {resp.status_code}")
+        fd, path = tempfile.mkstemp(suffix=".safetensors")
+        with os.fdopen(fd, "wb") as f:
+            f.write(resp.content)
+        return path
+    finally:
+        if own:
+            await cli.aclose()
