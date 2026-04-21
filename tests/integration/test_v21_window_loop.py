@@ -50,7 +50,11 @@ def _rollouts(k):
 
 def _make_service(tmp_path, checkpoint_hash="sha256:cp"):
     """Construct a ValidationService with state paths in tmp_path and
-    a mocked checkpoint store (no R2) + training stub."""
+    a mocked checkpoint store (no HF) + training stub.
+
+    Sets publish_every=1 so every window triggers a publish, keeping
+    existing test assertions simple.
+    """
     from reliquary.validator.service import ValidationService
     from reliquary.validator.state_persistence import ValidatorState
     from reliquary.validator.checkpoint import ManifestEntry
@@ -61,17 +65,22 @@ def _make_service(tmp_path, checkpoint_hash="sha256:cp"):
     )
     svc._state_path = str(tmp_path / "state.json")
     svc._state = ValidatorState(svc._state_path)
+    # Publish on every window so counter tests stay simple.
+    svc._publish_every = 1
 
-    # Mock checkpoint store — return incrementing ManifestEntries.
+    # Mock checkpoint store — start with a manifest so batcher gets a revision,
+    # then return incrementing ManifestEntries on publish.
     svc._checkpoint_store = MagicMock()
     svc._checkpoint_store.current_manifest = MagicMock(return_value=ManifestEntry(
-        checkpoint_n=0, file_url="https://r2/0",
-        file_hash=checkpoint_hash, signature="ed25519:sig0",
+        checkpoint_n=0,
+        repo_id="aivolutionedge/reliquary-sn",
+        revision=checkpoint_hash,
+        signature="ed25519:sig0",
     ))
     svc._checkpoint_store.publish = AsyncMock(side_effect=lambda checkpoint_n, model: ManifestEntry(
         checkpoint_n=checkpoint_n,
-        file_url=f"https://r2/{checkpoint_n}",
-        file_hash=f"sha256:cp{checkpoint_n}",
+        repo_id="aivolutionedge/reliquary-sn",
+        revision=f"rev_sha_{checkpoint_n:03d}",
         signature=f"ed25519:sig{checkpoint_n}",
     ))
 

@@ -78,12 +78,14 @@ async def test_train_and_publish_bumps_checkpoint_n(tmp_path):
     # Open a window so there's an active batcher + seal_event to drive
     svc._open_window()
 
-    # Mock the checkpoint store to avoid R2 calls
+    # Mock the checkpoint store to avoid HF calls
     svc._checkpoint_store = MagicMock()
+    svc._checkpoint_store.current_manifest = MagicMock(return_value=None)
     from reliquary.validator.checkpoint import ManifestEntry
     fake_entry = ManifestEntry(
         checkpoint_n=initial_checkpoint + 1,
-        file_url="https://r2/x", file_hash="sha256:x",
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="rev_sha_x",
         signature="ed25519:x",
     )
     svc._checkpoint_store.publish = AsyncMock(return_value=fake_entry)
@@ -110,12 +112,12 @@ def test_open_window_wires_checkpoint_hash_into_batcher(tmp_path):
     svc._checkpoint_store = MagicMock()
     svc._checkpoint_store.current_manifest = MagicMock(return_value=ManifestEntry(
         checkpoint_n=5,
-        file_url="https://r2/5",
-        file_hash="sha256:hash5",
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="rev_sha_005",
         signature="ed25519:sig",
     ))
     svc._open_window()
-    assert svc._active_batcher.current_checkpoint_hash == "sha256:hash5"
+    assert svc._active_batcher.current_checkpoint_hash == "rev_sha_005"
 
 
 def test_open_window_empty_hash_pre_first_publish(tmp_path):
@@ -125,3 +127,55 @@ def test_open_window_empty_hash_pre_first_publish(tmp_path):
     svc._checkpoint_store.current_manifest = MagicMock(return_value=None)
     svc._open_window()
     assert svc._active_batcher.current_checkpoint_hash == ""
+
+
+@pytest.mark.asyncio
+async def test_publish_every_n_windows(tmp_path):
+    """With _publish_every=3, publish is called only on windows 3 (first due to
+    None manifest) then ... actually on windows 1 (first, manifest is None) and
+    then next on window 3 (3 % 3 == 0). Verify: 5 _train_and_publish calls
+    produce exactly 2 publish calls when publish_every=3 and manifest starts None."""
+    import reliquary.validator.service as svc_mod
+    from reliquary.validator.checkpoint import ManifestEntry
+
+    svc = _make_service(tmp_path)
+    svc._publish_every = 3
+
+    # Start with no manifest so first call always publishes.
+    mock_store = MagicMock()
+    mock_store.current_manifest = MagicMock(return_value=None)
+
+    published_entries = []
+
+    async def _fake_publish(checkpoint_n, model):
+        entry = ManifestEntry(
+            checkpoint_n=checkpoint_n,
+            repo_id="aivolutionedge/reliquary-sn",
+            revision=f"rev_{checkpoint_n:03d}",
+            signature="ed25519:sig",
+        )
+        published_entries.append(entry)
+        # After first publish, current_manifest returns the latest entry.
+        mock_store.current_manifest.return_value = entry
+        return entry
+
+    mock_store.publish = AsyncMock(side_effect=_fake_publish)
+    svc._checkpoint_store = mock_store
+
+    original_upload = svc_mod.storage.upload_window_dataset
+    svc_mod.storage.upload_window_dataset = AsyncMock(return_value=True)
+
+    try:
+        for _ in range(5):
+            svc._open_window()
+            svc._active_batcher.seal_event.set()
+            await svc._train_and_publish()
+    finally:
+        svc_mod.storage.upload_window_dataset = original_upload
+
+    # window_n increments: 1,2,3,4,5.
+    # Publish fires when: window_n==1 (manifest is None), window_n==3 (3%3==0).
+    # Windows 2,4,5 skip. checkpoint_n advances only on publish.
+    assert mock_store.publish.await_count == 2
+    assert published_entries[0].checkpoint_n == 1  # first publish: next_n = 0+1 = 1
+    assert published_entries[1].checkpoint_n == 2  # second publish: next_n = 1+1 = 2

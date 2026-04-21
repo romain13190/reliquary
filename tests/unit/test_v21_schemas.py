@@ -31,15 +31,15 @@ def test_grpo_batch_state_has_window_state_fields():
         cooldown_prompts=[],
         valid_submissions=0,
         checkpoint_n=7,
-        checkpoint_url="https://r2.example/cp/7.safetensors",
-        checkpoint_hash="sha256:abcdef",
+        checkpoint_repo_id="aivolutionedge/reliquary-sn",
+        checkpoint_revision="rev_sha_007",
     )
     assert s.state == WindowState.OPEN
     assert s.window_n == 42
     assert s.checkpoint_n == 7
 
 
-def test_grpo_batch_state_checkpoint_url_optional_pre_first_publish():
+def test_grpo_batch_state_checkpoint_optional_pre_first_publish():
     s = GrpoBatchState(
         state=WindowState.OPEN,
         window_n=0,
@@ -48,11 +48,11 @@ def test_grpo_batch_state_checkpoint_url_optional_pre_first_publish():
         cooldown_prompts=[],
         valid_submissions=0,
         checkpoint_n=0,
-        checkpoint_url=None,
-        checkpoint_hash=None,
+        checkpoint_repo_id=None,
+        checkpoint_revision=None,
     )
-    assert s.checkpoint_url is None
-    assert s.checkpoint_hash is None
+    assert s.checkpoint_repo_id is None
+    assert s.checkpoint_revision is None
 
 
 def test_batch_submission_requires_checkpoint_hash():

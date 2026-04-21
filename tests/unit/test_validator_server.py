@@ -162,8 +162,8 @@ def test_state_endpoint_returns_window_state_enum():
     assert body["state"] == "open"
     assert body["window_n"] == 500
     assert body["checkpoint_n"] == 0  # no checkpoint published yet
-    assert body["checkpoint_url"] is None
-    assert body["checkpoint_hash"] is None
+    assert body["checkpoint_repo_id"] is None
+    assert body["checkpoint_revision"] is None
 
 
 def test_state_endpoint_exposes_checkpoint_when_set():
@@ -175,16 +175,16 @@ def test_state_endpoint_exposes_checkpoint_when_set():
     server.set_current_state(WindowState.OPEN)
     server.set_current_checkpoint(ManifestEntry(
         checkpoint_n=7,
-        file_url="https://r2/7",
-        file_hash="sha256:seven",
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="rev_sha_007",
         signature="ed25519:sig",
     ))
     client = TestClient(server.app)
     resp = client.get("/window/500/state")
     body = resp.json()
     assert body["checkpoint_n"] == 7
-    assert body["checkpoint_url"] == "https://r2/7"
-    assert body["checkpoint_hash"] == "sha256:seven"
+    assert body["checkpoint_repo_id"] == "aivolutionedge/reliquary-sn"
+    assert body["checkpoint_revision"] == "rev_sha_007"
 
 
 def test_checkpoint_endpoint_404_when_none_published():
@@ -199,8 +199,8 @@ def test_checkpoint_endpoint_returns_manifest_when_set():
     server = ValidatorServer()
     server.set_current_checkpoint(ManifestEntry(
         checkpoint_n=42,
-        file_url="https://r2/42",
-        file_hash="sha256:forty_two",
+        repo_id="aivolutionedge/reliquary-sn",
+        revision="rev_sha_042",
         signature="ed25519:sig_42",
     ))
     client = TestClient(server.app)
@@ -208,6 +208,6 @@ def test_checkpoint_endpoint_returns_manifest_when_set():
     assert resp.status_code == 200
     body = resp.json()
     assert body["checkpoint_n"] == 42
-    assert body["file_url"] == "https://r2/42"
-    assert body["file_hash"] == "sha256:forty_two"
+    assert body["repo_id"] == "aivolutionedge/reliquary-sn"
+    assert body["revision"] == "rev_sha_042"
     assert body["signature"] == "ed25519:sig_42"

@@ -113,8 +113,8 @@ class ValidatorServer:
                 ),
                 valid_submissions=len(batcher.valid_submissions()),
                 checkpoint_n=cp.checkpoint_n if cp else 0,
-                checkpoint_url=cp.file_url if cp else None,
-                checkpoint_hash=cp.file_hash if cp else None,
+                checkpoint_repo_id=cp.repo_id if cp else None,
+                checkpoint_revision=cp.revision if cp else None,
             )
 
         @app.get("/checkpoint")
@@ -124,8 +124,8 @@ class ValidatorServer:
                 raise HTTPException(status_code=404, detail="no_checkpoint")
             return {
                 "checkpoint_n": cp.checkpoint_n,
-                "file_url": cp.file_url,
-                "file_hash": cp.file_hash,
+                "repo_id": cp.repo_id,
+                "revision": cp.revision,
                 "signature": cp.signature,
             }
 

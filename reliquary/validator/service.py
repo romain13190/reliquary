@@ -10,8 +10,10 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
+    CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
     CHECKPOINT_STAGING_DIR_DEFAULT,
     CHECKPOINT_STATE_PATH_DEFAULT,
+    DEFAULT_HF_REPO_ID,
     POLL_INTERVAL_SECONDS,
     SUBNET_START_BLOCK,
     UID_BURN,
@@ -99,6 +101,7 @@ class ValidationService:
         http_port: int = VALIDATOR_HTTP_PORT,
         external_ip: str | None = None,
         external_port: int | None = None,
+        hf_repo_id: str | None = None,
     ) -> None:
         self.wallet = wallet
         self.model = model
@@ -122,9 +125,11 @@ class ValidationService:
         self._state_path = CHECKPOINT_STATE_PATH_DEFAULT
         self._state = ValidatorState(self._state_path)
         self._state.load()
+        self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
             wallet=wallet,
+            repo_id=hf_repo_id or DEFAULT_HF_REPO_ID,
             staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
         )
         self._active_batcher = None
@@ -160,7 +165,7 @@ class ValidationService:
         )
         cp = self._checkpoint_store.current_manifest()
         self._active_batcher.current_checkpoint_hash = (
-            cp.file_hash if cp else ""
+            cp.revision if cp else ""
         )
         self.server.set_active_batcher(self._active_batcher)
         self._set_state(WindowState.OPEN)
@@ -179,20 +184,35 @@ class ValidationService:
         self.model = train_step(self.model, batch)
 
         self._set_state(WindowState.PUBLISHING)
-        new_n = self._state.checkpoint_n + 1
-        try:
-            entry = await self._checkpoint_store.publish(
-                checkpoint_n=new_n, model=self.model,
-            )
-            self._state.checkpoint_n = new_n
-            self._state.save()
-            # Notify server of new manifest (Task 9 adds this method).
+        # checkpoint_n only advances on publish; use window_n for cadence.
+        next_n = self._state.checkpoint_n + 1
+        # Push to HF every N windows, or immediately if no checkpoint exists yet.
+        should_publish = (
+            (self._state.window_n % self._publish_every == 0)
+            or self._checkpoint_store.current_manifest() is None
+        )
+        if should_publish:
             try:
-                self.server.set_current_checkpoint(entry)
-            except AttributeError:
-                pass
-        except Exception:
-            logger.exception("checkpoint publish failed; staying on previous")
+                entry = await self._checkpoint_store.publish(
+                    checkpoint_n=next_n, model=self.model,
+                )
+                self._state.checkpoint_n = next_n
+                self._state.save()
+                try:
+                    self.server.set_current_checkpoint(entry)
+                except AttributeError:
+                    pass
+                logger.info(
+                    "Published checkpoint %d to %s@%s",
+                    entry.checkpoint_n, entry.repo_id, entry.revision[:12],
+                )
+            except Exception:
+                logger.exception("HF publish failed; staying on previous checkpoint")
+        else:
+            logger.info(
+                "Skipping HF publish for window_n=%d (publishing every %d)",
+                self._state.window_n, self._publish_every,
+            )
 
         try:
             await self._archive_window(self._active_batcher, batch)

@@ -115,6 +115,19 @@ WEIGHT_SUBMISSION_INTERVAL = 360  # Blocks between weight submissions
 
 CHECKPOINT_PREFIX = "reliquary/checkpoints/"
 
+# ────────────────  HUGGING FACE CHECKPOINT PUBLISHING  ────────────────
+
+# How often to publish the current in-memory model to Hugging Face.
+# Training happens every window (stub in v2.1, real GRPO in follow-up),
+# but HF uploads are slow for large models, so we publish only every
+# N windows. Between publishes, miners stay on the last pushed revision.
+CHECKPOINT_PUBLISH_INTERVAL_WINDOWS = 10
+
+# Default HF repo target for published checkpoints. Operator may
+# override via --hf-repo-id CLI arg. Must be a writable repo id for
+# the validator's HF token.
+DEFAULT_HF_REPO_ID = "aivolutionedge/reliquary-sn"
+
 # ────────────────  DEPRECATED (GRPO REFACTOR)  ────────────────
 # Kept importable to avoid breaking transitive imports during the rollout.
 # These knobs no longer participate in any runtime decision and will be

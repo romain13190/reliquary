@@ -44,22 +44,35 @@ async def maybe_pull_checkpoint(
     download_fn,
     load_fn,
 ):
-    """If remote checkpoint_n > local, download + load and return new model.
+    """If remote checkpoint_n > local, download via HF and load.
+
+    state.checkpoint_repo_id + state.checkpoint_revision identify the
+    HF snapshot. download_fn/load_fn still injected for testability.
 
     Returns ``(new_local_n, new_local_hash, new_model)``. If no update is
-    needed (remote ≤ local, or remote has no URL yet), returns inputs
-    unchanged.
-
-    The download/load functions are injected so unit tests don't need
-    httpx + torch.
+    needed (remote ≤ local, or remote has no repo/revision yet), returns
+    inputs unchanged.
     """
     if state.checkpoint_n <= local_n:
         return local_n, local_hash, local_model
-    if state.checkpoint_url is None:
+    if state.checkpoint_repo_id is None or state.checkpoint_revision is None:
         return local_n, local_hash, local_model
-    local_path = await download_fn(state.checkpoint_url)
+    local_path = await download_fn(state.checkpoint_repo_id, state.checkpoint_revision)
     new_model = load_fn(local_path)
-    return state.checkpoint_n, state.checkpoint_hash, new_model
+    return state.checkpoint_n, state.checkpoint_revision, new_model
+
+
+async def _hf_download(repo_id: str, revision: str) -> str:
+    """Download a snapshot into the local HF cache and return the model folder path."""
+    import asyncio
+    from huggingface_hub import snapshot_download
+
+    return await asyncio.to_thread(
+        snapshot_download,
+        repo_id=repo_id,
+        revision=revision,
+        allow_patterns=["model.safetensors", "config.json", "tokenizer*"],
+    )
 
 
 def pick_prompt_idx(
@@ -179,7 +192,7 @@ class MiningEngine:
         from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
             SubmissionError, discover_validator_url,
-            download_checkpoint, get_window_state_v2, submit_batch_v2,
+            get_window_state_v2, submit_batch_v2,
         )
         from reliquary.protocol.submission import (
             BatchSubmissionRequest, WindowState,
@@ -218,7 +231,7 @@ class MiningEngine:
                     local_n, local_hash, self.hf_model = await maybe_pull_checkpoint(
                         state=state, local_n=local_n, local_hash=local_hash,
                         local_model=self.hf_model,
-                        download_fn=lambda u: download_checkpoint(u, client=client),
+                        download_fn=_hf_download,
                         load_fn=self._load_checkpoint,
                     )
                 except Exception:

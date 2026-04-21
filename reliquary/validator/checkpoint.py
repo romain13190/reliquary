@@ -1,4 +1,4 @@
-"""CheckpointStore: produce → hash → sign → upload → manifest entry.
+"""CheckpointStore: save → upload to HuggingFace → sign → manifest entry.
 
 Single-validator (v2.1) implementation. The validator owns the
 checkpoint lifecycle for the whole netuid; multi-validator consensus
@@ -7,7 +7,6 @@ on checkpoint hash is a v2.2 concern.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -22,9 +21,9 @@ class ManifestEntry:
     """A published checkpoint entry."""
 
     checkpoint_n: int
-    file_url: str
-    file_hash: str       # "sha256:<hex>"
-    signature: str       # "ed25519:<hex>" — wallet signs (n || file_hash)
+    repo_id: str          # HF repo, e.g. "aivolutionedge/reliquary-sn"
+    revision: str         # HF commit SHA (serves as strong content hash)
+    signature: str        # "ed25519:<hex>" — wallet signs (checkpoint_n || revision)
 
 
 class _WalletLike(Protocol):
@@ -41,21 +40,25 @@ class CheckpointStore:
 
     Production wiring (defaults):
       * ``save_weights_fn`` → ``torch.save(model.state_dict(), path)``
-      * ``upload_fn`` → ``storage.upload_checkpoint_file`` (added in Task 4)
-    Tests inject both as mocks to avoid torch + R2 deps.
+      * ``upload_fn`` → HuggingFace Hub upload_file (lazy import)
+    Tests inject both as mocks to avoid torch + HF deps.
     """
 
     def __init__(
         self,
         validator_hotkey: str,
         wallet: _WalletLike,
+        repo_id: str,
         staging_dir_path: str,
         *,
-        upload_fn: Callable[[str, str], Awaitable[str]] | None = None,
+        hf_token: str | None = None,
+        upload_fn: Callable[..., Awaitable[str]] | None = None,
         save_weights_fn: Callable[[Any, Path], None] | None = None,
     ) -> None:
         self.validator_hotkey = validator_hotkey
         self.wallet = wallet
+        self.repo_id = repo_id
+        self.hf_token = hf_token or os.environ.get("HF_TOKEN")
         self.staging_dir = Path(staging_dir_path)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._upload = upload_fn or _default_upload
@@ -66,48 +69,67 @@ class CheckpointStore:
         return self._current
 
     async def publish(self, checkpoint_n: int, model: Any) -> ManifestEntry:
-        """Save → hash → sign → upload → install in manifest."""
+        """Save locally → upload to HF → sign (n || revision) → install manifest."""
+        # 1. Save locally
         path = self.staging_dir / f"{checkpoint_n}.safetensors"
         self._save_weights(model, path)
-        file_hash = self._sha256_file(path)
-        sig_payload = f"{checkpoint_n}|{file_hash}".encode()
+
+        # 2. Upload to HF — returns the new commit revision (SHA)
+        revision = await self._upload(
+            local_path=str(path),
+            repo_id=self.repo_id,
+            path_in_repo="model.safetensors",
+            commit_message=f"checkpoint {checkpoint_n}",
+        )
+
+        # 3. Sign (n || revision) — strong cross-validator proof
+        sig_payload = f"{checkpoint_n}|{revision}".encode()
         sig_bytes = self.wallet.hotkey.sign(sig_payload)
         signature = "ed25519:" + sig_bytes.hex()
 
-        key = f"reliquary/checkpoints/{self.validator_hotkey}/{checkpoint_n}.safetensors"
-        url = await self._upload(str(path), key)
-
+        # 4. Install manifest
         entry = ManifestEntry(
             checkpoint_n=checkpoint_n,
-            file_url=url,
-            file_hash=file_hash,
+            repo_id=self.repo_id,
+            revision=revision,
             signature=signature,
         )
         self._current = entry
         logger.info(
-            "Published checkpoint %d (hash=%s, url=%s)",
-            checkpoint_n, file_hash[:16], url,
+            "Published checkpoint %d to %s@%s",
+            checkpoint_n, self.repo_id, revision[:12],
         )
         return entry
 
-    @staticmethod
-    def _sha256_file(path: Path) -> str:
-        h = hashlib.sha256()
-        with path.open("rb") as f:
-            while True:
-                chunk = f.read(64 * 1024)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return "sha256:" + h.hexdigest()
 
+# ---- production defaults (lazy-imported so tests don't drag torch/HF in) ----
 
-# ---- production defaults (lazy-imported so tests don't drag torch/R2 in) ----
+async def _default_upload(
+    local_path: str,
+    repo_id: str,
+    path_in_repo: str,
+    commit_message: str,
+) -> str:
+    """Upload via huggingface_hub.HfApi.upload_file.
 
-async def _default_upload(local_path: str, key: str) -> str:
-    """Default upload using the R2 helper from Task 4."""
-    from reliquary.infrastructure import storage
-    return await storage.upload_checkpoint_file(local_path, key)
+    Returns the commit revision SHA (strong hash of the repo state).
+    Runs in a thread — HfApi is sync.
+    """
+    import asyncio
+    from huggingface_hub import HfApi
+
+    def _sync_upload():
+        api = HfApi()
+        commit_info = api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            commit_message=commit_message,
+        )
+        # CommitInfo.oid holds the commit SHA
+        return commit_info.oid
+
+    return await asyncio.to_thread(_sync_upload)
 
 
 def _default_save_weights(model: Any, path: Path) -> None:

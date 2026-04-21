@@ -105,5 +105,5 @@ class GrpoBatchState(BaseModel):
     cooldown_prompts: list[int] = Field(default_factory=list)
     valid_submissions: int = Field(..., ge=0)
     checkpoint_n: int = Field(..., ge=0)
-    checkpoint_url: str | None = None
-    checkpoint_hash: str | None = None
+    checkpoint_repo_id: str | None = None
+    checkpoint_revision: str | None = None

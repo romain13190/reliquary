@@ -6,7 +6,7 @@ import os
 
 import typer
 
-from reliquary.constants import ENVIRONMENT_NAME, VALIDATOR_HTTP_PORT
+from reliquary.constants import DEFAULT_HF_REPO_ID, ENVIRONMENT_NAME, VALIDATOR_HTTP_PORT
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 
@@ -145,6 +145,10 @@ def validate(
         0,
         help="Public port to advertise on-chain; defaults to --http-port when 0.",
     ),
+    hf_repo_id: str = typer.Option(
+        DEFAULT_HF_REPO_ID,
+        help="HuggingFace repo ID to publish checkpoints to (must be writable with HF_TOKEN).",
+    ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Run Reliquary validator."""
@@ -195,6 +199,7 @@ def validate(
             http_port=http_port,
             external_ip=external_ip or None,
             external_port=(external_port or http_port) if external_ip else None,
+            hf_repo_id=hf_repo_id,
         )
         await service.run(subtensor)
 

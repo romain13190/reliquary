@@ -111,24 +111,3 @@ async def test_current_window_smaller_than_n_caps_at_zero():
     assert result == []
 
 
-@pytest.mark.asyncio
-async def test_upload_checkpoint_file(tmp_path):
-    """upload_checkpoint_file streams a local file to R2 and returns the URL."""
-    from unittest.mock import AsyncMock, patch
-    from reliquary.infrastructure.storage import upload_checkpoint_file
-
-    src = tmp_path / "checkpoint.safetensors"
-    src.write_bytes(b"fake_weights_payload")
-
-    mock_client = AsyncMock()
-    mock_client.put_object = AsyncMock(return_value={})
-    mock_ctx = AsyncMock()
-    mock_ctx.__aenter__.return_value = mock_client
-    mock_ctx.__aexit__.return_value = None
-
-    with patch(
-        "reliquary.infrastructure.storage.get_s3_client", return_value=mock_ctx
-    ), patch.dict("os.environ", {"R2_BUCKET_ID": "reliquary"}):
-        url = await upload_checkpoint_file(str(src), "reliquary/checkpoints/hk/1.safetensors")
-    assert "reliquary/checkpoints/hk/1.safetensors" in url
-    mock_client.put_object.assert_awaited_once()
