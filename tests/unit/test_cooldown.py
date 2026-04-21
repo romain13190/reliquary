@@ -110,8 +110,8 @@ def test_rebuild_from_history_takes_most_recent():
     m.rebuild_from_history(archived, current_window=120)
     # Prompt 42 last seen at 105
     assert m.is_in_cooldown(42, 120) is True
-    assert m.is_in_cooldown(42, 155) is True
-    assert m.is_in_cooldown(42, 156) is False
+    assert m.is_in_cooldown(42, 154) is True
+    assert m.is_in_cooldown(42, 155) is False
     # Prompt 7 last seen at 110
     assert m.is_in_cooldown(7, 159) is True
     assert m.is_in_cooldown(7, 160) is False
