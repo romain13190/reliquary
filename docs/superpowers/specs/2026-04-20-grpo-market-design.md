@@ -78,7 +78,7 @@ handles hardware heterogeneity — same flow as v1.
 | `top_p_proto`, `top_k_proto`, `MAX_NEW_TOKENS_PROTOCOL_CAP` | fixed | same reason |
 | `ZONE_K_MIN`, `ZONE_K_MAX` | 2, 6 | apprenable zone; `k ∉ [2,6]` → rejected |
 | `B` | 8 | batch size for training step |
-| `BATCH_PROMPT_COOLDOWN_WINDOWS` | 3 | a batched prompt is ineligible for `B` for the next N windows |
+| `BATCH_PROMPT_COOLDOWN_WINDOWS` | 50 | a batched prompt is ineligible for `B` for the next N windows (= training steps) |
 
 ## Protocol flow
 
@@ -350,8 +350,9 @@ a dead cold start:
 - `BOOTSTRAP_K_RANGE = (1, 7)` — wider zone during bootstrap
 - `BOOTSTRAP_M = 4` — smaller groups for easier hit rate (reverts to 8 at
   window 100)
-- `BOOTSTRAP_COOLDOWN = 0` — no cooldown during bootstrap (maximise batch
-  fill rate, reverts to 3 at window 100)
+- `BOOTSTRAP_COOLDOWN = 10` — shorter cooldown during bootstrap to keep
+  the batch full while miner population and env coverage are thin
+  (reverts to 50 at window 100)
 - Curated env subset in `env_version=bootstrap` — prompts pre-screened to
   fall in `[0.2, 0.8]` for the initial checkpoint
 
@@ -467,9 +468,10 @@ pre-announced block height.
 3. `DIVERSITY_PREFIX_LEN` from v1 — keep as a sanity check (rejects
    obvious copy-paste across miners) or drop entirely? Prompt-level
    diversity in the batch probably subsumes it.
-4. `BATCH_PROMPT_COOLDOWN_WINDOWS = 3` — first-principles guess. Worth
-   A/B-ing on testnet (3 vs 5 vs 10) to measure impact on env coverage
-   vs curriculum efficiency.
+4. `BATCH_PROMPT_COOLDOWN_WINDOWS = 50` — sized so ~400 distinct prompts
+   (50 × B) are trained between reuses of the same prompt, giving the
+   policy time to shift meaningfully. Worth A/B-ing on testnet (20 vs 50
+   vs 100) vs env size to measure env-coverage tradeoff.
 
 These are surface-level tuning choices; the structural design does not
 depend on the answers.
