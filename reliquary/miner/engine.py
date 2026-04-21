@@ -216,9 +216,9 @@ class MiningEngine:
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
                 try:
-                    state = await get_window_state_v2(url, 0, client=client)
+                    state = await get_window_state_v2(url, client=client)
                 except SubmissionError:
-                    # /window/state may return 404 between windows; wait briefly.
+                    # /state may return 503 between windows; wait briefly.
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
                 except Exception as e:

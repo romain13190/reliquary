@@ -75,7 +75,7 @@ def mine(
             import httpx
             from huggingface_hub import snapshot_download
             async with httpx.AsyncClient(timeout=30) as client:
-                state = await get_window_state_v2(url, 0, client=client)
+                state = await get_window_state_v2(url, client=client)
             if state.checkpoint_repo_id and state.checkpoint_revision:
                 logger.info(
                     "Validator at %s is on checkpoint %d (%s@%s). "

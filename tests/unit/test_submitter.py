@@ -162,7 +162,7 @@ async def test_get_window_state_v2(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "get", _get)
     client = httpx.AsyncClient()
-    s = await get_window_state_v2("http://fake", 100, client=client)
+    s = await get_window_state_v2("http://fake", client=client)
     assert s.window_n == 100
     assert set(s.cooldown_prompts) == {42, 7}
     await client.aclose()

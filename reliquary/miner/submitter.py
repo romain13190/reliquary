@@ -136,9 +136,11 @@ async def _get_with_retry(
                 if attempt < len(_RETRY_DELAYS):
                     await asyncio.sleep(delay)
                 continue
+            if resp.status_code == 503:
+                # No active window yet — caller's job to handle.
+                raise SubmissionError(f"no active window at {full_url}")
             if resp.status_code == 404:
-                # Window not active — caller's job to handle.
-                raise SubmissionError(f"window not active at {full_url}")
+                raise SubmissionError(f"endpoint not found: {full_url}")
             if 400 <= resp.status_code < 500:
                 raise SubmissionError(
                     f"HTTP {resp.status_code}: {_safe_detail(resp)}"
@@ -182,14 +184,13 @@ async def submit_batch_v2(
 
 async def get_window_state_v2(
     url: str,
-    window_start: int,
     *,
     client: httpx.AsyncClient | None = None,
     timeout: float = _DEFAULT_TIMEOUT,
 ) -> GrpoBatchState:
-    """GET the validator's v2 GrpoBatchState for a given window."""
+    """GET the validator's current v2 GrpoBatchState."""
     return await _get_with_retry(
-        f"{url}/window/{window_start}/state", GrpoBatchState,
+        f"{url}/state", GrpoBatchState,
         client=client, timeout=timeout,
     )
 

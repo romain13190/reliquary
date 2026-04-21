@@ -102,19 +102,19 @@ def test_state_endpoint_returns_grpo_batch_state():
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
-    resp = client.get("/window/500/state")
+    resp = client.get("/state")
     assert resp.status_code == 200
     state = GrpoBatchState(**resp.json())
     assert state.window_n == 500
     assert 42 in state.cooldown_prompts
 
 
-def test_state_endpoint_404_on_wrong_window():
+def test_state_endpoint_503_when_no_active_batcher():
     server = ValidatorServer()
-    server.set_active_batcher(_batcher(window_start=500))
     client = TestClient(server.app)
-    resp = client.get("/window/999/state")
-    assert resp.status_code == 404
+    resp = client.get("/state")
+    assert resp.status_code == 503
+    assert resp.json()["detail"] == "no_active_window"
 
 
 # --- v2.1: state-aware endpoints ---
@@ -156,7 +156,7 @@ def test_state_endpoint_returns_window_state_enum():
     server.set_active_batcher(batcher)
     server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
-    resp = client.get("/window/500/state")
+    resp = client.get("/state")
     assert resp.status_code == 200
     body = resp.json()
     assert body["state"] == "open"
@@ -180,7 +180,7 @@ def test_state_endpoint_exposes_checkpoint_when_set():
         signature="ed25519:sig",
     ))
     client = TestClient(server.app)
-    resp = client.get("/window/500/state")
+    resp = client.get("/state")
     body = resp.json()
     assert body["checkpoint_n"] == 7
     assert body["checkpoint_repo_id"] == "aivolutionedge/reliquary-sn"

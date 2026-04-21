@@ -173,7 +173,7 @@ class ValidationService:
 
     def _set_state(self, s: WindowState) -> None:
         self._current_window_state = s
-        # Also notify the server so /window/state returns the right value.
+        # Also notify the server so /state returns the right value.
         try:
             self.server.set_current_state(s)
         except AttributeError:

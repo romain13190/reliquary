@@ -1,4 +1,4 @@
-"""Miner detects new checkpoint_n via /window/state and downloads via HF."""
+"""Miner detects new checkpoint_n via /state and downloads via HF."""
 
 from unittest.mock import AsyncMock, MagicMock
 

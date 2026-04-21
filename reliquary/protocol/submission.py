@@ -94,7 +94,7 @@ class BatchSubmissionResponse(BaseModel):
 
 
 class GrpoBatchState(BaseModel):
-    """Live window state for miners polling ``/window/{n}/state`` (v2.1)."""
+    """Live window state for miners polling ``/state`` (v2.1)."""
 
     model_config = ConfigDict(extra="forbid")
 

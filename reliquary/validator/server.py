@@ -95,18 +95,17 @@ class ValidatorServer:
                 accepted=True, reason=RejectReason.ACCEPTED,
             )
 
-        @app.get(
-            "/window/{window_start}/state", response_model=GrpoBatchState
-        )
-        async def window_state(window_start: int) -> GrpoBatchState:
+        @app.get("/state", response_model=GrpoBatchState)
+        async def state() -> GrpoBatchState:
+            """Current window + checkpoint state. v2.1 has one active batcher per validator."""
             batcher = self.active_batcher
-            if batcher is None or batcher.window_start != window_start:
-                raise HTTPException(status_code=404, detail="window_not_active")
+            if batcher is None:
+                raise HTTPException(status_code=503, detail="no_active_window")
             cp = self._current_checkpoint
             return GrpoBatchState(
                 state=self._current_state,
                 window_n=batcher.window_start,
-                anchor_block=batcher.window_start,  # placeholder; real anchor via service later
+                anchor_block=batcher.window_start,
                 current_round=batcher.current_round,
                 cooldown_prompts=sorted(
                     batcher._cooldown.current_cooldown_set(batcher.window_start)
