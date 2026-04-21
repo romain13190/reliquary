@@ -23,7 +23,7 @@ class FakeEnv:
 
 
 def _batcher(window_start=500, cooldown_map=None):
-    return GrpoWindowBatcher(
+    batcher = GrpoWindowBatcher(
         window_start=window_start,
         current_round=1000,
         env=FakeEnv(),
@@ -34,9 +34,11 @@ def _batcher(window_start=500, cooldown_map=None):
         verify_proof_version_fn=lambda c: True,
         completion_text_fn=lambda r: r.commit.get("completion_text_for_test", ""),
     )
+    batcher.current_checkpoint_hash = "sha256:test"
+    return batcher
 
 
-def _request(prompt_idx=42, window_start=500, signed_round=1000, k=4):
+def _request(prompt_idx=42, window_start=500, signed_round=1000, k=4, checkpoint_hash="sha256:test"):
     rollouts = []
     for i in range(M_ROLLOUTS):
         text = "CORRECT" if i < k else "wrong"
@@ -54,13 +56,16 @@ def _request(prompt_idx=42, window_start=500, signed_round=1000, k=4):
         signed_round=signed_round,
         merkle_root="00" * 32,
         rollouts=rollouts,
+        checkpoint_hash=checkpoint_hash,
     )
 
 
 def test_submit_returns_queued_on_active_window():
+    from reliquary.protocol.submission import WindowState
     server = ValidatorServer()
     batcher = _batcher(window_start=500)
     server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
     resp = client.post("/submit", json=_request().model_dump(mode="json"))
     assert resp.status_code == 200
@@ -70,31 +75,37 @@ def test_submit_returns_queued_on_active_window():
 
 
 def test_submit_503_when_no_active_batcher():
+    from reliquary.protocol.submission import WindowState
     server = ValidatorServer()
+    server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
     resp = client.post("/submit", json=_request().model_dump(mode="json"))
     assert resp.status_code == 503
 
 
 def test_submit_409_on_window_mismatch():
+    from reliquary.protocol.submission import WindowState
     server = ValidatorServer()
     server.set_active_batcher(_batcher(window_start=500))
+    server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
     resp = client.post("/submit", json=_request(window_start=999).model_dump(mode="json"))
     assert resp.status_code == 409
 
 
 def test_state_endpoint_returns_grpo_batch_state():
+    from reliquary.protocol.submission import WindowState
     cd = CooldownMap(cooldown_windows=50)
     cd.record_batched(prompt_idx=42, window=490)
     batcher = _batcher(window_start=500, cooldown_map=cd)
     server = ValidatorServer()
     server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
     client = TestClient(server.app)
     resp = client.get("/window/500/state")
     assert resp.status_code == 200
     state = GrpoBatchState(**resp.json())
-    assert state.window_start == 500
+    assert state.window_n == 500
     assert 42 in state.cooldown_prompts
 
 
@@ -104,3 +115,99 @@ def test_state_endpoint_404_on_wrong_window():
     client = TestClient(server.app)
     resp = client.get("/window/999/state")
     assert resp.status_code == 404
+
+
+# --- v2.1: state-aware endpoints ---
+
+def test_submit_rejects_when_state_not_open():
+    """When state != OPEN, /submit returns a non-accepted response."""
+    from reliquary.protocol.submission import WindowState
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.current_checkpoint_hash = "sha256:test"
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.TRAINING)
+    client = TestClient(server.app)
+    resp = client.post("/submit", json=_request().model_dump(mode="json"))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "window_not_active"
+
+
+def test_submit_accepted_when_state_open():
+    from reliquary.protocol.submission import WindowState
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    batcher.current_checkpoint_hash = "sha256:test"
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+    resp = client.post("/submit", json=_request().model_dump(mode="json"))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] is True
+
+
+def test_state_endpoint_returns_window_state_enum():
+    from reliquary.protocol.submission import WindowState
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    client = TestClient(server.app)
+    resp = client.get("/window/500/state")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["state"] == "open"
+    assert body["window_n"] == 500
+    assert body["checkpoint_n"] == 0  # no checkpoint published yet
+    assert body["checkpoint_url"] is None
+    assert body["checkpoint_hash"] is None
+
+
+def test_state_endpoint_exposes_checkpoint_when_set():
+    from reliquary.protocol.submission import WindowState
+    from reliquary.validator.checkpoint import ManifestEntry
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    server.set_current_state(WindowState.OPEN)
+    server.set_current_checkpoint(ManifestEntry(
+        checkpoint_n=7,
+        file_url="https://r2/7",
+        file_hash="sha256:seven",
+        signature="ed25519:sig",
+    ))
+    client = TestClient(server.app)
+    resp = client.get("/window/500/state")
+    body = resp.json()
+    assert body["checkpoint_n"] == 7
+    assert body["checkpoint_url"] == "https://r2/7"
+    assert body["checkpoint_hash"] == "sha256:seven"
+
+
+def test_checkpoint_endpoint_404_when_none_published():
+    server = ValidatorServer()
+    client = TestClient(server.app)
+    resp = client.get("/checkpoint")
+    assert resp.status_code == 404
+
+
+def test_checkpoint_endpoint_returns_manifest_when_set():
+    from reliquary.validator.checkpoint import ManifestEntry
+    server = ValidatorServer()
+    server.set_current_checkpoint(ManifestEntry(
+        checkpoint_n=42,
+        file_url="https://r2/42",
+        file_hash="sha256:forty_two",
+        signature="ed25519:sig_42",
+    ))
+    client = TestClient(server.app)
+    resp = client.get("/checkpoint")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["checkpoint_n"] == 42
+    assert body["file_url"] == "https://r2/42"
+    assert body["file_hash"] == "sha256:forty_two"
+    assert body["signature"] == "ed25519:sig_42"
