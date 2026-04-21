@@ -107,3 +107,28 @@ def verify_commitment_proofs(
     # A miner cannot benefit from having fewer positions verified.
     all_passed = passed == checked and checked >= expected_challenges
     return all_passed, passed, checked
+
+
+def verify_reward_claim(
+    env: Any,
+    problem: dict,
+    completion_text: str,
+    claimed: float,
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    """Re-compute the env's reward on *completion_text* and compare to *claimed*.
+
+    Miners declare the reward of each completion in their submission (saves
+    validator compute when they can pre-filter out-of-zone) but the validator
+    re-runs ``env.compute_reward`` to check honesty. A mismatch means the
+    miner lied about reward, warranting rejection.
+
+    Returns True iff |env_reward - claimed| <= tolerance. The small tolerance
+    absorbs float64 formatting round-trip (JSON serialisation) noise.
+    """
+    try:
+        actual = env.compute_reward(problem, completion_text)
+    except Exception:
+        return False
+    return abs(float(actual) - float(claimed)) <= tolerance
