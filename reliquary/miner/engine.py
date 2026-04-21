@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING
 import random as _random
 
 from reliquary.constants import (
-    BLOCK_TIME_SECONDS,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     M_ROLLOUTS,

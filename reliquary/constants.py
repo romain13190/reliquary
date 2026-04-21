@@ -102,9 +102,6 @@ UID_BURN = 0
 MIN_ROLLOUT_FILE_SIZE_BYTES = 200
 MAX_ROLLOUT_FILE_SIZE_BYTES = 350 * 1024 * 1024  # 350 MB
 
-# Soft check threshold for stochastic failures.
-STOCHASTIC_CHECK_FAILURE_THRESHOLD = 0.51
-
 # ────────────────  CONTINUOUS VALIDATION  ────────────────
 
 # How often the validator polls for new state (seconds).

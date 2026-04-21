@@ -9,7 +9,6 @@ from collections import defaultdict
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
-    BLOCK_TIME_SECONDS,
     BOOTSTRAP_WINDOWS,
     CHECKPOINT_STAGING_DIR_DEFAULT,
     CHECKPOINT_STATE_PATH_DEFAULT,
@@ -227,7 +226,7 @@ class ValidationService:
     async def run(self, subtensor) -> None:
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
-        await self._rebuild_cooldown_from_history(subtensor)
+        await self._rebuild_cooldown_from_history()
         logger.info(
             "Validator started (v2.1): env=%s, netuid=%d, http=%s:%d",
             self.env.name, self.netuid, self.server.host, self.server.port,
@@ -319,7 +318,7 @@ class ValidationService:
                 "serve_axon threw — miners will have to use --validator-url"
             )
 
-    async def _rebuild_cooldown_from_history(self, subtensor) -> None:
+    async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, reconstruct CooldownMap from the last
         BATCH_PROMPT_COOLDOWN_WINDOWS archived windows on R2.
 
@@ -332,8 +331,7 @@ class ValidationService:
             current cooldown state without coordination
         """
         try:
-            current_block = await chain.get_current_block(subtensor)
-            current_window = self._compute_target_window(current_block)
+            current_window = self._state.window_n
             archives = await storage.list_recent_datasets(
                 hotkey=self.wallet.hotkey.ss58_address,
                 current_window=current_window,
@@ -412,11 +410,3 @@ class ValidationService:
             subtensor, self.wallet, self.netuid, uids, weight_vals,
         )
 
-    @staticmethod
-    def _compute_target_window(current_block: int) -> int:
-        return (current_block // WINDOW_LENGTH) * WINDOW_LENGTH - WINDOW_LENGTH
-
-    # _run_window is superseded by _open_window + _train_and_publish + _archive_window.
-    # Kept as dead code for Task 13 cleanup.
-    async def _run_window(self, subtensor, target_window: int) -> None:
-        pass

@@ -62,15 +62,13 @@ async def test_rebuild_cooldown_from_history_populates_map():
         {"window_start": 100, "batch": [{"prompt_idx": 42}]},
         {"window_start": 101, "batch": [{"prompt_idx": 7}]},
     ]
+    svc._state.window_n = 105  # v2.1 authoritative counter
 
     with patch(
         "reliquary.infrastructure.storage.list_recent_datasets",
         new=AsyncMock(return_value=archives),
-    ), patch(
-        "reliquary.infrastructure.chain.get_current_block",
-        new=AsyncMock(return_value=110),  # _compute_target_window(110) = 105; horizon = 105-50 = 55 < 100
     ):
-        await svc._rebuild_cooldown_from_history(subtensor=object())
+        await svc._rebuild_cooldown_from_history()
 
     # Should now know about prompts 42 and 7.
     assert len(svc._cooldown_map) == 2
