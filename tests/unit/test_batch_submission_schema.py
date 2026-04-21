@@ -10,6 +10,7 @@ from reliquary.protocol.submission import (
     GrpoBatchState,
     RejectReason,
     RolloutSubmission,
+    WindowState,
 )
 
 
@@ -35,6 +36,7 @@ def test_valid_request_parses():
         signed_round=999_999,
         merkle_root="00" * 32,
         rollouts=_valid_rollouts(k=4),
+        checkpoint_hash="sha256:test",
     )
     assert req.prompt_idx == 42
     assert len(req.rollouts) == M_ROLLOUTS
@@ -91,10 +93,13 @@ def test_accepted_response():
 
 def test_grpo_batch_state_exposes_cooldown():
     state = GrpoBatchState(
-        window_start=100,
+        state=WindowState.OPEN,
+        window_n=100,
+        anchor_block=1000,
         current_round=999,
         cooldown_prompts=[42, 7, 99],
         valid_submissions=12,
+        checkpoint_n=0,
     )
     dumped = state.model_dump()
     assert set(dumped["cooldown_prompts"]) == {42, 7, 99}

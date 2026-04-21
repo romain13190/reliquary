@@ -22,6 +22,7 @@ from reliquary.protocol.submission import (
     GrpoBatchState,
     RejectReason,
     RolloutSubmission,
+    WindowState,
 )
 
 
@@ -100,6 +101,7 @@ def _v2_request():
         signed_round=999,
         merkle_root="00" * 32,
         rollouts=_rollouts(),
+        checkpoint_hash="sha256:test",
     )
 
 
@@ -146,8 +148,13 @@ async def test_submit_batch_v2_reject_reason_propagated(monkeypatch):
 @pytest.mark.asyncio
 async def test_get_window_state_v2(monkeypatch):
     state = GrpoBatchState(
-        window_start=100, current_round=999, cooldown_prompts=[42, 7],
+        state=WindowState.OPEN,
+        window_n=100,
+        anchor_block=1000,
+        current_round=999,
+        cooldown_prompts=[42, 7],
         valid_submissions=3,
+        checkpoint_n=0,
     )
 
     async def _get(self, url, timeout=None):
@@ -156,7 +163,7 @@ async def test_get_window_state_v2(monkeypatch):
     monkeypatch.setattr(httpx.AsyncClient, "get", _get)
     client = httpx.AsyncClient()
     s = await get_window_state_v2("http://fake", 100, client=client)
-    assert s.window_start == 100
+    assert s.window_n == 100
     assert set(s.cooldown_prompts) == {42, 7}
     await client.aclose()
 

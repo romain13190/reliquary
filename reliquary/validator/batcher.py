@@ -24,6 +24,7 @@ from reliquary.protocol.submission import (
     GrpoBatchState,
     RejectReason,
     RolloutSubmission,
+    WindowState,
 )
 from reliquary.validator.batch_selection import select_batch
 from reliquary.validator.cooldown import CooldownMap
@@ -233,10 +234,13 @@ class GrpoWindowBatcher:
     def get_state(self) -> GrpoBatchState:
         with self._lock:
             return GrpoBatchState(
-                window_start=self.window_start,
+                state=WindowState.OPEN,
+                window_n=self.window_start,
+                anchor_block=self.window_start,
                 current_round=self.current_round,
                 cooldown_prompts=sorted(
                     self._cooldown.current_cooldown_set(self.window_start)
                 ),
                 valid_submissions=len(self._valid),
+                checkpoint_n=0,
             )

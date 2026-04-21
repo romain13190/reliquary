@@ -68,6 +68,7 @@ def _request(
         signed_round=signed_round,
         merkle_root="00" * 32,
         rollouts=rollouts,
+        checkpoint_hash="sha256:test",
     )
 
 
@@ -166,6 +167,7 @@ def test_reject_reward_mismatch():
         signed_round=1000,
         merkle_root="00" * 32,
         rollouts=rollouts,
+        checkpoint_hash="sha256:test",
     )
     resp = b.accept_submission(req)
     assert resp.accepted is False
