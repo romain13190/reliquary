@@ -208,3 +208,100 @@ async def test_get_window_state_404_raises() -> None:
     async with httpx.AsyncClient(transport=transport) as client:
         with pytest.raises(SubmissionError):
             await get_window_state("http://val", 1000, client=client)
+
+
+# ---- v2 submitter tests ----
+
+from reliquary.protocol.submission import (
+    BatchSubmissionRequest,
+    BatchSubmissionResponse,
+    GrpoBatchState,
+    RejectReason,
+    RolloutSubmission,
+)
+from reliquary.miner.submitter import (
+    get_window_state_v2,
+    submit_batch_v2,
+)
+
+
+def _rollouts(k=4):
+    out = []
+    for i in range(8):
+        out.append(
+            RolloutSubmission(
+                tokens=[1, 2, 3],
+                reward=1.0 if i < k else 0.0,
+                commit={"tokens": [1, 2, 3], "proof_version": "v5"},
+            )
+        )
+    return out
+
+
+def _v2_request():
+    return BatchSubmissionRequest(
+        miner_hotkey="hk",
+        prompt_idx=42,
+        window_start=100,
+        signed_round=999,
+        merkle_root="00" * 32,
+        rollouts=_rollouts(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_ok(monkeypatch):
+    responses = [
+        httpx.Response(
+            200,
+            json=BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.ACCEPTED
+            ).model_dump(mode="json"),
+        )
+    ]
+
+    async def _post(self, url, json=None, timeout=None):
+        return responses.pop(0)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_submit_batch_v2_reject_reason_propagated(monkeypatch):
+    async def _post(self, url, json=None, timeout=None):
+        return httpx.Response(
+            200,
+            json=BatchSubmissionResponse(
+                accepted=False, reason=RejectReason.PROMPT_IN_COOLDOWN
+            ).model_dump(mode="json"),
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", _post)
+    client = httpx.AsyncClient()
+    resp = await submit_batch_v2("http://fake", _v2_request(), client=client)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_IN_COOLDOWN
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_window_state_v2(monkeypatch):
+    state = GrpoBatchState(
+        window_start=100, current_round=999, cooldown_prompts=[42, 7],
+        valid_submissions=3,
+    )
+
+    async def _get(self, url, timeout=None):
+        return httpx.Response(200, json=state.model_dump(mode="json"))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", _get)
+    client = httpx.AsyncClient()
+    s = await get_window_state_v2("http://fake", 100, client=client)
+    assert s.window_start == 100
+    assert set(s.cooldown_prompts) == {42, 7}
+    await client.aclose()

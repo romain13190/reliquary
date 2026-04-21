@@ -15,6 +15,10 @@ import httpx
 
 from reliquary.constants import VALIDATOR_HTTP_PORT
 from reliquary.protocol.submission import (
+    BatchSubmissionRequest,
+    BatchSubmissionResponse,
+    GrpoBatchState,
+    RejectReason,
     SubmissionRequest,
     SubmissionResponse,
     WindowStateResponse,
@@ -129,8 +133,6 @@ async def _post_with_retry(
             # 4xx means the request is malformed or the validator rejected it
             # for a deterministic reason — retrying is pointless. Parse and return.
             if 400 <= resp.status_code < 500:
-                # 422 (validation) and 503/409 don't carry a SubmissionResponse —
-                # surface them as a non-accepted response with the detail string.
                 detail = _safe_detail(resp)
                 if response_model is SubmissionResponse:
                     return SubmissionResponse(
@@ -139,6 +141,14 @@ async def _post_with_retry(
                         settled=False,
                         slot_count=0,
                     )
+                if response_model is BatchSubmissionResponse:
+                    if resp.status_code == 409:
+                        reason = RejectReason.WINDOW_MISMATCH
+                    elif resp.status_code == 503:
+                        reason = RejectReason.WINDOW_NOT_ACTIVE
+                    else:
+                        reason = RejectReason.BAD_PROMPT_IDX
+                    return BatchSubmissionResponse(accepted=False, reason=reason)
                 raise SubmissionError(f"HTTP {resp.status_code}: {detail}")
             if resp.status_code >= 500:
                 last_exc = SubmissionError(f"HTTP {resp.status_code}")
@@ -198,3 +208,32 @@ def _safe_detail(resp: httpx.Response) -> str:
         return str(body)[:200]
     except Exception:
         return resp.text[:200]
+
+
+async def submit_batch_v2(
+    url: str,
+    request: BatchSubmissionRequest,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> BatchSubmissionResponse:
+    """POST a v2 batch submission. Retries network errors; 4xx is final."""
+    payload = request.model_dump(mode="json")
+    return await _post_with_retry(
+        f"{url}/submit", payload, BatchSubmissionResponse,
+        client=client, timeout=timeout,
+    )
+
+
+async def get_window_state_v2(
+    url: str,
+    window_start: int,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> GrpoBatchState:
+    """GET the validator's v2 GrpoBatchState for a given window."""
+    return await _get_with_retry(
+        f"{url}/window/{window_start}/state", GrpoBatchState,
+        client=client, timeout=timeout,
+    )
