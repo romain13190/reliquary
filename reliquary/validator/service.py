@@ -11,7 +11,9 @@ from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
     BLOCK_TIME_SECONDS,
+    BOOTSTRAP_WINDOWS,
     POLL_INTERVAL_SECONDS,
+    SUBNET_START_BLOCK,
     UID_BURN,
     VALIDATOR_HTTP_PORT,
     WEIGHT_SUBMISSION_INTERVAL,
@@ -28,6 +30,17 @@ from reliquary.validator.weights import compute_weights_v2
 logger = logging.getLogger(__name__)
 
 ROLLING_WINDOWS = WEIGHT_SUBMISSION_INTERVAL // WINDOW_LENGTH
+
+
+def is_bootstrap_window(window_start: int, subnet_start: int) -> bool:
+    """True iff *window_start* is within ``BOOTSTRAP_WINDOWS`` of ``subnet_start``.
+
+    Bootstrap windows use the relaxed zone / cooldown / M values so the
+    batch can fill while miner population and env coverage are thin.
+    """
+    if window_start < subnet_start:
+        return False
+    return window_start - subnet_start < BOOTSTRAP_WINDOWS
 
 
 def open_grpo_window(
@@ -198,6 +211,9 @@ class ValidationService:
         # uses this to validate signed_round freshness.
         current_round = target_window
 
+        bootstrap = is_bootstrap_window(
+            window_start=target_window, subnet_start=SUBNET_START_BLOCK,
+        )
         batcher = open_grpo_window(
             window_start=target_window,
             current_round=current_round,
@@ -205,6 +221,7 @@ class ValidationService:
             model=self.model,
             cooldown_map=self._cooldown_map,
             tokenizer=self.tokenizer,
+            bootstrap=bootstrap,
         )
         batcher.randomness = randomness  # pass through for GRAIL sketch verification
         self.server.set_active_batcher(batcher)
