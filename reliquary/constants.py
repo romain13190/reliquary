@@ -212,3 +212,30 @@ CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
 # gives a ~25-window half-life — a miner that stops contributing loses
 # half their score in ~25 windows.
 EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
+
+# ────────────────  GRPO TRAINING (v2.1)  ────────────────
+
+# Learning rate for AdamW. Small — RL fine-tuning on pretrained LLMs is
+# sensitive; too high = collapse. 5e-7 is a conservative baseline for 4B.
+LEARNING_RATE = 5e-7
+
+# PPO clip range. Standard in GRPO/RLHF literature.
+PPO_CLIP_EPSILON = 0.2
+
+# KL penalty weight (DeepSeek's GRPO default). Keeps π_new close to the
+# frozen reference; too low → drift / mode collapse; too high → no learning.
+KL_BETA = 0.04
+
+# Max gradient norm before step — standard RL stability guard.
+GRAD_CLIP_NORM = 1.0
+
+# Linear LR warmup for the first N training steps (= N windows sealed).
+LR_WARMUP_WINDOWS = 10
+
+# Cosine schedule end target (in windows). Chosen large so LR never
+# actually reaches zero at normal cadence — effectively a slow decay.
+LR_COSINE_MAX_WINDOWS = 10_000
+
+# Default base model (HF repo id). Served as the reference for KL and the
+# cold-start checkpoint.
+DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct"

@@ -6,7 +6,7 @@ import os
 
 import typer
 
-from reliquary.constants import DEFAULT_HF_REPO_ID, ENVIRONMENT_NAME, VALIDATOR_HTTP_PORT
+from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_HF_REPO_ID, ENVIRONMENT_NAME, VALIDATOR_HTTP_PORT
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 
@@ -129,7 +129,7 @@ def validate(
     netuid: int = typer.Option(81, help="Subnet UID"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
-    checkpoint: str = typer.Option(..., help="Model checkpoint path"),
+    checkpoint: str = typer.Option(DEFAULT_BASE_MODEL, help="HF repo id or local path of the model to load"),
     environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name"),
     http_host: str = typer.Option("0.0.0.0", help="HTTP bind address"),
     http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port"),

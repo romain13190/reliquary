@@ -98,6 +98,14 @@ class ValidationService:
     ) -> None:
         self.wallet = wallet
         self.model = model
+        # Enable gradient checkpointing to reduce activation memory.
+        # Harmless if already enabled or unsupported by the model.
+        try:
+            self.model.gradient_checkpointing_enable()
+        except (AttributeError, NotImplementedError):
+            logger.warning(
+                "model does not support gradient_checkpointing_enable"
+            )
         self.tokenizer = tokenizer
         self.env = env
         self.netuid = netuid
