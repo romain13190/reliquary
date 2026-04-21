@@ -236,3 +236,108 @@ def test_distinct_prompts_in_batch_only():
     assert len(batch) == 2
     hotkeys = {s.hotkey for s in batch}
     assert hotkeys == {"alice", "carol"}
+
+
+# --- v2.1 seal_event + checkpoint_hash gating ---
+
+import asyncio
+
+import pytest
+
+
+def _request_v21(prompt_idx=42, signed_round=1000, window_start=500,
+                 rewards=None, hotkey="hk", checkpoint_hash="sha256:abc"):
+    """v2.1 request: includes the required checkpoint_hash field."""
+    if rewards is None:
+        rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    rollouts = []
+    for i, r in enumerate(rewards):
+        text = "CORRECT" if r > 0.5 else "wrong"
+        rollouts.append(
+            RolloutSubmission(
+                tokens=[1, 2, 3, 4, 5], reward=r,
+                commit={
+                    "proof_version": "v5", "tokens": [1, 2, 3, 4, 5],
+                    "completion_text_for_test": text,
+                },
+            )
+        )
+    return BatchSubmissionRequest(
+        miner_hotkey=hotkey, prompt_idx=prompt_idx,
+        window_start=window_start, signed_round=signed_round,
+        merkle_root="00" * 32, rollouts=rollouts,
+        checkpoint_hash=checkpoint_hash,
+    )
+
+
+def test_reject_wrong_checkpoint():
+    """Submission with checkpoint_hash != batcher's current is rejected."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:current"
+    req = _request_v21(checkpoint_hash="sha256:stale")
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.WRONG_CHECKPOINT
+
+
+def test_accept_matching_checkpoint():
+    b = _make_batcher()
+    b.current_checkpoint_hash = "sha256:current"
+    req = _request_v21(checkpoint_hash="sha256:current")
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+
+def test_empty_checkpoint_hash_disables_gate():
+    """When batcher.current_checkpoint_hash is "", any hash is accepted
+    (test convenience — simulates pre-first-publish)."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    req = _request_v21(checkpoint_hash="anything")
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+
+@pytest.mark.asyncio
+async def test_seal_event_set_when_b_valid_distinct_landed():
+    """seal_event fires when the B-th valid distinct-prompt non-cooldown
+    submission is accepted."""
+    b = _make_batcher(current_round=2000)
+    b.current_checkpoint_hash = "sha256:hash"
+    assert not b.seal_event.is_set()
+    for i in range(B_BATCH):
+        req = _request_v21(
+            prompt_idx=i, signed_round=1993 + i, hotkey=f"hk{i}",
+            checkpoint_hash="sha256:hash",
+        )
+        b.accept_submission(req)
+    # Give the event loop a tick to ensure the event is visible.
+    await asyncio.wait_for(b.seal_event.wait(), timeout=0.1)
+    assert b.seal_event.is_set()
+
+
+def test_seal_event_not_set_with_only_duplicate_prompts():
+    """Two submissions on same prompt → only first counts → seal_event not set."""
+    b = _make_batcher(current_round=2000)
+    b.current_checkpoint_hash = "sha256:hash"
+    for i in range(2):
+        req = _request_v21(
+            prompt_idx=42, signed_round=1993 + i, hotkey=f"hk{i}",
+            checkpoint_hash="sha256:hash",
+        )
+        b.accept_submission(req)
+    # Only 1 distinct prompt → not enough for seal
+    assert not b.seal_event.is_set()
+
+
+def test_seal_event_not_set_with_fewer_than_b():
+    """Fewer than B valid submissions → no seal."""
+    b = _make_batcher(current_round=2000)
+    b.current_checkpoint_hash = "sha256:hash"
+    for i in range(B_BATCH - 1):
+        req = _request_v21(
+            prompt_idx=i, signed_round=1993 + i, hotkey=f"hk{i}",
+            checkpoint_hash="sha256:hash",
+        )
+        b.accept_submission(req)
+    assert not b.seal_event.is_set()
