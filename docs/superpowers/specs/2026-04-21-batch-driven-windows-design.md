@@ -271,29 +271,34 @@ cutover did.
 - `test_miner_checkpoint_pull.py` — miner detects new checkpoint_n, downloads, switches model
 - `test_window_counter_persistence.py` — `window_n` survives validator restart (rebuild from R2 history like cooldown)
 
-## Open questions for reviewer
+## Resolved decisions (was: open questions)
 
-1. **Training implementation**: this spec stubs the actual GRPO update.
-   The first iteration just bumps `checkpoint_n` without modifying
-   weights, to validate the orchestration. Real training comes in a
-   follow-up. Acceptable?
-2. **Multi-validator divergence**: with single-trainer-per-window, the
-   network has 1 source of truth per window. If multiple validators
-   run, they fork the model. Do we accept this for v2.1 (each validator
-   serves its own miners) or do we add lightweight election (v2.2
-   work)?
-3. **`WINDOW_TIMEOUT_SECONDS = 600`**: is 10 min the right value? Too
-   short = bursty traffic stalls early. Too long = a dead miner field
-   blocks training for 10 min. Worth A/B on testnet.
-4. **`checkpoint_n` storage**: persisted where? Local JSON on validator
-   + rebuild from R2 manifest history at startup, mirroring the
-   cooldown approach.
+1. **Training implementation**: ✅ stub-first. `train_step(batch)` does
+   not modify weights in v2.1 — it just bumps `checkpoint_n` and writes
+   the current weights as the "new" checkpoint. This validates the full
+   orchestration (seal → publish → pull → submit) without coupling to
+   the actual GRPO loss code. The real GRPO update plugs into
+   `validator/training.py` in a follow-up PR with no protocol change.
+2. **Multi-validator**: ✅ single-validator assumption baked in for
+   v2.1. The whole netuid runs one validator. Multi-validator
+   coordination (consensus on window_n, election of trainer per window,
+   shared checkpoint hash) is v2.2 territory and will be a separate
+   spec. The current code does not need to handle the divergence case
+   because divergence cannot occur.
+3. **`WINDOW_TIMEOUT_SECONDS = 600`**: tunable constant; 10 min is the
+   bootstrap default. Worth A/B on testnet.
+4. **`checkpoint_n` storage**: local JSON on validator at
+   `reliquary/state/checkpoint.json`, plus rebuild from R2 manifest
+   history at startup (mirrors cooldown approach).
 
-## Out of scope
+## Out of scope (v2.1)
 
-- **Real GRPO training implementation** — this spec wires the
-  orchestration; the actual `train_step(batch) → new_weights` is a
-  separate work item, plugged into `validator/training.py`.
-- **Multi-validator checkpoint consensus** — v2.2.
+- **Real GRPO training implementation** — `train_step(batch)` is a stub
+  that bumps `checkpoint_n` and reuses current weights. The actual
+  loss computation + optimizer step plugs into
+  `validator/training.py` in a follow-up PR with no protocol change.
+- **Multi-validator orchestration** — v2.1 assumes a single validator
+  per netuid. Multi-validator consensus on `window_n`, trainer
+  election, and shared checkpoint hashing are v2.2.
 - **Decentralised model storage** (instead of R2) — v2.2 / v3.
 - **Backward-compat with v2.0** — single coordinated cutover.
