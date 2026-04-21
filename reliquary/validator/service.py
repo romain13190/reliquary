@@ -107,7 +107,6 @@ class ValidationService:
 
         self._last_processed_window: int = -1
         self._batched_hotkeys: list[str] = []
-        self._empty_batch_slots: int = 0
         self._windows_in_interval: int = 0
         self._cooldown_map = CooldownMap(
             cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
@@ -171,12 +170,10 @@ class ValidationService:
                         submitted = await self._submit_weights(subtensor)
                         if submitted:
                             self._batched_hotkeys.clear()
-                            self._empty_batch_slots = 0
                         else:
                             logger.warning(
-                                "set_weights did not succeed — keeping %d "
-                                "hotkey slots and %d empty slots for next cycle",
-                                len(self._batched_hotkeys), self._empty_batch_slots,
+                                "set_weights did not succeed — keeping %d hotkey slots for next cycle",
+                                len(self._batched_hotkeys),
                             )
                         self._windows_in_interval = 0
                 except asyncio.CancelledError:
@@ -269,7 +266,6 @@ class ValidationService:
             for sub in batch:
                 self._batched_hotkeys.append(sub.hotkey)
             empty = B_BATCH - len(batch)
-            self._empty_batch_slots += empty
             logger.info(
                 "Window %d sealed: batch=%d/%d, empty=%d, valid_pool=%d",
                 target_window, len(batch), B_BATCH, empty,

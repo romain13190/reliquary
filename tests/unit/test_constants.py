@@ -20,7 +20,6 @@ def test_v2_temperature_fixed_nonzero():
 
 def test_v2_cooldown_values():
     assert C.BATCH_PROMPT_COOLDOWN_WINDOWS == 50
-    assert C.BOOTSTRAP_COOLDOWN_WINDOWS == 10
     assert C.BOOTSTRAP_WINDOWS == 100
 
 
@@ -28,7 +27,3 @@ def test_v2_bootstrap_zone_is_wider_than_steady():
     # k ∈ [1, 7] during bootstrap vs [2, 6] steady
     assert C.BOOTSTRAP_ZONE_K_MIN < C.ZONE_K_MIN
     assert C.BOOTSTRAP_ZONE_K_MAX > C.ZONE_K_MAX
-
-
-def test_v2_bootstrap_m_smaller():
-    assert C.BOOTSTRAP_M_ROLLOUTS < C.M_ROLLOUTS

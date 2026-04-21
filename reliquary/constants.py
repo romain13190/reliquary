@@ -177,8 +177,6 @@ BATCH_PROMPT_COOLDOWN_WINDOWS = 50
 BOOTSTRAP_WINDOWS = 100
 BOOTSTRAP_ZONE_K_MIN = 1
 BOOTSTRAP_ZONE_K_MAX = 7
-BOOTSTRAP_M_ROLLOUTS = 4
-BOOTSTRAP_COOLDOWN_WINDOWS = 10
 
 # First on-chain block at which this subnet deployed v2. Used to
 # determine bootstrap eligibility. Set at the coordinated cutover.

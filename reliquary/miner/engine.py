@@ -66,16 +66,23 @@ def pick_prompt_idx(
 
 
 def _compute_merkle_root(rollouts) -> str:
-    """Compute Merkle root over rollout leaves — returns 64-char hex."""
+    """Compute Merkle root over rollout leaves — returns 64-char hex.
+
+    Uses canonical JSON (sort_keys=True, compact separators) for dict/list
+    serialisation so the root is deterministic across Python
+    implementations and refactor-stable against dict-construction-order
+    changes.
+    """
     import hashlib
+    import json
 
     leaves = []
     for i, r in enumerate(rollouts):
         h = hashlib.sha256()
         h.update(i.to_bytes(8, "big"))
-        h.update(repr(r.tokens).encode())
-        h.update(repr(r.reward).encode())
-        h.update(repr(r.commit).encode())
+        h.update(json.dumps(r.tokens, separators=(",", ":")).encode())
+        h.update(json.dumps(r.reward).encode())
+        h.update(json.dumps(r.commit, sort_keys=True, separators=(",", ":")).encode())
         leaves.append(h.digest())
 
     while len(leaves) > 1:
