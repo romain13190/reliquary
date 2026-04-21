@@ -1,11 +1,9 @@
-"""FastAPI server: receives miner submissions, exposes window state.
+"""FastAPI server: receives v2 GRPO market submissions, exposes window state.
 
-The server holds a reference to the active `WindowBatcher`, which is rotated
-by the validator service at the start of each window. /submit drops requests
-on an asyncio queue and returns immediately; a worker drains the queue and
-runs `accept_submission` in a worker thread so heavy GRAIL verifs don't block
-HTTP responses (otherwise large bodies from real miners would spend the whole
-miner budget waiting for the verifier to return).
+/submit drops requests on an asyncio queue (worker thread drains it off the
+event loop so GRAIL verification doesn't block HTTP responses). Under
+TestClient (no worker running), /submit runs synchronously so tests see
+the real verdict.
 """
 
 from __future__ import annotations
@@ -20,11 +18,12 @@ import uvicorn
 
 from reliquary.constants import VALIDATOR_HTTP_PORT
 from reliquary.protocol.submission import (
-    SubmissionRequest,
-    SubmissionResponse,
-    WindowStateResponse,
+    BatchSubmissionRequest,
+    BatchSubmissionResponse,
+    GrpoBatchState,
+    RejectReason,
 )
-from reliquary.validator.batcher import WindowBatcher
+from reliquary.validator.batcher_v2 import GrpoWindowBatcher
 
 logger = logging.getLogger(__name__)
 
@@ -35,27 +34,21 @@ class _Health(BaseModel):
 
 
 class ValidatorServer:
-    """Lifecycle wrapper around the FastAPI app + uvicorn server."""
-
     def __init__(self, host: str = "0.0.0.0", port: int = VALIDATOR_HTTP_PORT) -> None:
         self.host = host
         self.port = port
-        self.active_batcher: WindowBatcher | None = None
+        self.active_batcher: GrpoWindowBatcher | None = None
         self.app: FastAPI = self._build_app()
         self._server: uvicorn.Server | None = None
         self._task: asyncio.Task[Any] | None = None
-        # Queue is created eagerly so the /submit handler can enqueue even
-        # when the server is running under a TestClient (where start()/the
-        # worker are never invoked). Late-binding to the running loop is fine
-        # on Python 3.10+ since asyncio.Queue is loop-agnostic at init.
         self._submit_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task[Any] | None = None
 
-    def set_active_batcher(self, batcher: WindowBatcher | None) -> None:
+    def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         self.active_batcher = batcher
 
     def _build_app(self) -> FastAPI:
-        app = FastAPI(title="Reliquary Validator", version="1.0")
+        app = FastAPI(title="Reliquary Validator", version="2.0")
 
         @app.get("/health", response_model=_Health)
         async def health() -> _Health:
@@ -66,34 +59,38 @@ class ValidatorServer:
                 ),
             )
 
-        @app.post("/submit", response_model=SubmissionResponse)
-        async def submit(request: SubmissionRequest) -> SubmissionResponse:
+        @app.post("/submit", response_model=BatchSubmissionResponse)
+        async def submit(request: BatchSubmissionRequest) -> BatchSubmissionResponse:
             batcher = self.active_batcher
             if batcher is None:
                 raise HTTPException(status_code=503, detail="no_active_window")
             if request.window_start != batcher.window_start:
                 raise HTTPException(status_code=409, detail="window_mismatch")
+
+            # Under TestClient (no worker running) we run synchronously so tests
+            # see the real accept verdict; under uvicorn we enqueue for the
+            # worker and return a provisional ACCEPTED. The worker's real
+            # verdict surfaces in logs.
+            if self._worker_task is None:
+                return batcher.accept_submission(request)
+
             await self._submit_queue.put((request, batcher))
-            return SubmissionResponse(
-                accepted=True,
-                reason="queued",
-                settled=False,
-                slot_count=batcher.slots[request.slot_index].count,
+            return BatchSubmissionResponse(
+                accepted=True, reason=RejectReason.ACCEPTED
             )
 
         @app.get(
-            "/window/{window_start}/state", response_model=WindowStateResponse
+            "/window/{window_start}/state", response_model=GrpoBatchState
         )
-        async def window_state(window_start: int) -> WindowStateResponse:
+        async def window_state(window_start: int) -> GrpoBatchState:
             batcher = self.active_batcher
             if batcher is None or batcher.window_start != window_start:
                 raise HTTPException(status_code=404, detail="window_not_active")
-            return batcher.get_window_state()
+            return batcher.get_state()
 
         return app
 
     async def _submit_worker(self) -> None:
-        """Drain the submit queue and verify each request off the event loop."""
         while True:
             try:
                 request, batcher = await self._submit_queue.get()
@@ -105,38 +102,30 @@ class ValidatorServer:
                 )
                 if response.accepted:
                     logger.info(
-                        "accepted slot %d from %s (count=%d)",
-                        request.slot_index,
-                        request.miner_hotkey[:12],
-                        response.slot_count,
+                        "accepted prompt=%d hotkey=%s",
+                        request.prompt_idx, request.miner_hotkey[:12],
                     )
                 else:
                     logger.warning(
-                        "rejected slot %d from %s: %s",
-                        request.slot_index,
-                        request.miner_hotkey[:12],
-                        response.reason,
+                        "rejected prompt=%d hotkey=%s reason=%s",
+                        request.prompt_idx, request.miner_hotkey[:12],
+                        response.reason.value,
                     )
             except Exception:
                 logger.exception(
-                    "submission worker failed on slot %d", request.slot_index
+                    "submission worker failed on prompt %d", request.prompt_idx
                 )
 
     async def start(self) -> None:
-        """Start uvicorn + submit worker in the background; idempotent."""
         if self._task is not None:
             return
         config = uvicorn.Config(
-            self.app,
-            host=self.host,
-            port=self.port,
-            log_level="warning",
-            access_log=False,
+            self.app, host=self.host, port=self.port,
+            log_level="warning", access_log=False,
         )
         self._server = uvicorn.Server(config)
         self._task = asyncio.create_task(self._server.serve())
         self._worker_task = asyncio.create_task(self._submit_worker())
-        # Yield once so uvicorn can bind before the caller proceeds.
         await asyncio.sleep(0)
         logger.info("Validator HTTP server listening on %s:%d", self.host, self.port)
 

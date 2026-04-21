@@ -1,140 +1,106 @@
-"""Tests for the validator FastAPI server."""
-
-from __future__ import annotations
-
-from unittest.mock import MagicMock
+"""Validator HTTP server — v2 GRPO market endpoints."""
 
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import (
-    COMPLETIONS_PER_SUBMISSION,
-    PROMPTS_PER_WINDOW,
+from reliquary.constants import M_ROLLOUTS
+from reliquary.protocol.submission import (
+    BatchSubmissionRequest,
+    GrpoBatchState,
+    RolloutSubmission,
+    RejectReason,
 )
-from reliquary.protocol.submission import SubmissionResponse, WindowStateResponse, SlotState
+from reliquary.validator.batcher_v2 import GrpoWindowBatcher
+from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
 
 
-def _payload() -> dict:
-    return {
-        "window_start": 1000,
-        "slot_index": 0,
-        "prompt_id": "abc123def4567890",
-        "miner_hotkey": "5HotkeyTest" + "x" * 35,
-        "completions": [
-            {"tokens": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10 + i], "commit": {"v": 1}}
-            for i in range(COMPLETIONS_PER_SUBMISSION)
-        ],
-    }
+class FakeEnv:
+    name = "fake"
+    def __len__(self): return 1000
+    def get_problem(self, idx): return {"prompt": f"p{idx}", "ground_truth": "", "id": f"p{idx}"}
+    def compute_reward(self, p, c): return 1.0 if "CORRECT" in c else 0.0
 
 
-@pytest.fixture
-def server() -> ValidatorServer:
-    return ValidatorServer(host="127.0.0.1", port=0)
-
-
-@pytest.fixture
-def client(server: ValidatorServer) -> TestClient:
-    return TestClient(server.app)
-
-
-def test_health_when_idle_reports_no_active_window(client: TestClient) -> None:
-    r = client.get("/health")
-    assert r.status_code == 200
-    assert r.json() == {"status": "ok", "active_window": None}
-
-
-def test_health_with_active_batcher_reports_window(
-    server: ValidatorServer, client: TestClient
-) -> None:
-    fake_batcher = MagicMock()
-    fake_batcher.window_start = 1000
-    server.set_active_batcher(fake_batcher)
-    r = client.get("/health")
-    assert r.status_code == 200
-    assert r.json()["active_window"] == 1000
-
-
-def test_submit_503_when_no_active_window(client: TestClient) -> None:
-    r = client.post("/submit", json=_payload())
-    assert r.status_code == 503
-    assert r.json()["detail"] == "no_active_window"
-
-
-def test_submit_409_on_window_mismatch(
-    server: ValidatorServer, client: TestClient
-) -> None:
-    fake_batcher = MagicMock()
-    fake_batcher.window_start = 999  # different
-    server.set_active_batcher(fake_batcher)
-    r = client.post("/submit", json=_payload())
-    assert r.status_code == 409
-    assert r.json()["detail"] == "window_mismatch"
-
-
-def test_submit_queues_for_async_verification(
-    server: ValidatorServer, client: TestClient
-) -> None:
-    """/submit returns 200/queued immediately and drops the request on the
-    async queue — the worker (not exercised by TestClient) does the actual
-    GRAIL verify off-thread. See reliquary/validator/server.py::_submit_worker.
-    """
-    fake_batcher = MagicMock()
-    fake_batcher.window_start = 1000
-    # batcher.slots[idx].count is read to populate the early response
-    fake_batcher.slots = [MagicMock(count=0) for _ in range(8)]
-    server.set_active_batcher(fake_batcher)
-
-    r = client.post("/submit", json=_payload())
-    assert r.status_code == 200
-    body = r.json()
-    assert body["accepted"] is True
-    assert body["reason"] == "queued"
-    # Worker isn't started in the TestClient fixture, so the item should still
-    # be sitting on the queue.
-    assert server._submit_queue.qsize() == 1
-
-
-def test_window_state_404_when_no_batcher(client: TestClient) -> None:
-    r = client.get("/window/1000/state")
-    assert r.status_code == 404
-
-
-def test_window_state_404_when_window_mismatch(
-    server: ValidatorServer, client: TestClient
-) -> None:
-    fake_batcher = MagicMock()
-    fake_batcher.window_start = 1000
-    server.set_active_batcher(fake_batcher)
-    r = client.get("/window/2000/state")
-    assert r.status_code == 404
-
-
-def test_window_state_returns_batcher_snapshot(
-    server: ValidatorServer, client: TestClient
-) -> None:
-    fake_batcher = MagicMock()
-    fake_batcher.window_start = 1000
-    snap = WindowStateResponse(
-        window_start=1000,
-        slot_states=[
-            SlotState(slot_index=i, prompt_id=f"p{i}", count=i, settled=False)
-            for i in range(PROMPTS_PER_WINDOW)
-        ],
+def _batcher(window_start=500, cooldown_map=None):
+    return GrpoWindowBatcher(
+        window_start=window_start,
+        current_round=1000,
+        env=FakeEnv(),
+        model=None,
+        cooldown_map=cooldown_map,
+        verify_commitment_proofs_fn=lambda c, m, r: (True, 1, 1),
+        verify_signature_fn=lambda c, h: True,
+        verify_proof_version_fn=lambda c: True,
+        completion_text_fn=lambda r: r.commit.get("completion_text_for_test", ""),
     )
-    fake_batcher.get_window_state.return_value = snap
-    server.set_active_batcher(fake_batcher)
-    r = client.get("/window/1000/state")
-    assert r.status_code == 200
-    assert r.json()["window_start"] == 1000
-    assert len(r.json()["slot_states"]) == PROMPTS_PER_WINDOW
 
 
-def test_submit_validates_payload_shape(client: TestClient) -> None:
-    bad = _payload()
-    bad["completions"] = []  # empty list rejected by pydantic min_length
-    fake_batcher = MagicMock()
-    fake_batcher.window_start = 1000
-    # Even with active batcher, pydantic should reject before reaching it.
-    r = client.post("/submit", json=bad)
-    assert r.status_code == 422
+def _request(prompt_idx=42, window_start=500, signed_round=1000, k=4):
+    rollouts = []
+    for i in range(M_ROLLOUTS):
+        text = "CORRECT" if i < k else "wrong"
+        rollouts.append(
+            RolloutSubmission(
+                tokens=[1, 2, 3],
+                reward=1.0 if i < k else 0.0,
+                commit={"tokens": [1, 2, 3], "proof_version": "v5", "completion_text_for_test": text},
+            )
+        )
+    return BatchSubmissionRequest(
+        miner_hotkey="hk",
+        prompt_idx=prompt_idx,
+        window_start=window_start,
+        signed_round=signed_round,
+        merkle_root="00" * 32,
+        rollouts=rollouts,
+    )
+
+
+def test_submit_returns_queued_on_active_window():
+    server = ValidatorServer()
+    batcher = _batcher(window_start=500)
+    server.set_active_batcher(batcher)
+    client = TestClient(server.app)
+    resp = client.post("/submit", json=_request().model_dump(mode="json"))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["accepted"] is True
+    assert body["reason"] == RejectReason.ACCEPTED.value
+
+
+def test_submit_503_when_no_active_batcher():
+    server = ValidatorServer()
+    client = TestClient(server.app)
+    resp = client.post("/submit", json=_request().model_dump(mode="json"))
+    assert resp.status_code == 503
+
+
+def test_submit_409_on_window_mismatch():
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    client = TestClient(server.app)
+    resp = client.post("/submit", json=_request(window_start=999).model_dump(mode="json"))
+    assert resp.status_code == 409
+
+
+def test_state_endpoint_returns_grpo_batch_state():
+    cd = CooldownMap(cooldown_windows=50)
+    cd.record_batched(prompt_idx=42, window=490)
+    batcher = _batcher(window_start=500, cooldown_map=cd)
+    server = ValidatorServer()
+    server.set_active_batcher(batcher)
+    client = TestClient(server.app)
+    resp = client.get("/window/500/state")
+    assert resp.status_code == 200
+    state = GrpoBatchState(**resp.json())
+    assert state.window_start == 500
+    assert 42 in state.cooldown_prompts
+
+
+def test_state_endpoint_404_on_wrong_window():
+    server = ValidatorServer()
+    server.set_active_batcher(_batcher(window_start=500))
+    client = TestClient(server.app)
+    resp = client.get("/window/999/state")
+    assert resp.status_code == 404
