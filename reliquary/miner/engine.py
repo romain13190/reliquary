@@ -1,7 +1,8 @@
 """Miner engine — vLLM generation + HuggingFace GRAIL proof construction.
 
-Protocol: deterministic prompts derived from beacon randomness → 4
-prefix-distinct completions per slot → HTTP submission to validator.
+Protocol v2: free prompt selection (uniform random with cooldown skip),
+M rollouts per prompt at fixed temperature T_PROTO, local reward computation,
+Merkle root commitment, HTTP batch submission to validator.
 """
 
 from __future__ import annotations
@@ -11,31 +12,81 @@ import os
 import time
 from typing import TYPE_CHECKING
 
+import random as _random
+
 from reliquary.constants import (
     BLOCK_TIME_SECONDS,
-    DIVERSITY_PREFIX_LEN,
-    GROUP_SIZE,
     LAYER_INDEX,
     MAX_NEW_TOKENS_PROTOCOL_CAP,
-    MINER_BATCH_SIZE,
-    PROMPTS_PER_WINDOW,
+    M_ROLLOUTS,
+    T_PROTO,
     UPLOAD_BUFFER,
     WINDOW_LENGTH,
 )
 from reliquary.infrastructure import chain
-from reliquary.miner.prompts import derive_window_prompts
-from reliquary.miner.submitter import (
-    SubmissionError,
-    discover_validator_url,
-    get_window_state,
-    submit_batch,
+from reliquary.protocol.submission import (
+    BatchSubmissionRequest,
+    CompletionSubmission,
+    RolloutSubmission,
 )
-from reliquary.protocol.submission import CompletionSubmission, SubmissionRequest
 
 if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+
+
+def pick_prompt_idx(
+    env,
+    cooldown_prompts: set[int],
+    *,
+    rng: _random.Random | None = None,
+    max_attempts: int = 1000,
+) -> int:
+    """Pick a random prompt index that isn't currently in cooldown.
+
+    The reference miner uses uniform-random selection with rejection
+    sampling against the cooldown set. More sophisticated strategies
+    (pre-screening zone probability, etc.) are left to miner operators.
+
+    Raises ``RuntimeError`` if no eligible prompt can be found — typically
+    because the env is fully in cooldown.
+    """
+    rng = rng or _random
+    n = len(env)
+    if len(cooldown_prompts) < n / 2:
+        for _ in range(max_attempts):
+            idx = rng.randrange(n)
+            if idx not in cooldown_prompts:
+                return idx
+        raise RuntimeError("no eligible prompt found after max attempts")
+    eligible = [i for i in range(n) if i not in cooldown_prompts]
+    if not eligible:
+        raise RuntimeError("no eligible prompt — env fully in cooldown")
+    return rng.choice(eligible)
+
+
+def _compute_merkle_root(rollouts) -> str:
+    """Compute Merkle root over rollout leaves — returns 64-char hex."""
+    import hashlib
+
+    leaves = []
+    for i, r in enumerate(rollouts):
+        h = hashlib.sha256()
+        h.update(i.to_bytes(8, "big"))
+        h.update(repr(r.tokens).encode())
+        h.update(repr(r.reward).encode())
+        h.update(repr(r.commit).encode())
+        leaves.append(h.digest())
+
+    while len(leaves) > 1:
+        new = []
+        for i in range(0, len(leaves), 2):
+            left = leaves[i]
+            right = leaves[i + 1] if i + 1 < len(leaves) else left
+            new.append(hashlib.sha256(left + right).digest())
+        leaves = new
+    return leaves[0].hex()
 
 
 class MiningEngine:
@@ -83,128 +134,141 @@ class MiningEngine:
         window_start: int,
         use_drand: bool = True,
     ) -> list:
-        """Iterate over 8 deterministic prompts and submit 4 completions per slot.
+        """v2: pick prompts freely, generate M rollouts each, submit batch.
 
-        Returns the list of SubmissionResponse objects collected during the
-        window.
+        Returns the list of BatchSubmissionResponse objects collected.
         """
         import httpx
+        import random
 
-        # 1. Compute window randomness
+        # Lazy imports — submitter v2 helpers are defined in Task 13.
+        from reliquary.miner.submitter import (
+            SubmissionError,
+            discover_validator_url,
+            get_window_state_v2,
+            submit_batch_v2,
+        )
+
         randomness = await self._compute_randomness(subtensor, window_start, use_drand)
 
-        # 2. Derive 8 deterministic prompts
-        problems = derive_window_prompts(self.env, randomness, PROMPTS_PER_WINDOW)
-
-        # 3. Resolve validator URL
         if self.validator_url_override:
             url = self.validator_url_override
         else:
             metagraph = await chain.get_metagraph(subtensor, chain.NETUID)
             url = discover_validator_url(metagraph)
 
-        # 4. Deadline: end of window minus upload buffer
         deadline = (
             time.monotonic()
             + WINDOW_LENGTH * BLOCK_TIME_SECONDS
             - UPLOAD_BUFFER
         )
         logger.info(
-            "Mining window %d — %.0fs budget, validator %s",
+            "Mining v2 window %d — %.0fs budget, validator %s",
             window_start,
             WINDOW_LENGTH * BLOCK_TIME_SECONDS - UPLOAD_BUFFER,
             url,
         )
 
+        rng = random.Random()
         results = []
 
-        # 5. Shared HTTP client for all submissions this window
         async with httpx.AsyncClient(timeout=30) as client:
-            for slot_index, problem in enumerate(problems):
-                # 6a. Check deadline before each slot
-                if time.monotonic() >= deadline:
-                    logger.info(
-                        "deadline reached, stopping at slot %d", slot_index
-                    )
+            while time.monotonic() < deadline:
+                try:
+                    state = await get_window_state_v2(url, window_start, client=client)
+                except SubmissionError as exc:
+                    logger.debug("state fetch failed: %s", exc)
+                    continue
+
+                cooldown_set = set(state.cooldown_prompts)
+                signed_round = state.current_round
+
+                try:
+                    prompt_idx = pick_prompt_idx(self.env, cooldown_set, rng=rng)
+                except RuntimeError:
+                    logger.info("env fully in cooldown; stopping")
                     break
 
-                # 6b. Fetch window state to decide strategy:
-                #     - skip if slot is settled or both quotas full
-                #     - pick target reward class (rare) to maximise advantage
-                target_reward: float | None = None
-                try:
-                    state = await get_window_state(url, window_start, client=client)
-                    slot_state = next(
-                        (s for s in state.slot_states if s.slot_index == slot_index),
-                        None,
-                    )
-                    if slot_state is not None:
-                        if slot_state.settled:
-                            logger.debug("slot %d already settled, skipping", slot_index)
-                            continue
-                        target_reward = self._choose_target_reward(slot_state.rewards)
-                        if target_reward == "slot_full":
-                            logger.debug(
-                                "slot %d: full, skipping", slot_index,
-                            )
-                            continue
-                except SubmissionError as exc:
-                    # Window not active yet or racing the validator — attempt anyway
-                    # with no targeting (target_reward stays None).
-                    logger.debug(
-                        "get_window_state for slot %d failed (%s); submitting untargeted",
-                        slot_index, exc,
-                    )
-                except Exception as exc:
+                problem = self.env.get_problem(prompt_idx)
+
+                generations = self._generate_m_rollouts(problem, randomness)
+                if len(generations) < M_ROLLOUTS:
                     logger.warning(
-                        "Unexpected error fetching window state for slot %d: %s",
-                        slot_index, exc,
+                        "generated %d / %d rollouts for prompt %d; skipping",
+                        len(generations), M_ROLLOUTS, prompt_idx,
                     )
                     continue
 
-                # 6c. Generate MINER_BATCH_SIZE prefix-distinct completions,
-                # targeting the picked reward class if any (sample-and-filter).
-                diverse = self._generate_targeted_batch(
-                    problem, randomness, target_reward,
-                )
-                if len(diverse) < MINER_BATCH_SIZE:
-                    logger.warning(
-                        "slot %d: only got %d completions after max attempts "
-                        "(target_reward=%s, need %d) — skipping",
-                        slot_index, len(diverse), target_reward,
-                        MINER_BATCH_SIZE,
-                    )
-                    continue
-
-                # 6d. Build CompletionSubmission objects
-                completions = [
-                    self._build_completion_submission(gen, randomness)
-                    for gen in diverse
+                rollout_submissions = [
+                    self._build_rollout_submission(gen, problem, randomness)
+                    for gen in generations
                 ]
 
-                # 6e. Build and send SubmissionRequest
-                request = SubmissionRequest(
-                    window_start=window_start,
-                    slot_index=slot_index,
-                    prompt_id=problem["id"],
+                merkle_root = _compute_merkle_root(rollout_submissions)
+
+                request = BatchSubmissionRequest(
                     miner_hotkey=self.wallet.hotkey.ss58_address,
-                    completions=completions,
+                    prompt_idx=prompt_idx,
+                    window_start=window_start,
+                    signed_round=signed_round,
+                    merkle_root=merkle_root,
+                    rollouts=rollout_submissions,
                 )
                 try:
-                    response = await submit_batch(url, request, client=client)
+                    resp = await submit_batch_v2(url, request, client=client)
                     logger.info(
-                        "slot %d: accepted=%s reason=%r settled=%s slot_count=%d",
-                        slot_index,
-                        response.accepted,
-                        response.reason,
-                        response.settled,
-                        response.slot_count,
+                        "submitted prompt %d — accepted=%s reason=%s",
+                        prompt_idx, resp.accepted, resp.reason.value,
                     )
-                    results.append(response)
+                    results.append(resp)
                 except SubmissionError as exc:
-                    logger.error("slot %d: submission failed: %s", slot_index, exc)
+                    logger.error("submit failed prompt %d: %s", prompt_idx, exc)
 
         return results
+
+    def _generate_m_rollouts(self, problem, randomness) -> list[dict]:
+        """Generate M_ROLLOUTS completions at T_PROTO. No cherry-picking."""
+        import torch
+
+        prompt_tokens = self.tokenizer.encode(
+            problem["prompt"], add_special_tokens=False
+        )
+        prompt_length = len(prompt_tokens)
+
+        rollouts = []
+        for _ in range(M_ROLLOUTS):
+            with torch.no_grad():
+                input_tensor = torch.tensor(
+                    [prompt_tokens],
+                    device=getattr(self.vllm_model, "device", "cpu"),
+                )
+                outputs = self.vllm_model.generate(
+                    input_tensor,
+                    max_new_tokens=self.max_new_tokens,
+                    do_sample=True,
+                    temperature=T_PROTO,
+                )
+            all_tokens = outputs[0].tolist()
+            rollouts.append({
+                "tokens": all_tokens,
+                "prompt_length": prompt_length,
+            })
+        return rollouts
+
+    def _build_rollout_submission(self, generation, problem, randomness):
+        """Build a RolloutSubmission: completion + claimed reward + GRAIL commit."""
+        all_tokens = generation["tokens"]
+        prompt_length = generation["prompt_length"]
+        completion_tokens = all_tokens[prompt_length:]
+        completion_text = self.tokenizer.decode(completion_tokens)
+        reward = self.env.compute_reward(problem, completion_text)
+
+        completion_sub = self._build_completion_submission(generation, randomness)
+        return RolloutSubmission(
+            tokens=all_tokens,
+            reward=reward,
+            commit=completion_sub.commit,
+        )
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -227,100 +291,6 @@ class MiningEngine:
                 block_hash, beacon["randomness"], drand_round=beacon["round"]
             )
         return chain.compute_window_randomness(block_hash)
-
-    @staticmethod
-    def _choose_target_reward(rewards_hist: dict[str, int]):
-        """Pick the reward class the miner should target for this slot.
-
-        Strategy under the market-free settlement (no per-class quota):
-          * If the slot has already reached GROUP_SIZE → return the
-            sentinel ``"slot_full"`` so the caller skips the slot.
-          * Otherwise target the RARE class (smaller count) to maximise
-            |advantage| at settlement. Ties → None (no preference).
-
-        Returns:
-            1.0, 0.0, None, or the sentinel ``"slot_full"``.
-        """
-        count_1 = rewards_hist.get("1.0", 0)
-        count_0 = rewards_hist.get("0.0", 0)
-
-        if count_1 + count_0 >= GROUP_SIZE:
-            return "slot_full"
-        if count_1 < count_0:
-            return 1.0
-        if count_0 < count_1:
-            return 0.0
-        return None  # balanced / empty — no preference
-
-    def _generate_targeted_batch(
-        self,
-        problem: dict,
-        randomness: str,
-        target_reward: float | None,
-    ) -> list[dict]:
-        """Generate up to MINER_BATCH_SIZE prefix-distinct completions,
-        optionally filtered to match ``target_reward``.
-
-        Uses the env locally to score each candidate (deterministic — same
-        formula as the validator). Rejects candidates whose first
-        ``DIVERSITY_PREFIX_LEN`` tokens collide with an earlier accepted
-        candidate. Caps attempts to avoid unbounded loops when the model
-        can't produce the target class for this prompt.
-        """
-        import torch
-
-        # Generous attempt cap: 10× the target batch size. Enough for typical
-        # rejection sampling without blowing up when the model is near-
-        # deterministic on this prompt (in which case we give up and let
-        # the caller skip the slot).
-        max_attempts = MINER_BATCH_SIZE * 10
-
-        prompt_tokens: list[int] = self.tokenizer.encode(
-            problem["prompt"], add_special_tokens=False
-        )
-        prompt_length = len(prompt_tokens)
-
-        seen_prefixes: set[tuple] = set()
-        completions: list[dict] = []
-
-        for _ in range(max_attempts):
-            if len(completions) >= MINER_BATCH_SIZE:
-                break
-
-            with torch.no_grad():
-                input_tensor = torch.tensor(
-                    [prompt_tokens], device=getattr(self.vllm_model, "device", "cpu")
-                )
-                outputs = self.vllm_model.generate(
-                    input_tensor,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=True,
-                    temperature=1.0,
-                )
-            all_tokens: list[int] = outputs[0].tolist()
-            completion_tokens = all_tokens[prompt_length:]
-
-            # Filter by target reward if requested.
-            if target_reward is not None:
-                completion_text = self.tokenizer.decode(completion_tokens)
-                reward = self.env.compute_reward(problem, completion_text)
-                if reward != target_reward:
-                    continue
-
-            # Prefix dedup (intra-batch — the validator also enforces cross-miner).
-            prefix = tuple(completion_tokens[:DIVERSITY_PREFIX_LEN])
-            if prefix in seen_prefixes:
-                continue
-            seen_prefixes.add(prefix)
-            completions.append(
-                {
-                    "tokens": all_tokens,
-                    "prompt_length": prompt_length,
-                    "completion_tokens": completion_tokens,
-                }
-            )
-
-        return completions
 
     def _build_completion_submission(
         self, generation: dict, randomness: str
