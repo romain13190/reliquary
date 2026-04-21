@@ -11,154 +11,95 @@ usable as training data without trusting any individual miner.
 
 ---
 
-## What Reliquary does today
+## How it works (v2 GRPO market)
 
-Every ~60 s window the network produces up to **256 verified rollouts**
-(8 prompts × 32 completions/slot) from a pinned reference checkpoint.
-The cycle:
+Each window (~60 s, 1 training step):
 
-1. **Beacon** → miners and validators derive 8 identical prompts from
-   `drand ⊕ block_hash`.
-2. **Rollout market** → miners compete per slot. Each validator exposes
-   a live reward histogram at `/window/{n}/state`; miners read it and
-   target the under-represented reward class to maximise their payout.
-   Each batch is atomically verified (GRAIL proof + diversity +
-   signature) or rejected as a whole.
-3. **Settlement** → the slot freezes at 32 accepted completions or 60 s,
-   whichever comes first. No quota is enforced during collection —
-   balance is a market outcome, not a rule.
-4. **Publication** → the full dataset (prompts + completions + rewards)
-   is gzipped and uploaded to R2 at `reliquary/dataset/window-{n}.json.gz`.
-5. **Weights** → every 72 windows (~72 min) the validator aggregates
-   per-miner scores (superlinear exponent 4 for sybil resistance) and
-   routes the unclaimed budget to `UID_BURN` on chain.
+1. Miners pick a `prompt_idx` from the env (GSM8K, ~7473 problems) —
+   avoiding the validator's published cooldown set.
+2. Each miner generates 8 rollouts at `T_PROTO` (≈ 0.9), computes local
+   rewards, builds GRAIL commits, and POSTs a `BatchSubmissionRequest`
+   to the validator.
+3. Validator verifies in order: signature → prompt_idx in range → round
+   freshness → prompt not in cooldown → reward claims match
+   `env.compute_reward` → GRAIL sketch matches model forward-pass
+   → `k ∈ [2, 6]` (approvable zone).
+4. At window close, validator selects the first `B = 8` in-zone
+   submissions (FIFO by signed drand round, distinct prompts) for the
+   training batch. Sealed batch becomes the GRPO step input; each
+   batched prompt enters a 50-window cooldown (or 10 during bootstrap).
+5. Weights: each batch member earns `1/B` of window emission; unused
+   slots burn to `UID_BURN`.
 
-The deliverable **today** is the stream of verified GRPO-ready datasets.
-A downstream trainer — any party, any model — can consume it.
+Miners who submit outside the zone, on cooled-down prompts, or too slow
+to make the batch earn **zero**. The speed + distinct-prompt
+competition removes any incentive for cherry-picking (cherry-picking
+takes extra compute → later `signed_round` → displaced from the batch).
 
----
-
-## The mechanism
-
-Reliquary does not pay miners for *work*. It pays them for **signal** —
-the GRPO-usable information each completion brings to its slot. The
-scoring rule applied after a slot freezes is:
-
-```
-score(c) = |c.reward − mean_slot| / std_slot
-```
-
-Three consequences fall out of that formula, and together they are the
-core of the design:
-
-**Self-balancing without a quota.** A slot that already has 28 corrects
-and 4 wrongs pays ~5× more per wrong than per correct. Miners read
-`/state` live and pivot toward whatever class is scarce. The 50/50
-equilibrium emerges from the incentive; it is never enforced by a cap.
-
-**Collective burn as a coordination device.** A degenerate slot
-(`std = 0`, e.g. {32, 0}) pays *zero* to everyone — even the miners who
-submitted valid completions. The emission share that a balanced slot
-would have produced is explicitly routed to `UID_BURN`. A miner cannot
-monopolise a class without destroying their own payout, which turns
-diversification into a Nash equilibrium rather than a good deed.
-
-**Fixed budget, not re-normalised.** The notional budget per window is
-`PROMPTS_PER_WINDOW × GROUP_SIZE = 256` units of |advantage|. What
-miners fail to claim *burns*; it is not redistributed to the miners who
-did show up. The economic weight of each completion stays stable across
-windows regardless of how many miners compete, and lazy windows
-genuinely shrink supply instead of inflating the remaining participants.
-
-**Signal, not tokens.** The |z-score| formulation is the information
-content of a completion in a GRPO update. The R2 dataset a downstream
-trainer consumes is already filtered and weighted by learning value —
-the market prices exactly what the trainer would have priced anyway.
+Full design rationale: `docs/superpowers/specs/2026-04-20-grpo-market-design.md`.
 
 ---
 
 ## Flow at a glance
 
 ```
-                   drand beacon + block hash
-                              │
-                              ▼
-                8 deterministic prompts per window
-                              │
-   ┌──────────────────────────┴──────────────────────────┐
-   │                                                     │
-   ▼                                                     ▼
-Miner (2 GPUs)                                    Validator (1 GPU)
-─ Same 8 prompts                                  ─ Same 8 prompts
-─ Read /state, pick rare                          ─ Serve HTTP /submit
-  reward class per slot                           ─ For each batch:
-─ Generate N completions                              • verify GRAIL proof
-─ Build GRAIL proof (HF                               • check prefix-distinct
-  forward + commitments)                              • append to slot
-─ POST /submit  ─────────────────────▶            ─ Auto-finalize at 32
-                                                    or timeout 60 s
-                                                  ─ Score by |advantage|
-                                                  ─ Upload dataset to R2
-                                                  ─ 72 windows →
-                                                    set_weights on-chain
+                   drand beacon
+                        │
+                        ▼
+            Miner picks prompt_idx freely
+            (avoids cooldown set from /window/{n}/state)
+                        │
+   ┌────────────────────┴────────────────────┐
+   │                                         │
+   ▼                                         ▼
+Miner (2 GPUs)                         Validator (1 GPU)
+─ Pick prompt_idx ∉ cooldown           ─ Serve HTTP /submit
+─ Generate M=8 rollouts at T_PROTO     ─ Full verification pipeline:
+─ Compute local rewards                    • signature
+─ Build GRAIL proof (HF forward            • prompt_idx range
+  + sketch commits)                        • round freshness
+─ POST BatchSubmissionRequest ────▶        • cooldown check
+                                           • reward match
+                                           • GRAIL sketch match
+                                           • zone check k ∈ [2,6]
+                               ─ Batch: first B=8 distinct-prompt
+                                 in-zone submissions (FIFO)
+                               ─ Seal batch → GRPO training step
+                               ─ Update cooldown map
+                               ─ Upload dataset to R2
+                               ─ Every WEIGHT_SUBMISSION_INTERVAL →
+                                 set_weights on-chain (flat 1/B)
 ```
-
-Per-slot cap: `GROUP_SIZE = 32`. No per-class quota — the slot is a free
-market. Advantage scoring steers miners toward balance post-hoc.
 
 ---
 
 ## Roadmap
 
-### v1 — Verifiable inference *(current)*
+### v1 — Verifiable inference *(superseded)*
 
-Miners produce verified rollouts on a **frozen reference checkpoint**
-pinned by the subnet. No training happens inside Reliquary yet — the
-published R2 dataset is the product. External consumers (research labs,
-RL teams) pull the stream.
+Miners produced verified rollouts on a frozen reference checkpoint pinned
+by the subnet. 8 validator-derived prompts per window, 32 completions per
+slot, advantage-based scoring.
 
-**Status:** stabilising. Shipped in the current code:
-- Free-market slot settlement — no per-class quota, no hotkey dedup, only
-  capacity + cross-miner prefix dedup.
-- Advantage-based scoring over the full accepted set. Rare class pays
-  proportionally; degenerate slots burn.
-- Miner strategic targeting via live histogram on `/window/{n}/state`.
-- R2 archive in GRPO-ready format.
+### v2 — On-policy training inside the subnet *(current)*
 
-**Remaining v1 gaps:**
-- `model_name` in GRAIL commits is signed but not compared against a
-  canonical reference. Low-impact while the checkpoint is frozen; must be
-  closed before v2 opens.
-- Offline-precompute of GSM8K answers is a theoretical attack on the
-  fixed dataset. Self-resolves in v2 when the checkpoint rotates.
+The subnet trains the reference checkpoint itself from the rollouts miners
+produce, then rotates the checkpoint on-chain. Miners freely pick prompts,
+compete on speed and novelty, and earn flat `1/B` for each batch slot they
+fill.
 
-### v2 — On-policy training inside the subnet
-
-The subnet **trains the reference checkpoint itself** from the rollouts
-miners produce, then rotates the checkpoint on-chain. This turns
-Reliquary into a real closed-loop, on-policy GRPO trainer — and the
-training step itself is performed by the subnet's participants, not
-outsourced to a third party.
-
-
-**Open design questions** (to be resolved before v2 ships):
-- **Who runs the training step, and how is consensus on the next
-  checkpoint reached?** Candidates: every validator trains independently
-  and the metagraph-weighted majority of checkpoint hashes wins; a
-  rotating election based on stake or score; a deterministic split of
-  GRPO gradients across participants who each compute a piece.
-- **Cadence.** 1 step per window (≈ 4-minute checkpoint rotation) vs.
-  accumulate *k* windows per step. Affects how fast miners must resync
-  and how much on-policy drift is tolerable.
-- **Model announcement protocol.** Today miners and validators
-  coordinate checkpoints off-chain (CLI flag convention). v2 needs a
-  formal channel — on-chain Bittensor subnet commitments, or a
-  validator-signed `/current_model` HTTP endpoint — so that miners
-  auto-rotate the moment training publishes a new checkpoint and the
-  GRAIL sketch check starts rejecting stale-model rollouts.
-- **Training-cost economics.** Whether validators running the training
-  step earn an additional slice of emissions, or whether training is a
-  precondition for `validator_permit`.
+**What shipped:**
+- Free prompt selection — miners pick any `prompt_idx`, no validator-derived
+  slots.
+- Zone filter `k ∈ [2, 6]` — requires at least 2 correct and 2 incorrect
+  rollouts per submission; degenerate sets are rejected.
+- `CooldownMap` — batched prompts enter a 50-window cooldown (10 during
+  bootstrap) so the training corpus stays diverse.
+- Flat `1/B` weight per batch member; unused slots burn to `UID_BURN`.
+- Bootstrap mode — first `BOOTSTRAP_WINDOWS` windows use wider zone [1, 7]
+  and a shorter 10-window cooldown to fill the first batches faster.
+- GRPO training step runs on the sealed batch each window; checkpoint
+  rotates on-chain after each step.
 
 ### v3 — Open inference-market API
 
@@ -199,10 +140,10 @@ reliquary/
   protocol/         GRAIL proof construction, signatures, submission schemas
   shared/           forward_single_layer — the bit-identical forward pass
   infrastructure/   drand client, Bittensor chain, R2 storage
-  environment/      prompt sources (gsm8k for v1)
+  environment/      prompt sources (gsm8k)
   miner/            MiningEngine — generate + prove + submit
-  validator/        WindowBatcher, HTTP server, scoring, weights
-tests/unit/         277 tests covering all of the above
+  validator/        GrpoWindowBatcher, HTTP server, cooldown, weights
+tests/unit/         covers all of the above
 docs/               operator tutorials
 ```
 
@@ -210,7 +151,7 @@ docs/               operator tutorials
 
 ## Status
 
-Version `0.1.0` · Python ≥ 3.11 · CUDA 12 · MIT licence.
+Version `0.2.0` · Python ≥ 3.11 · CUDA 12 · MIT licence.
 
 `GRAIL` in this repo refers specifically to the **cryptographic proof
 system** used to bind completions to the reference model. The rest of

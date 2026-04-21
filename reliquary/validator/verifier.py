@@ -1,8 +1,7 @@
-"""GRAIL proof verification — primitives used by the WindowBatcher.
+"""GRAIL proof verification — primitives used by GrpoWindowBatcher.
 
-The orchestration (which prompt, which slot, which miner) lives in
-`reliquary.validator.batcher`. This module only exposes the per-commit
-checks that touch the model or the signature scheme.
+The orchestration lives in `reliquary.validator.batcher`. This module only
+exposes the per-commit checks that touch the model or the signature scheme.
 """
 
 import logging
@@ -107,3 +106,61 @@ def verify_commitment_proofs(
     # A miner cannot benefit from having fewer positions verified.
     all_passed = passed == checked and checked >= expected_challenges
     return all_passed, passed, checked
+
+
+def verify_reward_claim(
+    env: Any,
+    problem: dict,
+    completion_text: str,
+    claimed: float,
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    """Re-compute the env's reward on *completion_text* and compare to *claimed*.
+
+    Miners declare the reward of each completion in their submission (saves
+    validator compute when they can pre-filter out-of-zone) but the validator
+    re-runs ``env.compute_reward`` to check honesty. A mismatch means the
+    miner lied about reward, warranting rejection.
+
+    Returns True iff |env_reward - claimed| <= tolerance. The small tolerance
+    absorbs float64 formatting round-trip (JSON serialisation) noise.
+    """
+    try:
+        actual = env.compute_reward(problem, completion_text)
+    except Exception:
+        return False
+    return abs(float(actual) - float(claimed)) <= tolerance
+
+
+def rewards_to_k(rewards: list[float], *, success_threshold: float = 0.5) -> int:
+    """Count rewards that are successes (> success_threshold).
+
+    GSM8K returns binary {0.0, 1.0}; the threshold tolerates float round-trip
+    noise and future continuous envs where "success" is >= some level.
+    """
+    return sum(1 for r in rewards if r > success_threshold)
+
+
+def is_in_zone(k: int, *, bootstrap: bool = False) -> bool:
+    """True iff k lies strictly inside the apprenable zone.
+
+    Steady state: ``ZONE_K_MIN <= k <= ZONE_K_MAX`` (default [2, 6]).
+    Bootstrap mode: ``BOOTSTRAP_ZONE_K_MIN <= k <= BOOTSTRAP_ZONE_K_MAX``
+    (default [1, 7]) — wider to keep the batch filling while miner
+    population and env coverage are thin.
+
+    ``k=0`` (trivially hard) and ``k=M_ROLLOUTS`` (trivially easy) are
+    always rejected regardless of bootstrap flag — these have zero
+    GRPO signal by definition.
+    """
+    from reliquary.constants import (
+        BOOTSTRAP_ZONE_K_MAX, BOOTSTRAP_ZONE_K_MIN,
+        M_ROLLOUTS, ZONE_K_MAX, ZONE_K_MIN,
+    )
+
+    if k <= 0 or k >= M_ROLLOUTS:
+        return False
+    if bootstrap:
+        return BOOTSTRAP_ZONE_K_MIN <= k <= BOOTSTRAP_ZONE_K_MAX
+    return ZONE_K_MIN <= k <= ZONE_K_MAX

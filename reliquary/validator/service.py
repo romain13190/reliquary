@@ -1,4 +1,4 @@
-"""Validator main loop — synchronous GRPO batching via HTTP endpoint."""
+"""Validator main loop — v2 GRPO market batching via HTTP endpoint."""
 
 from __future__ import annotations
 
@@ -6,13 +6,14 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
-from typing import Any
 
 from reliquary.constants import (
+    BATCH_PROMPT_COOLDOWN_WINDOWS,
+    B_BATCH,
     BLOCK_TIME_SECONDS,
+    BOOTSTRAP_WINDOWS,
     POLL_INTERVAL_SECONDS,
-    PROMPTS_PER_WINDOW,
-    SLOT_DEADLINE_SECONDS,
+    SUBNET_START_BLOCK,
     UID_BURN,
     VALIDATOR_HTTP_PORT,
     WEIGHT_SUBMISSION_INTERVAL,
@@ -20,14 +21,64 @@ from reliquary.constants import (
 )
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
-from reliquary.miner.prompts import derive_window_prompts
-from reliquary.validator.batcher import ProblemSlot, WindowBatcher
+from reliquary.protocol.submission import RolloutSubmission
+from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
-from reliquary.validator.weights import compute_weights
+from reliquary.validator.weights import compute_weights_v2
 
 logger = logging.getLogger(__name__)
 
 ROLLING_WINDOWS = WEIGHT_SUBMISSION_INTERVAL // WINDOW_LENGTH
+
+
+def is_bootstrap_window(window_start: int, subnet_start: int) -> bool:
+    """True iff *window_start* is within ``BOOTSTRAP_WINDOWS`` of ``subnet_start``.
+
+    Bootstrap windows use the relaxed zone / cooldown / M values so the
+    batch can fill while miner population and env coverage are thin.
+    """
+    if window_start < subnet_start:
+        return False
+    return window_start - subnet_start < BOOTSTRAP_WINDOWS
+
+
+def open_grpo_window(
+    window_start: int,
+    current_round: int,
+    env,
+    model,
+    *,
+    cooldown_map: CooldownMap,
+    tokenizer,
+    bootstrap: bool = False,
+) -> GrpoWindowBatcher:
+    """Instantiate a GrpoWindowBatcher for this window.
+
+    ``cooldown_map`` is the validator's long-lived CooldownMap, shared
+    across windows. Each window's sealed batch updates it via
+    ``GrpoWindowBatcher.seal_batch``.
+    """
+    def _completion_text(rollout: RolloutSubmission) -> str:
+        prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
+        return tokenizer.decode(rollout.tokens[prompt_len:])
+
+    return GrpoWindowBatcher(
+        window_start=window_start,
+        current_round=current_round,
+        env=env,
+        model=model,
+        cooldown_map=cooldown_map,
+        bootstrap=bootstrap,
+        completion_text_fn=_completion_text,
+    )
+
+
+def compute_weights_for_window(
+    batch: list[ValidSubmission],
+) -> tuple[dict[str, float], float]:
+    """Collapse a sealed batch into (miner_weights, burn_weight) via v2 flat formula."""
+    return compute_weights_v2(batch_hotkeys=[sub.hotkey for sub in batch])
 
 
 class ValidationService:
@@ -55,9 +106,12 @@ class ValidationService:
         self.external_port = external_port
 
         self._last_processed_window: int = -1
-        self._miner_scores: defaultdict[str, float] = defaultdict(float)
-        self._burn_accumulated: float = 0.0
+        self._batched_hotkeys: list[str] = []
+        self._empty_batch_slots: int = 0
         self._windows_in_interval: int = 0
+        self._cooldown_map = CooldownMap(
+            cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
+        )
 
         self.server = ValidatorServer(host=http_host, port=http_port)
 
@@ -82,21 +136,14 @@ class ValidationService:
                     self._windows_in_interval += 1
                     if self._windows_in_interval >= ROLLING_WINDOWS:
                         submitted = await self._submit_weights(subtensor)
-                        # Only reset the score accumulator when the chain
-                        # actually accepted our weights. If the extrinsic was
-                        # rejected (e.g. no validator_permit yet, weights rate
-                        # limit, network blip beyond bittensor's own 5 retries)
-                        # we keep the scores so the next attempt reflects
-                        # everything we've observed since the last successful
-                        # submission, not just the windows since the last try.
                         if submitted:
-                            self._miner_scores.clear()
-                            self._burn_accumulated = 0.0
+                            self._batched_hotkeys.clear()
+                            self._empty_batch_slots = 0
                         else:
                             logger.warning(
                                 "set_weights did not succeed — keeping %d "
-                                "hotkey scores and burn=%.2f for next cycle",
-                                len(self._miner_scores), self._burn_accumulated,
+                                "hotkey slots and %d empty slots for next cycle",
+                                len(self._batched_hotkeys), self._empty_batch_slots,
                             )
                         self._windows_in_interval = 0
                 except asyncio.CancelledError:
@@ -158,49 +205,68 @@ class ValidationService:
 
     async def _run_window(self, subtensor, target_window: int) -> None:
         randomness = await self._derive_randomness(subtensor, target_window)
-        problems = derive_window_prompts(self.env, randomness, PROMPTS_PER_WINDOW)
-        slots = [
-            ProblemSlot(slot_index=i, prompt_id=p["id"], problem=p)
-            for i, p in enumerate(problems)
-        ]
-        batcher = WindowBatcher(
+        # v2: current drand round derived from the beacon, not block hash.
+        # For now use target_window as a placeholder logical round counter —
+        # the real wiring to drand round is in a follow-up. GrpoWindowBatcher
+        # uses this to validate signed_round freshness.
+        current_round = target_window
+
+        bootstrap = is_bootstrap_window(
+            window_start=target_window, subnet_start=SUBNET_START_BLOCK,
+        )
+        batcher = open_grpo_window(
             window_start=target_window,
-            slots=slots,
-            randomness=randomness,
+            current_round=current_round,
             env=self.env,
             model=self.model,
+            cooldown_map=self._cooldown_map,
             tokenizer=self.tokenizer,
+            bootstrap=bootstrap,
         )
+        batcher.randomness = randomness  # pass through for GRAIL sketch verification
         self.server.set_active_batcher(batcher)
 
         deadline = time.monotonic() + WINDOW_LENGTH * BLOCK_TIME_SECONDS
         try:
             while time.monotonic() < deadline:
-                # Trigger per-slot timeouts so the SLOT_DEADLINE_SECONDS cap
-                # is actually enforced (slots freeze at 60s regardless of the
-                # enclosing window deadline).
-                batcher.finalize_due_slots()
-                if batcher.is_window_complete():
-                    logger.info("Window %d settled (all slots finalized)", target_window)
-                    break
                 await asyncio.sleep(1)
 
-            # Safety net: force-finalize anything still open. Needed when the
-            # window deadline fires before the SLOT deadline (small WINDOW_LENGTH)
-            # or when the slot clock and service clock have drifted.
-            batcher.finalize_due_slots(now=time.monotonic() + SLOT_DEADLINE_SECONDS)
-
-            scores = batcher.get_miner_scores()
-            burn = batcher.get_burn_score()
-            for hk, s in scores.items():
-                self._miner_scores[hk] += s
-            self._burn_accumulated += burn
+            # Seal the batch at window close — this records cooldowns.
+            batch = batcher.seal_batch()
+            for sub in batch:
+                self._batched_hotkeys.append(sub.hotkey)
+            empty = B_BATCH - len(batch)
+            self._empty_batch_slots += empty
             logger.info(
-                "Window %d scored: %d miners (total %.2f), burn %.2f",
-                target_window, len(scores), sum(scores.values()), burn,
+                "Window %d sealed: batch=%d/%d, empty=%d, valid_pool=%d",
+                target_window, len(batch), B_BATCH, empty,
+                len(batcher.valid_submissions()),
             )
 
-            archive = batcher.get_archive_data()
+            # Archive the valid submissions pool (not just the batch) for audit.
+            archive = {
+                "window_start": target_window,
+                "randomness": randomness,
+                "environment": self.env.name,
+                "batch": [
+                    {
+                        "hotkey": s.hotkey,
+                        "prompt_idx": s.prompt_idx,
+                        "signed_round": s.signed_round,
+                        "k": s.k,
+                    }
+                    for s in batch
+                ],
+                "valid_submissions": [
+                    {
+                        "hotkey": s.hotkey,
+                        "prompt_idx": s.prompt_idx,
+                        "signed_round": s.signed_round,
+                        "k": s.k,
+                    }
+                    for s in batcher.valid_submissions()
+                ],
+            }
             try:
                 await storage.upload_window_dataset(
                     target_window,
@@ -227,19 +293,32 @@ class ValidationService:
         return chain.compute_window_randomness(block_hash)
 
     async def _submit_weights(self, subtensor) -> bool:
-        """Submit accumulated weights on-chain. Returns True iff the chain
-        reports the extrinsic succeeded (not merely "no exception")."""
-        scores = dict(self._miner_scores)
-        burn = self._burn_accumulated
-        miner_weights, burn_weight = compute_weights(scores, burn_score=burn)
-        non_zero_miners = {hk: w for hk, w in miner_weights.items() if w > 0}
+        """Submit flat 1/B weights + burn."""
+        # Aggregate batch members across the interval.
+        hotkey_counts: dict[str, int] = defaultdict(int)
+        for hk in self._batched_hotkeys:
+            hotkey_counts[hk] += 1
+
+        # Each slot is worth 1/(ROLLING_WINDOWS * B_BATCH) of the total
+        # emission over the interval. Equivalently, since miner_weights
+        # from compute_weights_v2 sums to len(batch)/B per window and we
+        # have ROLLING_WINDOWS windows, the normalized per-miner share is
+        # count * 1/(ROLLING_WINDOWS * B_BATCH).
+        total_slots = ROLLING_WINDOWS * B_BATCH
+        if total_slots == 0:
+            return True
+
+        miner_weights = {
+            hk: count / total_slots for hk, count in hotkey_counts.items()
+        }
+        used = len(self._batched_hotkeys)
+        burn_weight = (total_slots - used) / total_slots
+
         logger.info(
-            "Submitting weights: %d miners + %.4f burn to UID %d "
-            "(miner_total=%.2f, burn_score=%.2f)",
-            len(non_zero_miners), burn_weight, UID_BURN,
-            sum(scores.values()), burn,
+            "Submitting v2 weights: %d miners, burn=%.4f (used=%d/%d slots)",
+            len(miner_weights), burn_weight, used, total_slots,
         )
-        for hk, w in sorted(non_zero_miners.items(), key=lambda x: -x[1])[:10]:
+        for hk, w in sorted(miner_weights.items(), key=lambda x: -x[1])[:10]:
             logger.info("  %s: %.6f", hk[:8], w)
 
         meta = await chain.get_metagraph(subtensor, self.netuid)
