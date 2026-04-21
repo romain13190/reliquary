@@ -39,6 +39,16 @@ class RejectReason(str, Enum):
     WRONG_ROLLOUT_COUNT = "wrong_rollout_count"
     WINDOW_MISMATCH = "window_mismatch"
     WINDOW_NOT_ACTIVE = "window_not_active"
+    WRONG_CHECKPOINT = "wrong_checkpoint"
+
+
+class WindowState(str, Enum):
+    """Current phase of a batch-driven window (v2.1)."""
+
+    OPEN = "open"             # accepting /submit
+    TRAINING = "training"     # GRPO step running, no submissions
+    PUBLISHING = "publishing" # uploading weights, no submissions
+    READY = "ready"           # checkpoint published; transient — back to OPEN once next window opens
 
 
 class RolloutSubmission(BaseModel):

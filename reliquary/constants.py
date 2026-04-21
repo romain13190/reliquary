@@ -181,3 +181,17 @@ BOOTSTRAP_ZONE_K_MAX = 7
 # First on-chain block at which this subnet deployed v2. Used to
 # determine bootstrap eligibility. Set at the coordinated cutover.
 SUBNET_START_BLOCK = 0
+
+# ────────────────  v2.1 BATCH-DRIVEN WINDOWS  ────────────────
+
+# Safety-net timeout: a window auto-seals after this many seconds even
+# if fewer than B valid submissions have landed. The unused slots burn.
+# Set generously — this is a backstop, not the cadence.
+WINDOW_TIMEOUT_SECONDS = 600
+
+# Local JSON path for validator state (window_n counter + checkpoint_n).
+# Resolved relative to the CWD if not absolute.
+CHECKPOINT_STATE_PATH_DEFAULT = "reliquary/state/checkpoint.json"
+
+# Local directory for staged checkpoint files before R2 upload.
+CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
