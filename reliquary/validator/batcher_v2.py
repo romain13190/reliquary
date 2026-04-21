@@ -89,8 +89,9 @@ class GrpoWindowBatcher:
         self._completion_text = completion_text_fn
         self._time_fn = time_fn or time.monotonic
 
-        self._cooldown = cooldown_map or CooldownMap(
-            cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
+        self._cooldown = (
+            cooldown_map if cooldown_map is not None
+            else CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
         )
 
         if verify_commitment_proofs_fn is None:
