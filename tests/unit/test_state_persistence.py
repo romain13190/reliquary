@@ -50,3 +50,36 @@ def test_save_creates_parent_dir(tmp_path: Path):
     s.window_n = 5
     s.save()
     assert p.exists()
+
+
+def test_miner_scores_ema_roundtrip(tmp_path: Path):
+    """miner_scores_ema dict survives save/load."""
+    p = str(tmp_path / "s.json")
+    s1 = ValidatorState(path=p)
+    s1.window_n = 10
+    s1.miner_scores_ema = {"alice": 0.25, "bob": 0.1}
+    s1.save()
+
+    s2 = ValidatorState(path=p)
+    s2.load()
+    assert abs(s2.miner_scores_ema["alice"] - 0.25) < 1e-9
+    assert abs(s2.miner_scores_ema["bob"] - 0.1) < 1e-9
+
+
+def test_default_miner_scores_ema_is_empty(tmp_path: Path):
+    """Fresh ValidatorState starts with an empty EMA dict."""
+    s = ValidatorState(path=str(tmp_path / "s.json"))
+    assert s.miner_scores_ema == {}
+
+
+def test_load_legacy_file_without_ema_key(tmp_path: Path):
+    """Old state files without miner_scores_ema load cleanly (defaults to {})."""
+    import json
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps({"window_n": 5, "checkpoint_n": 2}))
+
+    s = ValidatorState(path=str(p))
+    s.load()
+    assert s.window_n == 5
+    assert s.checkpoint_n == 2
+    assert s.miner_scores_ema == {}

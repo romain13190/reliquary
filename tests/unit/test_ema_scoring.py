@@ -1,0 +1,176 @@
+"""EMA miner scoring — convergence, decay, persistence, burn math."""
+
+from collections import defaultdict
+from dataclasses import dataclass
+from unittest.mock import MagicMock
+
+import pytest
+
+from reliquary.constants import B_BATCH, EMA_ALPHA
+
+
+@dataclass
+class _FakeEnv:
+    @property
+    def name(self): return "fake"
+    def __len__(self): return 100
+    def get_problem(self, i): return {"prompt": "p", "ground_truth": "", "id": f"p{i}"}
+    def compute_reward(self, p, c): return 1.0
+
+
+class _FakeWallet:
+    class _Hk:
+        ss58_address = "5FHk"
+        @staticmethod
+        def sign(d): return b"sig"
+    hotkey = _Hk()
+
+
+def _make_service(tmp_path):
+    from reliquary.validator.service import ValidationService
+    from reliquary.validator.state_persistence import ValidatorState
+
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
+        env=_FakeEnv(), netuid=99,
+    )
+    svc._state_path = str(tmp_path / "s.json")
+    svc._state = ValidatorState(svc._state_path)
+    svc._miner_scores_ema = defaultdict(float)
+    return svc
+
+
+def _fake_batch(hotkey_counts: dict[str, int]):
+    """Build a list of fake ValidSubmissions from a (hotkey → count) map."""
+    batch = []
+    for hk, count in hotkey_counts.items():
+        for _ in range(count):
+            sub = MagicMock()
+            sub.hotkey = hk
+            batch.append(sub)
+    return batch
+
+
+def test_ema_converges_to_expected_fraction(tmp_path):
+    """Steady state: one miner winning 2/8 slots every window → EMA ≈ 0.25."""
+    svc = _make_service(tmp_path)
+    for _ in range(500):
+        svc._update_ema(_fake_batch({"alice": 2}))
+    assert abs(svc._miner_scores_ema["alice"] - 0.25) < 0.001
+
+
+def test_inactive_miner_decays_to_zero(tmp_path):
+    """Miner active 50 windows then stops — EMA drops below 1% after ~200 more windows."""
+    svc = _make_service(tmp_path)
+    # 50 windows active
+    for _ in range(50):
+        svc._update_ema(_fake_batch({"alice": 8}))  # full batch
+    peak = svc._miner_scores_ema["alice"]
+    assert peak > 0.5  # pretty active
+
+    # Stop — 200 windows of inactivity (empty batches)
+    for _ in range(200):
+        svc._update_ema([])
+
+    # EMA should have decayed substantially
+    final = svc._miner_scores_ema.get("alice", 0.0)
+    assert final < 0.01 * peak  # less than 1% of peak
+
+
+def test_sum_equals_fill_rate_steady_state(tmp_path):
+    """If batch consistently half-full, sum(EMAs) converges to ~0.5."""
+    svc = _make_service(tmp_path)
+    # Fill 4/8 slots every window — 4 different miners, 1 slot each
+    for _ in range(500):
+        svc._update_ema(_fake_batch({"a": 1, "b": 1, "c": 1, "d": 1}))
+    total = sum(svc._miner_scores_ema.values())
+    assert abs(total - 0.5) < 0.005
+
+
+def test_full_batch_sum_converges_to_one(tmp_path):
+    """Full batch every window → sum of EMAs → 1.0 (zero burn at steady state)."""
+    svc = _make_service(tmp_path)
+    for _ in range(500):
+        # 8 different miners, 1 slot each
+        batch_counts = {f"hk{i}": 1 for i in range(8)}
+        svc._update_ema(_fake_batch(batch_counts))
+    total = sum(svc._miner_scores_ema.values())
+    assert abs(total - 1.0) < 0.005
+
+
+def test_empty_batch_decays_all_emas(tmp_path):
+    """Empty batch for one window reduces every EMA by (1 - α)."""
+    svc = _make_service(tmp_path)
+    # Seed some EMAs
+    svc._miner_scores_ema["alice"] = 0.5
+    svc._miner_scores_ema["bob"] = 0.3
+
+    svc._update_ema([])  # empty batch
+
+    alpha = EMA_ALPHA
+    expected_alice = (1 - alpha) * 0.5
+    expected_bob = (1 - alpha) * 0.3
+    assert abs(svc._miner_scores_ema["alice"] - expected_alice) < 1e-9
+    assert abs(svc._miner_scores_ema["bob"] - expected_bob) < 1e-9
+
+
+def test_ema_persists_across_restart(tmp_path):
+    """Save EMA, create fresh service pointing at same path, EMA restored."""
+    path = tmp_path / "s.json"
+
+    svc1 = _make_service(tmp_path)
+    svc1._state_path = str(path)
+    svc1._state.path = str(path)
+    for _ in range(100):
+        svc1._update_ema(_fake_batch({"alice": 2, "bob": 1}))
+    final_alice = svc1._miner_scores_ema["alice"]
+    final_bob = svc1._miner_scores_ema["bob"]
+
+    # Fresh service, same state file
+    from reliquary.validator.service import ValidationService
+    from reliquary.validator.state_persistence import ValidatorState
+
+    svc2 = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
+        env=_FakeEnv(), netuid=99,
+    )
+    svc2._state = ValidatorState(str(path))
+    svc2._state.load()
+    svc2._miner_scores_ema = defaultdict(float, svc2._state.miner_scores_ema)
+
+    assert abs(svc2._miner_scores_ema["alice"] - final_alice) < 1e-9
+    assert abs(svc2._miner_scores_ema["bob"] - final_bob) < 1e-9
+
+
+def test_prune_keeps_dict_bounded(tmp_path):
+    """Near-zero EMAs (below 1e-6) are pruned to keep the dict small."""
+    svc = _make_service(tmp_path)
+    # Lots of short-lived miners
+    for i in range(50):
+        svc._update_ema(_fake_batch({f"ghost_{i}": 1}))
+    # Lots of decay
+    for _ in range(1000):
+        svc._update_ema([])
+    # Should have pruned most
+    assert len(svc._miner_scores_ema) < 10
+
+
+@pytest.mark.asyncio
+async def test_submit_does_not_clear_ema(tmp_path):
+    """_submit_weights must NOT reset _miner_scores_ema."""
+    from unittest.mock import AsyncMock
+    svc = _make_service(tmp_path)
+    svc._miner_scores_ema["alice"] = 0.2
+    svc._miner_scores_ema["bob"] = 0.3
+
+    # Mock chain methods so submit runs without real network
+    import reliquary.validator.service as svc_mod
+    svc_mod.chain.get_metagraph = AsyncMock(return_value=MagicMock(
+        hotkeys=["alice", "bob"], uids=[1, 2],
+    ))
+    svc_mod.chain.set_weights = AsyncMock(return_value=True)
+
+    await svc._submit_weights(MagicMock())
+
+    assert svc._miner_scores_ema["alice"] == 0.2
+    assert svc._miner_scores_ema["bob"] == 0.3

@@ -205,3 +205,10 @@ CHECKPOINT_STATE_PATH_DEFAULT = "reliquary/state/checkpoint.json"
 
 # Local directory for staged checkpoint files before R2 upload.
 CHECKPOINT_STAGING_DIR_DEFAULT = "reliquary/state/checkpoints"
+
+# ────────────────  SCORING  ────────────────
+
+# EMA smoothing factor for miner score. 2/(N+1) with N=ROLLING_WINDOWS=72
+# gives a ~25-window half-life — a miner that stops contributing loses
+# half their score in ~25 windows.
+EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274

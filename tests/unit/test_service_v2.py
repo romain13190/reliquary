@@ -74,10 +74,20 @@ async def test_rebuild_cooldown_from_history_populates_map():
     assert len(svc._cooldown_map) == 2
 
 
-def test_service_compute_weights_for_sealed_batch():
-    """After seal_batch, service computes flat 1/B weights."""
+def test_service_update_ema_for_sealed_batch():
+    """After seal_batch, service updates per-hotkey EMA from the batch."""
+    from collections import defaultdict
     from reliquary.protocol.submission import RolloutSubmission
-    from reliquary.validator.service import compute_weights_for_window
+    from reliquary.validator.service import ValidationService
+    from reliquary.validator.state_persistence import ValidatorState
+    from reliquary.constants import EMA_ALPHA
+
+    class FakeWallet:
+        class _Hk:
+            ss58_address = "5FHk"
+            @staticmethod
+            def sign(d): return b"sig"
+        hotkey = _Hk()
 
     rollouts = [
         RolloutSubmission(tokens=[1], reward=1.0, commit={"tokens": [1]})
@@ -90,7 +100,21 @@ def test_service_compute_weights_for_sealed_batch():
         )
         for i in range(5)
     ]
-    miner_weights, burn_weight = compute_weights_for_window(batch)
-    assert len(miner_weights) == 5
-    assert all(abs(w - 1.0 / B_BATCH) < 1e-9 for w in miner_weights.values())
-    assert abs(burn_weight - 3.0 / B_BATCH) < 1e-9
+
+    from unittest.mock import MagicMock
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmp:
+        svc = ValidationService(
+            wallet=FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
+            env=MagicMock(), netuid=99,
+        )
+        state_path = os.path.join(tmp, "s.json")
+        svc._state = ValidatorState(state_path)
+        svc._miner_scores_ema = defaultdict(float)
+
+        svc._update_ema(batch)
+
+        # 5 miners each contributed 1/B_BATCH of the batch.
+        for i in range(5):
+            expected = EMA_ALPHA * (1.0 / B_BATCH)
+            assert abs(svc._miner_scores_ema[f"hk{i}"] - expected) < 1e-9

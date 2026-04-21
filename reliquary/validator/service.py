@@ -31,7 +31,6 @@ from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.state_persistence import ValidatorState
 from reliquary.validator.training import train_step
-from reliquary.validator.weights import compute_weights_v2
 
 logger = logging.getLogger(__name__)
 
@@ -80,12 +79,6 @@ def open_grpo_window(
     )
 
 
-def compute_weights_for_window(
-    batch: list[ValidSubmission],
-) -> tuple[dict[str, float], float]:
-    """Collapse a sealed batch into (miner_weights, burn_weight) via v2 flat formula."""
-    return compute_weights_v2(batch_hotkeys=[sub.hotkey for sub in batch])
-
 
 class ValidationService:
     def __init__(
@@ -113,7 +106,6 @@ class ValidationService:
         self.external_port = external_port
 
         self._last_processed_window: int = -1
-        self._batched_hotkeys: list[str] = []
         self._windows_in_interval: int = 0
         self._cooldown_map = CooldownMap(
             cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
@@ -125,6 +117,10 @@ class ValidationService:
         self._state_path = CHECKPOINT_STATE_PATH_DEFAULT
         self._state = ValidatorState(self._state_path)
         self._state.load()
+        # Load EMA from persisted state (survives restarts).
+        self._miner_scores_ema: defaultdict[str, float] = defaultdict(
+            float, self._state.miner_scores_ema
+        )
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
@@ -134,6 +130,38 @@ class ValidationService:
         )
         self._active_batcher = None
         self._current_window_state: WindowState = WindowState.READY
+
+    def _update_ema(self, batch: list) -> None:
+        """EMA update on the per-hotkey miner score dict.
+
+        Applied to every hotkey we've ever seen — absent miners this window
+        contribute 0 → their EMA decays by factor (1 - α). Active miners
+        blend in their fresh contribution.
+
+        The sum across all hotkeys converges to the smoothed fill rate of
+        the batch — burn is derived as the complement.
+        """
+        from reliquary.constants import EMA_ALPHA
+        alpha = EMA_ALPHA
+
+        window_contribs: dict[str, int] = defaultdict(int)
+        for sub in batch:
+            window_contribs[sub.hotkey] += 1
+
+        all_hotkeys = set(self._miner_scores_ema) | set(window_contribs)
+        for hk in all_hotkeys:
+            fraction = window_contribs.get(hk, 0) / B_BATCH
+            old = self._miner_scores_ema[hk]
+            self._miner_scores_ema[hk] = alpha * fraction + (1 - alpha) * old
+
+        # Prune near-zero entries to bound the dict size.
+        self._miner_scores_ema = defaultdict(float, {
+            hk: v for hk, v in self._miner_scores_ema.items() if v > 1e-6
+        })
+
+        # Persist so the EMA survives restarts.
+        self._state.miner_scores_ema = dict(self._miner_scores_ema)
+        self._state.save()
 
     def _set_state(self, s: WindowState) -> None:
         self._current_window_state = s
@@ -178,8 +206,7 @@ class ValidationService:
 
         self._set_state(WindowState.TRAINING)
         batch = self._active_batcher.seal_batch()
-        for sub in batch:
-            self._batched_hotkeys.append(sub.hotkey)
+        self._update_ema(batch)
 
         self.model = train_step(self.model, batch)
 
@@ -288,8 +315,10 @@ class ValidationService:
                     # Weight cadence: every ROLLING_WINDOWS sealed windows.
                     if self._state.window_n % ROLLING_WINDOWS == 0:
                         submitted = await self._submit_weights(subtensor)
-                        if submitted:
-                            self._batched_hotkeys.clear()
+                        if not submitted:
+                            logger.warning(
+                                "set_weights did not succeed — EMA unchanged for next retry"
+                            )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -397,30 +426,17 @@ class ValidationService:
         return chain.compute_window_randomness(block_hash)
 
     async def _submit_weights(self, subtensor) -> bool:
-        """Submit flat 1/B weights + burn."""
-        # Aggregate batch members across the interval.
-        hotkey_counts: dict[str, int] = defaultdict(int)
-        for hk in self._batched_hotkeys:
-            hotkey_counts[hk] += 1
-
-        # Each slot is worth 1/(ROLLING_WINDOWS * B_BATCH) of the total
-        # emission over the interval. Equivalently, since miner_weights
-        # from compute_weights_v2 sums to len(batch)/B per window and we
-        # have ROLLING_WINDOWS windows, the normalized per-miner share is
-        # count * 1/(ROLLING_WINDOWS * B_BATCH).
-        total_slots = ROLLING_WINDOWS * B_BATCH
-        if total_slots == 0:
-            return True
-
-        miner_weights = {
-            hk: count / total_slots for hk, count in hotkey_counts.items()
-        }
-        used = len(self._batched_hotkeys)
-        burn_weight = (total_slots - used) / total_slots
+        """Submit weights from the current EMA snapshot. EMA is NOT cleared
+        on success — it persists across submits so that any submit within
+        an epoch carries the full rolling view of miner contributions.
+        """
+        miner_weights = dict(self._miner_scores_ema)
+        total = sum(miner_weights.values())
+        burn_weight = max(0.0, 1.0 - total)
 
         logger.info(
-            "Submitting v2 weights: %d miners, burn=%.4f (used=%d/%d slots)",
-            len(miner_weights), burn_weight, used, total_slots,
+            "Submitting weights: %d miners (ema_total=%.4f), burn=%.4f",
+            len(miner_weights), total, burn_weight,
         )
         for hk, w in sorted(miner_weights.items(), key=lambda x: -x[1])[:10]:
             logger.info("  %s: %.6f", hk[:8], w)

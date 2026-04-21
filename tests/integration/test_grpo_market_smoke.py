@@ -16,7 +16,7 @@ from reliquary.protocol.submission import (
 )
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.cooldown import CooldownMap
-from reliquary.validator.weights import compute_weights_v2
+from collections import defaultdict
 
 
 class FakeEnv:
@@ -117,21 +117,58 @@ def test_two_windows_with_cooldown():
     assert resp.accepted is True, f"expected eligibility after cooldown, got {resp.reason}"
 
 
+def _run_ema_windows(hotkey_counts_per_window: list[dict[str, int]]) -> defaultdict:
+    """Simulate _update_ema over multiple windows; return final EMA dict."""
+    from unittest.mock import MagicMock
+    from reliquary.validator.service import ValidationService
+    from reliquary.validator.state_persistence import ValidatorState
+    import tempfile, os
+
+    class _W:
+        class _Hk:
+            ss58_address = "5FHk"
+            @staticmethod
+            def sign(d): return b"sig"
+        hotkey = _Hk()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        svc = ValidationService(
+            wallet=_W(), model=MagicMock(), tokenizer=MagicMock(),
+            env=MagicMock(), netuid=99,
+        )
+        svc._state = ValidatorState(os.path.join(tmp, "s.json"))
+        svc._miner_scores_ema = defaultdict(float)
+
+        for counts in hotkey_counts_per_window:
+            batch = []
+            for hk, n in counts.items():
+                for _ in range(n):
+                    sub = MagicMock()
+                    sub.hotkey = hk
+                    batch.append(sub)
+            svc._update_ema(batch)
+
+        return svc._miner_scores_ema
+
+
 def test_weights_for_full_batch():
-    """Full batch of 8 hotkeys: each gets 1/B, zero burn."""
-    batch = [f"hk{i}" for i in range(B_BATCH)]
-    weights, burn = compute_weights_v2(batch_hotkeys=batch)
-    assert abs(sum(weights.values()) + burn - 1.0) < 1e-9
-    assert abs(burn) < 1e-9
-    assert len(weights) == B_BATCH
+    """Full batch every window — after convergence, EMA sum → 1.0, burn ≈ 0."""
+    counts = {f"hk{i}": 1 for i in range(B_BATCH)}
+    ema = _run_ema_windows([counts] * 500)
+    total = sum(ema.values())
+    burn = max(0.0, 1.0 - total)
+    assert abs(total + burn - 1.0) < 1e-9
+    assert abs(burn) < 0.005
+    assert len(ema) == B_BATCH
 
 
 def test_weights_for_partial_batch_burns_rest():
-    """Partial batch of 5: each gets 1/B, 3/B burns."""
-    batch = [f"hk{i}" for i in range(5)]
-    weights, burn = compute_weights_v2(batch_hotkeys=batch)
-    assert abs(sum(weights.values()) + burn - 1.0) < 1e-9
-    assert abs(burn - 3.0 / B_BATCH) < 1e-9
+    """Partial batch (5/8) every window — after convergence, burn ≈ 3/8."""
+    counts = {f"hk{i}": 1 for i in range(5)}
+    ema = _run_ema_windows([counts] * 500)
+    total = sum(ema.values())
+    burn = max(0.0, 1.0 - total)
+    assert abs(burn - 3.0 / B_BATCH) < 0.005
 
 
 def test_out_of_zone_rejected_end_to_end():

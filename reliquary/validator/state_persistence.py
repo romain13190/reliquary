@@ -20,6 +20,7 @@ class ValidatorState:
         self.path = path
         self.window_n: int = 0
         self.checkpoint_n: int = 0
+        self.miner_scores_ema: dict[str, float] = {}
 
     def load(self) -> None:
         """Load from disk if present; otherwise leave defaults."""
@@ -29,6 +30,9 @@ class ValidatorState:
             data = json.load(f)
         self.window_n = int(data.get("window_n", 0))
         self.checkpoint_n = int(data.get("checkpoint_n", 0))
+        self.miner_scores_ema = {
+            str(k): float(v) for k, v in data.get("miner_scores_ema", {}).items()
+        }
 
     def save(self) -> None:
         """Atomic write via tmp + rename. Creates parent dir if needed."""
@@ -38,7 +42,11 @@ class ValidatorState:
         try:
             with os.fdopen(tmp_fd, "w") as f:
                 json.dump(
-                    {"window_n": self.window_n, "checkpoint_n": self.checkpoint_n},
+                    {
+                        "window_n": self.window_n,
+                        "checkpoint_n": self.checkpoint_n,
+                        "miner_scores_ema": self.miner_scores_ema,
+                    },
                     f,
                 )
             os.replace(tmp_path, self.path)
