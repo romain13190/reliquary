@@ -2,6 +2,24 @@
 
 This is the minimal guide to start a miner on Bittensor subnet 81.
 
+## Boot sequence
+
+1. Miner starts with `reliquary mine --wallet-name ... --hotkey ...`
+2. Discovers the validator's HTTP URL via the Bittensor metagraph (or
+   uses `--validator-url` override)
+3. Queries `GET /window/state` to see the validator's currently-published
+   checkpoint (`checkpoint_repo_id` + `checkpoint_revision`)
+4. If the validator has a published checkpoint → downloads it from
+   Hugging Face and loads those weights
+5. Else → falls back to `--checkpoint` (default: `Qwen/Qwen3-4B-Instruct`)
+6. Enters the main loop in `MiningEngine.mine_window()`:
+   - Poll `/window/state` every tick
+   - If `state.checkpoint_n > local_n` → `_load_checkpoint(new_path)` (re-downloads and re-installs both model copies)
+   - If `state.state == OPEN` → pick prompt, generate, submit
+
+The boot query ensures a miner joining an already-running subnet lands
+directly on the current model, skipping an initial reject cycle.
+
 ## What a miner does (v2.1)
 
 Windows are event-driven, not time-based. A window seals the instant B=8

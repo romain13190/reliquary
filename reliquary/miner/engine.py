@@ -290,39 +290,29 @@ class MiningEngine:
     def _load_checkpoint(self, local_path: str):
         """Reload both hf_model and vllm_model from *local_path*.
 
-        Called after a successful HF download when the validator advances
-        its published checkpoint_n. Updates ``self.hf_model`` AND
-        ``self.vllm_model`` in place, returns the new hf_model so the
-        caller can overwrite its local reference.
-
-        On any exception, the old models are preserved and the function
-        returns the unchanged ``self.hf_model`` so the miner can keep
-        submitting (with the old checkpoint_hash, which will likely be
-        rejected with WRONG_CHECKPOINT until the next pull attempt
-        succeeds).
+        Both attributes are ``AutoModelForCausalLM`` instances despite the
+        historical ``vllm_model`` naming — vllm_model is the fast-generation
+        copy on ``self.vllm_gpu``, hf_model is the GRAIL-proof copy on
+        ``self.proof_gpu``.
         """
         import torch
         from transformers import AutoModelForCausalLM
 
-        from reliquary.constants import ATTN_IMPLEMENTATION, MAX_TOKENS_PER_ROLLOUT
+        from reliquary.constants import ATTN_IMPLEMENTATION
 
-        # Skip if we think we're already loaded from this path — avoids
-        # churn if maybe_pull_checkpoint is called redundantly.
         if getattr(self, "_loaded_checkpoint_path", None) == local_path:
             logger.debug("_load_checkpoint: already loaded from %s", local_path)
             return self.hf_model
 
         logger.info("Loading checkpoint from %s", local_path)
 
-        # 1. Reload hf_model (for GRAIL proofs).
+        # 1. Reload hf_model (for GRAIL proofs) on the proof GPU.
         try:
             new_hf = AutoModelForCausalLM.from_pretrained(
                 local_path,
                 torch_dtype=torch.bfloat16,
                 attn_implementation=ATTN_IMPLEMENTATION,
-            )
-            new_hf = new_hf.to(f"cuda:{self.proof_gpu}")
-            new_hf.eval()
+            ).to(f"cuda:{self.proof_gpu}").eval()
         except Exception:
             logger.exception(
                 "Failed to reload hf_model from %s; keeping old model",
@@ -330,71 +320,42 @@ class MiningEngine:
             )
             return self.hf_model
 
-        # 2. Swap hf_model — old is garbage-collected after we clear the
-        # reference and empty cache.
         old_hf = self.hf_model
         self.hf_model = new_hf
         del old_hf
         try:
             torch.cuda.empty_cache()
         except Exception:
-            pass  # non-CUDA envs, tests, etc.
+            pass
 
-        # 3. Reload vllm_model.
+        # 2. Reload vllm_model on the generation GPU.
         try:
-            from vllm import LLM
-        except ImportError:
-            logger.warning(
-                "vllm not installed — skipping vllm_model reload "
-                "(this should never happen in production)"
-            )
-            self._loaded_checkpoint_path = local_path
-            return self.hf_model
-
-        try:
-            # Tear down the old vllm engine first so memory frees up
-            # before we instantiate the new one.
-            old_vllm = self.vllm_model
-            self.vllm_model = None
-            del old_vllm
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-            # Pin the new LLM instance to the same GPU as before.
-            # vLLM uses CUDA_VISIBLE_DEVICES for device selection rather
-            # than a device= kwarg, so we set the env var for the duration
-            # of the LLM() call and restore it afterwards.
-            _old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.vllm_gpu)
-            try:
-                self.vllm_model = LLM(
-                    model=local_path,
-                    dtype="bfloat16",
-                    gpu_memory_utilization=0.85,
-                    max_model_len=MAX_TOKENS_PER_ROLLOUT,
-                )
-            finally:
-                if _old_cuda_visible is None:
-                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-                else:
-                    os.environ["CUDA_VISIBLE_DEVICES"] = _old_cuda_visible
-
+            new_gen = AutoModelForCausalLM.from_pretrained(
+                local_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=ATTN_IMPLEMENTATION,
+            ).to(f"cuda:{self.vllm_gpu}").eval()
         except Exception:
             logger.exception(
-                "Failed to reload vllm_model from %s; miner generation "
-                "is now BROKEN until next successful pull. The hf_model "
-                "was already swapped, so GRAIL proofs will be inconsistent.",
+                "Failed to reload vllm_model from %s; miner generation is "
+                "BROKEN until the next successful pull. hf_model was swapped "
+                "so GRAIL proofs will be inconsistent.",
                 local_path,
             )
-            # Don't raise — let the main loop report the situation and
-            # maybe retry. Return the (already-swapped) hf_model.
+            self.vllm_model = None
             self._loaded_checkpoint_path = None
             return self.hf_model
 
+        old_gen = self.vllm_model
+        self.vllm_model = new_gen
+        del old_gen
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
         self._loaded_checkpoint_path = local_path
-        logger.info("Checkpoint %s loaded into both hf_model and vllm_model", local_path)
+        logger.info("Checkpoint %s loaded into both models", local_path)
         return self.hf_model
 
     def _generate_m_rollouts(self, problem, randomness) -> list[dict]:

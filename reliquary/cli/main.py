@@ -54,16 +54,55 @@ def mine(
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from reliquary.constants import ATTN_IMPLEMENTATION, WINDOW_LENGTH
+        from reliquary.constants import ATTN_IMPLEMENTATION
         from reliquary.environment import load_environment
-        from reliquary.infrastructure.chain import get_subtensor
+        from reliquary.infrastructure.chain import get_subtensor, get_metagraph, NETUID
         from reliquary.miner.engine import MiningEngine
+        from reliquary.miner.submitter import discover_validator_url, get_window_state_v2
 
         wallet = bt.Wallet(name=wallet_name, hotkey=hotkey)
         subtensor = await get_subtensor()
 
-        logger.info("Loading models from %s...", checkpoint)
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        # --- Resolve initial checkpoint from validator if available ---
+        initial_path = checkpoint  # fallback to --checkpoint arg
+        try:
+            if validator_url:
+                url = validator_url
+            else:
+                metagraph = await get_metagraph(subtensor, NETUID)
+                url = discover_validator_url(metagraph)
+
+            import httpx
+            from huggingface_hub import snapshot_download
+            async with httpx.AsyncClient(timeout=30) as client:
+                state = await get_window_state_v2(url, 0, client=client)
+            if state.checkpoint_repo_id and state.checkpoint_revision:
+                logger.info(
+                    "Validator at %s is on checkpoint %d (%s@%s). "
+                    "Downloading to seed the miner model.",
+                    url, state.checkpoint_n, state.checkpoint_repo_id,
+                    state.checkpoint_revision[:12],
+                )
+                initial_path = snapshot_download(
+                    repo_id=state.checkpoint_repo_id,
+                    revision=state.checkpoint_revision,
+                )
+                logger.info("Using initial checkpoint path: %s", initial_path)
+            else:
+                logger.info(
+                    "Validator has no published checkpoint yet — using --checkpoint=%s",
+                    checkpoint,
+                )
+        except Exception as e:
+            logger.warning(
+                "Could not fetch validator checkpoint (%s); falling back to "
+                "--checkpoint=%s",
+                e, checkpoint,
+            )
+
+        # --- Load models from resolved path ---
+        logger.info("Loading models from %s...", initial_path)
+        tokenizer = AutoTokenizer.from_pretrained(initial_path)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -72,13 +111,13 @@ def mine(
         proof_device = "cuda:1" if torch.cuda.device_count() >= 2 else "cuda:0"
 
         vllm_model = AutoModelForCausalLM.from_pretrained(
-            checkpoint,
+            initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to("cuda:0").eval()
 
         hf_model = AutoModelForCausalLM.from_pretrained(
-            checkpoint,
+            initial_path,
             torch_dtype=torch.bfloat16,
             attn_implementation=ATTN_IMPLEMENTATION,
         ).to(proof_device).eval()
@@ -94,30 +133,19 @@ def mine(
             validator_url_override=validator_url or None,
         )
 
+        # Seed engine's _loaded_checkpoint_path so the first
+        # maybe_pull_checkpoint sees we're already synced (skips redundant reload).
+        if initial_path != checkpoint:
+            engine._loaded_checkpoint_path = initial_path
+
         logger.info("Miner ready. Entering main loop.")
-        last_window = -1
-        while True:
-            try:
-                current_block = await subtensor.get_current_block()
-                # Mine the window the validator is currently open on — same
-                # formula as ValidationService._compute_target_window: the
-                # validator processes the window that JUST ENDED so there is
-                # time for late submissions; miners must target that same
-                # window or their POSTs 404 (validator not open on it yet).
-                window_start = (
-                    (current_block // WINDOW_LENGTH) * WINDOW_LENGTH - WINDOW_LENGTH
-                )
-                if window_start > last_window:
-                    await engine.mine_window(
-                        subtensor, window_start, use_drand=use_drand
-                    )
-                    last_window = window_start
-                await asyncio.sleep(6)
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                logger.error("Mining error: %s", e, exc_info=True)
-                await asyncio.sleep(12)
+        try:
+            await engine.mine_window(subtensor, 0, use_drand=use_drand)
+        except KeyboardInterrupt:
+            logger.info("Miner interrupted by user")
+        except Exception as e:
+            logger.error("Mining loop crashed: %s", e, exc_info=True)
+            raise
 
     asyncio.run(_run())
 
