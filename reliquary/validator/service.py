@@ -204,19 +204,32 @@ class ValidationService:
         self._set_state(WindowState.READY)
 
     async def _archive_window(self, batcher, batch) -> None:
+        batch_entries = []
+        for s in batch:
+            problem = self.env.get_problem(s.prompt_idx)
+            rollouts_payload = [
+                {
+                    "tokens": r.tokens,
+                    "completion_text": text,
+                    "reward": r.reward,
+                }
+                for r, text in zip(s.rollouts, s.completion_texts)
+            ]
+            batch_entries.append({
+                "hotkey": s.hotkey,
+                "prompt_idx": s.prompt_idx,
+                "signed_round": s.signed_round,
+                "k": s.k,
+                "prompt": problem.get("prompt", ""),
+                "ground_truth": problem.get("ground_truth", ""),
+                "rollouts": rollouts_payload,
+            })
+
         archive = {
             "window_start": batcher.window_start,
             "randomness": batcher.randomness,
             "environment": self.env.name,
-            "batch": [
-                {
-                    "hotkey": s.hotkey,
-                    "prompt_idx": s.prompt_idx,
-                    "signed_round": s.signed_round,
-                    "k": s.k,
-                }
-                for s in batch
-            ],
+            "batch": batch_entries,
         }
         await storage.upload_window_dataset(
             batcher.window_start, archive,
