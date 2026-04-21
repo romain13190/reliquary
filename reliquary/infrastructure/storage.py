@@ -275,6 +275,25 @@ async def list_recent_datasets(
     return archives
 
 
+async def upload_checkpoint_file(local_path: str, key: str, **client_kwargs) -> str:
+    """Upload a checkpoint file (typically *.safetensors) to R2.
+
+    Returns the URL used by miners to download. Constructed from
+    ``R2_PUBLIC_URL`` env (fallback to endpoint) + bucket + key.
+    """
+    bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+    endpoint = os.getenv(
+        "R2_PUBLIC_URL",
+        os.getenv("R2_ENDPOINT_URL", ""),
+    )
+    async with get_s3_client(**client_kwargs) as client:
+        with open(local_path, "rb") as f:
+            await client.put_object(Bucket=bucket, Key=key, Body=f.read())
+    url = f"{endpoint.rstrip('/')}/{bucket}/{key}" if endpoint else f"r2://{bucket}/{key}"
+    logger.info("Uploaded checkpoint to %s", url)
+    return url
+
+
 async def download_window_rollouts(
     hotkey: str, window_start: int, **client_kwargs
 ) -> tuple[list[dict] | None, float | None]:
