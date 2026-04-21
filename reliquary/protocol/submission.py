@@ -72,6 +72,7 @@ class BatchSubmissionRequest(BaseModel):
     signed_round: int = Field(..., ge=0)
     merkle_root: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
     rollouts: list[RolloutSubmission]
+    checkpoint_hash: str = Field(..., min_length=1)
 
     @field_validator("rollouts")
     @classmethod
@@ -93,11 +94,16 @@ class BatchSubmissionResponse(BaseModel):
 
 
 class GrpoBatchState(BaseModel):
-    """Live window state for miners polling ``/window/{n}/state`` (v2)."""
+    """Live window state for miners polling ``/window/{n}/state`` (v2.1)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    window_start: int = Field(..., ge=0)
+    state: WindowState
+    window_n: int = Field(..., ge=0)
+    anchor_block: int = Field(..., ge=0)
     current_round: int = Field(..., ge=0)
     cooldown_prompts: list[int] = Field(default_factory=list)
     valid_submissions: int = Field(..., ge=0)
+    checkpoint_n: int = Field(..., ge=0)
+    checkpoint_url: str | None = None
+    checkpoint_hash: str | None = None
