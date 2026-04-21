@@ -2,27 +2,36 @@
 
 This is the minimal guide to start a miner on Bittensor subnet 81.
 
-## What a miner does (v2)
+## What a miner does (v2.1)
 
-Every ~60 seconds (one window ≈ 1 GRPO training step), every miner on the
-subnet:
+Windows are event-driven, not time-based. A window seals the instant B=8
+valid distinct-prompt submissions land; there is no fixed 60-second cadence.
+Every miner on the subnet runs a continuous poll-submit loop:
 
-1. **Picks a prompt** — selects a `prompt_idx` freely from the GSM8K env
-   (~7473 problems), avoiding any index listed in the validator's published
-   cooldown set (`/window/{n}/state` → `cooldown_prompts`).
-2. **Generates rollouts** — runs M=8 completions at `T_PROTO` (≈ 0.9),
-   `top_p=TOP_P_PROTO`, `top_k=TOP_K_PROTO` on the current reference
-   checkpoint.
-3. **Computes local rewards** — calls `env.compute_reward` on each rollout.
+1. **Polls `/window/state`** — calls `GET /window/state` continuously. The
+   response (`GrpoBatchState`) carries `state`, `window_n`, `checkpoint_n`,
+   `checkpoint_url`, `checkpoint_hash`, and `cooldown_prompts`.
+   - If `state != "open"`, the validator is in `TRAINING` or `PUBLISHING` —
+     sleep briefly (1–2 s) and re-poll. Do not submit while the window is
+     not open.
+   - If `checkpoint_n` advanced since the last poll, download `checkpoint_url`
+     and load the new weights before generating any rollouts.
+2. **Picks a prompt** — selects a `prompt_idx` freely from the GSM8K env
+   (~7473 problems), avoiding any index in `cooldown_prompts`. The window
+   identifier is `state.window_n` — there is no block-based window start.
+3. **Generates rollouts** — runs M=8 completions at `T_PROTO` (≈ 0.9),
+   `top_p=TOP_P_PROTO`, `top_k=TOP_K_PROTO` on the current checkpoint.
+4. **Computes local rewards** — calls `env.compute_reward` on each rollout.
    The validator recomputes rewards independently; claims that don't match
    are rejected (`REWARD_MISMATCH`). Only deterministic envs (like GSM8K)
    are used, so results are always reproducible.
-4. **Builds GRAIL sketches** — runs the bit-identical HuggingFace forward
+5. **Builds GRAIL sketches** — runs the bit-identical HuggingFace forward
    pass and generates sketch commitments that bind the completions to the
    model (unchanged from v1).
-5. **Submits** — POSTs a `BatchSubmissionRequest` to the validator containing:
+6. **Submits** — POSTs a `BatchSubmissionRequest` to the validator containing:
    `prompt_idx`, 8 rollouts, local rewards, GRAIL commits, `merkle_root`,
-   and `signed_round` (the most recent drand round the miner observed).
+   `signed_round` (the most recent drand round the miner observed), and
+   `checkpoint_hash` (copied from the last `/window/state` response).
 
 The validator processes submissions in real time. Only the first `B = 8`
 accepted submissions with distinct `prompt_idx` values that pass the zone
@@ -33,14 +42,19 @@ filter form the training batch for that window.
 The reference miner strategy (`pick_prompt_idx` in
 `reliquary/miner/engine.py`) is uniform-random sampling with
 rejection-sampling against the cooldown set. Before generating rollouts,
-fetch the cooldown set:
+fetch the window state:
 
 ```
-GET /window/{n}/state  →  GrpoBatchState.cooldown_prompts
+GET /window/state  →  GrpoBatchState
 ```
 
-Pick any `prompt_idx ∉ cooldown_prompts`. There is no other constraint on
-which prompt to pick — the whole GSM8K index is open.
+- Read `cooldown_prompts` and pick any `prompt_idx ∉ cooldown_prompts`.
+- Read `checkpoint_hash` and include it verbatim in your submission.
+- Read `window_n` and use it as the authoritative window identifier —
+  do not use block numbers for window timing.
+
+There is no other constraint on which prompt to pick — the whole GSM8K
+index is open.
 
 ### Zone filter
 
@@ -58,11 +72,18 @@ training and earn nothing.
 
 | Reason | Meaning | Action |
 |---|---|---|
+| `WRONG_CHECKPOINT` | `checkpoint_hash` in your submission doesn't match the active window | Re-poll `/window/state`, update to the latest `checkpoint_hash`, and retry |
 | `PROMPT_IN_COOLDOWN` | `prompt_idx` is in the active cooldown set | Retry with a different `prompt_idx` |
 | `STALE_ROUND` | `signed_round` is too old or from the future | Ensure your drand client is synced |
 | `OUT_OF_ZONE` | `k` (correct count) outside `[2, 6]` | Choose a different prompt; this one is too easy or too hard for you right now |
 | `REWARD_MISMATCH` | Your local rewards don't match `env.compute_reward` | Check checkpoint and env version alignment |
 | `GRAIL_FAIL` | Sketch doesn't match the validator's forward pass | Wrong checkpoint or CUDA environment mismatch |
+
+`WRONG_CHECKPOINT` is the most common transient rejection. It happens in the
+brief window between when the validator publishes a new checkpoint and when
+your miner polls the update. Re-poll `/window/state`, pick up the new
+`checkpoint_hash` and `checkpoint_url`, download the weights if `checkpoint_n`
+advanced, and resubmit.
 
 ### Payment model
 
@@ -176,20 +197,23 @@ On a healthy startup:
 ... | Starting Reliquary miner (network=finney, netuid=81, env=gsm8k)
 ... | Loading models from ./checkpoints/current...
 ... | Miner ready. Entering main loop.
-... | Mining window 1234567 — 30s budget, validator http://x.x.x.x:8888
-... | prompt_idx=4821 accepted=True  reason='ok'
+... | window_n=42 state=open checkpoint_n=7 — polling validator http://x.x.x.x:8888
+... | checkpoint_n advanced to 7 — downloading new weights
+... | prompt_idx=4821 checkpoint_hash=sha256:abc… accepted=True reason='ok'
 ... | prompt_idx=4821 batch_position=3/8
 ```
 
 If submissions are rejected, the `reason` string tells you why (see the
 rejection table above). On `PROMPT_IN_COOLDOWN`, pick a new `prompt_idx`
-and resubmit within the same window.
+and resubmit. On `WRONG_CHECKPOINT`, re-poll `/window/state` to get the
+latest `checkpoint_hash` before retrying.
 
 ## Monitoring & stopping
 
-The miner loop runs until killed. It sleeps 6 s between windows and 12 s on
-errors. No state is kept between windows, so restarting is safe — you'll
-resume mining the next window.
+The miner loop runs until killed. Between windows (when `/window/state`
+returns `state != "open"`) it sleeps briefly (1–2 s) and re-polls. On
+errors it backs off for up to 12 s. No state is kept between windows, so
+restarting is safe — you'll resume mining the next open window.
 
 Common operational checks:
 
@@ -216,6 +240,12 @@ grep -E "Mining window|error" ~/miner.log | tail -50
   too easy (k=8) or too hard (k=0) for the current checkpoint. The miner
   engine samples uniformly across the full index; if you've overridden
   prompt selection, broaden the range.
+- **Persistent `WRONG_CHECKPOINT`**: your miner is not picking up the
+  latest `checkpoint_hash` from `/window/state`. Ensure the poll loop
+  updates the hash before each submission. If the validator has just
+  published checkpoint N+1, submissions carrying the old hash are rejected
+  until you re-poll.
 - **Nothing accepted for several windows**: check your checkpoint hash
-  matches the subnet-announced one. GRAIL rejects proofs from the wrong
-  model via sketch mismatch.
+  matches the one advertised by `/window/state`. GRAIL rejects proofs from
+  the wrong model via sketch mismatch; `WRONG_CHECKPOINT` rejects before
+  even reaching GRAIL.

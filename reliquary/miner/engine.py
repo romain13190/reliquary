@@ -7,6 +7,7 @@ Merkle root commitment, HTTP batch submission to validator.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -33,6 +34,33 @@ if TYPE_CHECKING:
     from reliquary.environment.base import Environment
 
 logger = logging.getLogger(__name__)
+
+
+async def maybe_pull_checkpoint(
+    state,
+    local_n: int,
+    local_hash: str,
+    local_model,
+    *,
+    download_fn,
+    load_fn,
+):
+    """If remote checkpoint_n > local, download + load and return new model.
+
+    Returns ``(new_local_n, new_local_hash, new_model)``. If no update is
+    needed (remote ≤ local, or remote has no URL yet), returns inputs
+    unchanged.
+
+    The download/load functions are injected so unit tests don't need
+    httpx + torch.
+    """
+    if state.checkpoint_n <= local_n:
+        return local_n, local_hash, local_model
+    if state.checkpoint_url is None:
+        return local_n, local_hash, local_model
+    local_path = await download_fn(state.checkpoint_url)
+    new_model = load_fn(local_path)
+    return state.checkpoint_n, state.checkpoint_hash, new_model
 
 
 def pick_prompt_idx(
@@ -137,70 +165,84 @@ class MiningEngine:
     async def mine_window(
         self,
         subtensor,
-        window_start: int,
+        window_start: int = 0,  # v2.0 param kept for CLI compat; ignored
         use_drand: bool = True,
     ) -> list:
-        """v2: pick prompts freely, generate M rollouts each, submit batch.
+        """v2.1: poll state, pull checkpoint on n-change, submit when OPEN.
 
-        Returns the list of BatchSubmissionResponse objects collected.
+        Returns the list of BatchSubmissionResponse objects collected
+        across the loop. The loop exits only on external cancellation
+        (asyncio.CancelledError) or if env becomes fully cooldown'd.
         """
         import httpx
         import random
 
-        # Lazy imports — submitter v2 helpers are defined in Task 13.
+        from reliquary.constants import M_ROLLOUTS, POLL_INTERVAL_SECONDS
         from reliquary.miner.submitter import (
-            SubmissionError,
-            discover_validator_url,
-            get_window_state_v2,
-            submit_batch_v2,
+            SubmissionError, discover_validator_url,
+            download_checkpoint, get_window_state_v2, submit_batch_v2,
+        )
+        from reliquary.protocol.submission import (
+            BatchSubmissionRequest, WindowState,
         )
 
-        randomness = await self._compute_randomness(subtensor, window_start, use_drand)
-
+        # Resolve validator URL (once).
         if self.validator_url_override:
             url = self.validator_url_override
         else:
             metagraph = await chain.get_metagraph(subtensor, chain.NETUID)
             url = discover_validator_url(metagraph)
 
-        deadline = (
-            time.monotonic()
-            + WINDOW_LENGTH * BLOCK_TIME_SECONDS
-            - UPLOAD_BUFFER
-        )
-        logger.info(
-            "Mining v2 window %d — %.0fs budget, validator %s",
-            window_start,
-            WINDOW_LENGTH * BLOCK_TIME_SECONDS - UPLOAD_BUFFER,
-            url,
-        )
+        # Compute randomness (once — v2.1 uses it only for GRAIL sketch seed)
+        randomness = await self._compute_randomness(subtensor, 0, use_drand)
 
         rng = random.Random()
         results = []
+        local_n = 0
+        local_hash = ""
 
         async with httpx.AsyncClient(timeout=30) as client:
-            while time.monotonic() < deadline:
+            while True:
                 try:
-                    state = await get_window_state_v2(url, window_start, client=client)
-                except SubmissionError as exc:
-                    logger.debug("state fetch failed: %s", exc)
+                    state = await get_window_state_v2(url, 0, client=client)
+                except SubmissionError:
+                    # /window/state may return 404 between windows; wait briefly.
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                    continue
+                except Exception as e:
+                    logger.debug("state fetch failed: %s", e)
+                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
                     continue
 
-                cooldown_set = set(state.cooldown_prompts)
-                signed_round = state.current_round
+                # Pull new checkpoint if needed (works at any state).
+                try:
+                    local_n, local_hash, self.hf_model = await maybe_pull_checkpoint(
+                        state=state, local_n=local_n, local_hash=local_hash,
+                        local_model=self.hf_model,
+                        download_fn=lambda u: download_checkpoint(u, client=client),
+                        load_fn=self._load_checkpoint,
+                    )
+                except Exception:
+                    logger.exception("checkpoint pull failed; keeping local")
 
+                if state.state != WindowState.OPEN:
+                    await asyncio.sleep(1)
+                    continue
+
+                # Pick prompt, generate, submit.
+                cooldown_set = set(state.cooldown_prompts)
                 try:
                     prompt_idx = pick_prompt_idx(self.env, cooldown_set, rng=rng)
                 except RuntimeError:
-                    logger.info("env fully in cooldown; stopping")
-                    break
+                    logger.info("env fully in cooldown; sleeping")
+                    await asyncio.sleep(5)
+                    continue
 
                 problem = self.env.get_problem(prompt_idx)
-
                 generations = self._generate_m_rollouts(problem, randomness)
                 if len(generations) < M_ROLLOUTS:
                     logger.warning(
-                        "generated %d / %d rollouts for prompt %d; skipping",
+                        "generated %d/%d for prompt %d; skipping",
                         len(generations), M_ROLLOUTS, prompt_idx,
                     )
                     continue
@@ -209,28 +251,38 @@ class MiningEngine:
                     self._build_rollout_submission(gen, problem, randomness)
                     for gen in generations
                 ]
-
                 merkle_root = _compute_merkle_root(rollout_submissions)
 
                 request = BatchSubmissionRequest(
                     miner_hotkey=self.wallet.hotkey.ss58_address,
                     prompt_idx=prompt_idx,
-                    window_start=window_start,
-                    signed_round=signed_round,
+                    window_start=state.window_n,
+                    signed_round=state.current_round,
                     merkle_root=merkle_root,
                     rollouts=rollout_submissions,
+                    checkpoint_hash=local_hash,
                 )
                 try:
                     resp = await submit_batch_v2(url, request, client=client)
                     logger.info(
-                        "submitted prompt %d — accepted=%s reason=%s",
-                        prompt_idx, resp.accepted, resp.reason.value,
+                        "submitted window=%d prompt=%d accepted=%s reason=%s",
+                        state.window_n, prompt_idx, resp.accepted,
+                        resp.reason.value if hasattr(resp.reason, "value") else resp.reason,
                     )
                     results.append(resp)
                 except SubmissionError as exc:
-                    logger.error("submit failed prompt %d: %s", prompt_idx, exc)
+                    logger.error("submit failed: %s", exc)
 
         return results
+
+    def _load_checkpoint(self, local_path: str):
+        """Load a downloaded checkpoint into self.hf_model.
+
+        Stub for v2.1: does nothing, returns current model unchanged.
+        Real impl: torch.load(local_path) + load_state_dict.
+        """
+        logger.info("_load_checkpoint stub called with path %s", local_path)
+        return self.hf_model
 
     def _generate_m_rollouts(self, problem, randomness) -> list[dict]:
         """Generate M_ROLLOUTS completions at T_PROTO. No cherry-picking."""

@@ -43,9 +43,18 @@ class ValidatorServer:
         self._task: asyncio.Task[Any] | None = None
         self._submit_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task[Any] | None = None
+        from reliquary.protocol.submission import WindowState
+        self._current_state: WindowState = WindowState.READY
+        self._current_checkpoint = None  # ManifestEntry | None
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
         self.active_batcher = batcher
+
+    def set_current_state(self, state) -> None:
+        self._current_state = state
+
+    def set_current_checkpoint(self, entry) -> None:
+        self._current_checkpoint = entry
 
     def _build_app(self) -> FastAPI:
         app = FastAPI(title="Reliquary Validator", version="2.0")
@@ -61,6 +70,13 @@ class ValidatorServer:
 
         @app.post("/submit", response_model=BatchSubmissionResponse)
         async def submit(request: BatchSubmissionRequest) -> BatchSubmissionResponse:
+            from reliquary.protocol.submission import WindowState
+            # v2.1: reject if state != OPEN
+            if self._current_state != WindowState.OPEN:
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.WINDOW_NOT_ACTIVE,
+                )
+
             batcher = self.active_batcher
             if batcher is None:
                 raise HTTPException(status_code=503, detail="no_active_window")
@@ -76,7 +92,7 @@ class ValidatorServer:
 
             await self._submit_queue.put((request, batcher))
             return BatchSubmissionResponse(
-                accepted=True, reason=RejectReason.ACCEPTED
+                accepted=True, reason=RejectReason.ACCEPTED,
             )
 
         @app.get(
@@ -86,7 +102,32 @@ class ValidatorServer:
             batcher = self.active_batcher
             if batcher is None or batcher.window_start != window_start:
                 raise HTTPException(status_code=404, detail="window_not_active")
-            return batcher.get_state()
+            cp = self._current_checkpoint
+            return GrpoBatchState(
+                state=self._current_state,
+                window_n=batcher.window_start,
+                anchor_block=batcher.window_start,  # placeholder; real anchor via service later
+                current_round=batcher.current_round,
+                cooldown_prompts=sorted(
+                    batcher._cooldown.current_cooldown_set(batcher.window_start)
+                ),
+                valid_submissions=len(batcher.valid_submissions()),
+                checkpoint_n=cp.checkpoint_n if cp else 0,
+                checkpoint_url=cp.file_url if cp else None,
+                checkpoint_hash=cp.file_hash if cp else None,
+            )
+
+        @app.get("/checkpoint")
+        async def checkpoint():
+            cp = self._current_checkpoint
+            if cp is None:
+                raise HTTPException(status_code=404, detail="no_checkpoint")
+            return {
+                "checkpoint_n": cp.checkpoint_n,
+                "file_url": cp.file_url,
+                "file_hash": cp.file_hash,
+                "signature": cp.signature,
+            }
 
         return app
 

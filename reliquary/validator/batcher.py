@@ -6,6 +6,7 @@ validator's shared ``CooldownMap``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from reliquary.protocol.submission import (
     GrpoBatchState,
     RejectReason,
     RolloutSubmission,
+    WindowState,
 )
 from reliquary.validator.batch_selection import select_batch
 from reliquary.validator.cooldown import CooldownMap
@@ -111,6 +113,25 @@ class GrpoWindowBatcher:
         self._valid: list[ValidSubmission] = []
         self.randomness: str = ""
 
+        # v2.1: seal_event fires the moment the B-th distinct non-cooldown
+        # valid submission lands. Service awaits this to close the window.
+        # Stored as threading.Event for sync-safe set(); the asyncio.Event
+        # is created lazily on first access to bind to the current loop.
+        self._seal_flag: threading.Event = threading.Event()
+        self._seal_event: asyncio.Event | None = None
+        # v2.1: checkpoint hash miners must match. Empty string disables
+        # the gate (test convenience / pre-first-publish).
+        self.current_checkpoint_hash: str = ""
+
+    @property
+    def seal_event(self) -> asyncio.Event:
+        """Lazy asyncio.Event bound to whichever loop accesses it first."""
+        if self._seal_event is None:
+            self._seal_event = asyncio.Event()
+            if self._seal_flag.is_set():
+                self._seal_event.set()
+        return self._seal_event
+
     # ----------------------------- ingestion -----------------------------
 
     def accept_submission(
@@ -125,6 +146,10 @@ class GrpoWindowBatcher:
     ) -> BatchSubmissionResponse:
         if request.window_start != self.window_start:
             return self._reject(RejectReason.WINDOW_MISMATCH)
+        # v2.1: checkpoint hash gate. Empty string = gate disabled
+        # (pre-first-publish or test convenience).
+        if self.current_checkpoint_hash and request.checkpoint_hash != self.current_checkpoint_hash:
+            return self._reject(RejectReason.WRONG_CHECKPOINT)
         if request.prompt_idx >= len(self.env):
             return self._reject(RejectReason.BAD_PROMPT_IDX)
         if not self._round_fresh(request.signed_round):
@@ -164,6 +189,17 @@ class GrpoWindowBatcher:
                 arrived_at=self._time_fn(),
             )
         )
+
+        # v2.1: fire seal_event when B distinct non-cooldown prompts have been accepted.
+        distinct_eligible = len({
+            s.prompt_idx for s in self._valid
+            if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
+        })
+        if distinct_eligible >= B_BATCH and not self._seal_flag.is_set():
+            self._seal_flag.set()
+            if self._seal_event is not None:
+                self._seal_event.set()
+
         return BatchSubmissionResponse(
             accepted=True, reason=RejectReason.ACCEPTED
         )
@@ -198,10 +234,13 @@ class GrpoWindowBatcher:
     def get_state(self) -> GrpoBatchState:
         with self._lock:
             return GrpoBatchState(
-                window_start=self.window_start,
+                state=WindowState.OPEN,
+                window_n=self.window_start,
+                anchor_block=self.window_start,
                 current_round=self.current_round,
                 cooldown_prompts=sorted(
                     self._cooldown.current_cooldown_set(self.window_start)
                 ),
                 valid_submissions=len(self._valid),
+                checkpoint_n=0,
             )

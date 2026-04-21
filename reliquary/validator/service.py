@@ -1,10 +1,9 @@
-"""Validator main loop — v2 GRPO market batching via HTTP endpoint."""
+"""Validator main loop — v2.1 batch-driven state machine (OPEN→TRAINING→PUBLISHING→READY)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections import defaultdict
 
 from reliquary.constants import (
@@ -12,19 +11,25 @@ from reliquary.constants import (
     B_BATCH,
     BLOCK_TIME_SECONDS,
     BOOTSTRAP_WINDOWS,
+    CHECKPOINT_STAGING_DIR_DEFAULT,
+    CHECKPOINT_STATE_PATH_DEFAULT,
     POLL_INTERVAL_SECONDS,
     SUBNET_START_BLOCK,
     UID_BURN,
     VALIDATOR_HTTP_PORT,
     WEIGHT_SUBMISSION_INTERVAL,
     WINDOW_LENGTH,
+    WINDOW_TIMEOUT_SECONDS,
 )
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
-from reliquary.protocol.submission import RolloutSubmission
+from reliquary.protocol.submission import RolloutSubmission, WindowState
 from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
+from reliquary.validator.state_persistence import ValidatorState
+from reliquary.validator.training import train_step
 from reliquary.validator.weights import compute_weights_v2
 
 logger = logging.getLogger(__name__)
@@ -114,72 +119,153 @@ class ValidationService:
 
         self.server = ValidatorServer(host=http_host, port=http_port)
 
-    async def _rebuild_cooldown_from_history(self, subtensor) -> None:
-        """At startup, reconstruct CooldownMap from the last
-        BATCH_PROMPT_COOLDOWN_WINDOWS archived windows on R2.
+        # v2.1 state machine infrastructure
+        self._state_path = CHECKPOINT_STATE_PATH_DEFAULT
+        self._state = ValidatorState(self._state_path)
+        self._state.load()
+        self._checkpoint_store = CheckpointStore(
+            validator_hotkey=wallet.hotkey.ss58_address,
+            wallet=wallet,
+            staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
+        )
+        self._active_batcher = None
+        self._current_window_state: WindowState = WindowState.READY
 
-        R2 is the durable source of truth — each window's sealed batch is
-        uploaded by ``_run_window``. Rebuilding from that history means:
-          * local disk state isn't needed (no JSON file to manage)
-          * multi-validator consistency: any validator rebuilding from the
-            same R2 prefix converges to the same cooldown map
-          * a fresh validator joining an active subnet picks up the
-            current cooldown state without coordination
-        """
+    def _set_state(self, s: WindowState) -> None:
+        self._current_window_state = s
+        # Also notify the server so /window/state returns the right value.
         try:
-            current_block = await chain.get_current_block(subtensor)
-            current_window = self._compute_target_window(current_block)
-            archives = await storage.list_recent_datasets(
-                hotkey=self.wallet.hotkey.ss58_address,
-                current_window=current_window,
-                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
+            self.server.set_current_state(s)
+        except AttributeError:
+            # Task 9 adds this method; be tolerant during development.
+            pass
+
+    def _open_window(self) -> None:
+        """Create a new GrpoWindowBatcher and mark state OPEN.
+
+        Increments ``self._state.window_n`` and wires the active
+        checkpoint hash into the batcher so miners on stale checkpoints
+        get WRONG_CHECKPOINT rejected before GRAIL compute.
+        """
+        self._state.window_n += 1
+        bootstrap = is_bootstrap_window(
+            window_start=self._state.window_n,
+            subnet_start=SUBNET_START_BLOCK,
+        )
+        self._active_batcher = open_grpo_window(
+            window_start=self._state.window_n,
+            current_round=self._state.window_n,  # placeholder; drand wiring later
+            env=self.env, model=self.model,
+            cooldown_map=self._cooldown_map, tokenizer=self.tokenizer,
+            bootstrap=bootstrap,
+        )
+        cp = self._checkpoint_store.current_manifest()
+        self._active_batcher.current_checkpoint_hash = (
+            cp.file_hash if cp else ""
+        )
+        self.server.set_active_batcher(self._active_batcher)
+        self._set_state(WindowState.OPEN)
+
+    async def _train_and_publish(self) -> None:
+        """TRAINING + PUBLISHING + READY phases."""
+        if self._active_batcher is None:
+            logger.warning("_train_and_publish called with no active batcher")
+            return
+
+        self._set_state(WindowState.TRAINING)
+        batch = self._active_batcher.seal_batch()
+        for sub in batch:
+            self._batched_hotkeys.append(sub.hotkey)
+
+        self.model = train_step(self.model, batch)
+
+        self._set_state(WindowState.PUBLISHING)
+        new_n = self._state.checkpoint_n + 1
+        try:
+            entry = await self._checkpoint_store.publish(
+                checkpoint_n=new_n, model=self.model,
             )
-            self._cooldown_map.rebuild_from_history(
-                archives, current_window=current_window,
-            )
-            logger.info(
-                "Rebuilt cooldown from %d archive windows (current=%d, map size=%d)",
-                len(archives), current_window, len(self._cooldown_map),
-            )
+            self._state.checkpoint_n = new_n
+            self._state.save()
+            # Notify server of new manifest (Task 9 adds this method).
+            try:
+                self.server.set_current_checkpoint(entry)
+            except AttributeError:
+                pass
         except Exception:
-            logger.exception(
-                "Failed to rebuild cooldown from history; starting with empty state"
-            )
+            logger.exception("checkpoint publish failed; staying on previous")
+
+        try:
+            await self._archive_window(self._active_batcher, batch)
+        except Exception:
+            logger.exception("window archive failed")
+
+        self.server.set_active_batcher(None)
+        self._active_batcher = None
+        self._set_state(WindowState.READY)
+
+    async def _archive_window(self, batcher, batch) -> None:
+        archive = {
+            "window_start": batcher.window_start,
+            "randomness": batcher.randomness,
+            "environment": self.env.name,
+            "batch": [
+                {
+                    "hotkey": s.hotkey,
+                    "prompt_idx": s.prompt_idx,
+                    "signed_round": s.signed_round,
+                    "k": s.k,
+                }
+                for s in batch
+            ],
+        }
+        await storage.upload_window_dataset(
+            batcher.window_start, archive,
+            validator_hotkey=self.wallet.hotkey.ss58_address,
+        )
 
     async def run(self, subtensor) -> None:
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
         await self._rebuild_cooldown_from_history(subtensor)
         logger.info(
-            "Validator started: env=%s, netuid=%d, http=%s:%d, rolling_windows=%d",
+            "Validator started (v2.1): env=%s, netuid=%d, http=%s:%d",
             self.env.name, self.netuid, self.server.host, self.server.port,
-            ROLLING_WINDOWS,
         )
         try:
             while True:
                 try:
-                    current_block = await chain.get_current_block(subtensor)
-                    target_window = self._compute_target_window(current_block)
-                    if target_window <= self._last_processed_window:
-                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                        continue
-                    await self._run_window(subtensor, target_window)
-                    self._last_processed_window = target_window
-                    self._windows_in_interval += 1
-                    if self._windows_in_interval >= ROLLING_WINDOWS:
+                    self._open_window()
+                    try:
+                        await asyncio.wait_for(
+                            self._active_batcher.seal_event.wait(),
+                            timeout=WINDOW_TIMEOUT_SECONDS,
+                        )
+                        logger.info(
+                            "Window %d sealed (B valid received)",
+                            self._state.window_n,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Window %d timed out at %ds — sealing partial",
+                            self._state.window_n, WINDOW_TIMEOUT_SECONDS,
+                        )
+
+                    await self._train_and_publish()
+
+                    # Weight cadence: every ROLLING_WINDOWS sealed windows.
+                    if self._state.window_n % ROLLING_WINDOWS == 0:
                         submitted = await self._submit_weights(subtensor)
                         if submitted:
                             self._batched_hotkeys.clear()
-                        else:
-                            logger.warning(
-                                "set_weights did not succeed — keeping %d hotkey slots for next cycle",
-                                len(self._batched_hotkeys),
-                            )
-                        self._windows_in_interval = 0
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("Validation loop iteration failed")
+                    logger.exception("Window iteration failed")
+                    # Reset to READY so the next iteration doesn't spin on error state.
+                    self.server.set_active_batcher(None)
+                    self._active_batcher = None
+                    self._set_state(WindowState.READY)
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
             await self.server.stop()
@@ -233,79 +319,37 @@ class ValidationService:
                 "serve_axon threw — miners will have to use --validator-url"
             )
 
-    async def _run_window(self, subtensor, target_window: int) -> None:
-        randomness = await self._derive_randomness(subtensor, target_window)
-        # v2: current drand round derived from the beacon, not block hash.
-        # For now use target_window as a placeholder logical round counter —
-        # the real wiring to drand round is in a follow-up. GrpoWindowBatcher
-        # uses this to validate signed_round freshness.
-        current_round = target_window
+    async def _rebuild_cooldown_from_history(self, subtensor) -> None:
+        """At startup, reconstruct CooldownMap from the last
+        BATCH_PROMPT_COOLDOWN_WINDOWS archived windows on R2.
 
-        bootstrap = is_bootstrap_window(
-            window_start=target_window, subnet_start=SUBNET_START_BLOCK,
-        )
-        batcher = open_grpo_window(
-            window_start=target_window,
-            current_round=current_round,
-            env=self.env,
-            model=self.model,
-            cooldown_map=self._cooldown_map,
-            tokenizer=self.tokenizer,
-            bootstrap=bootstrap,
-        )
-        batcher.randomness = randomness  # pass through for GRAIL sketch verification
-        self.server.set_active_batcher(batcher)
-
-        deadline = time.monotonic() + WINDOW_LENGTH * BLOCK_TIME_SECONDS
+        R2 is the durable source of truth — each window's sealed batch is
+        uploaded by ``_archive_window``. Rebuilding from that history means:
+          * local disk state isn't needed (no JSON file to manage)
+          * multi-validator consistency: any validator rebuilding from the
+            same R2 prefix converges to the same cooldown map
+          * a fresh validator joining an active subnet picks up the
+            current cooldown state without coordination
+        """
         try:
-            while time.monotonic() < deadline:
-                await asyncio.sleep(1)
-
-            # Seal the batch at window close — this records cooldowns.
-            batch = batcher.seal_batch()
-            for sub in batch:
-                self._batched_hotkeys.append(sub.hotkey)
-            empty = B_BATCH - len(batch)
-            logger.info(
-                "Window %d sealed: batch=%d/%d, empty=%d, valid_pool=%d",
-                target_window, len(batch), B_BATCH, empty,
-                len(batcher.valid_submissions()),
+            current_block = await chain.get_current_block(subtensor)
+            current_window = self._compute_target_window(current_block)
+            archives = await storage.list_recent_datasets(
+                hotkey=self.wallet.hotkey.ss58_address,
+                current_window=current_window,
+                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
             )
-
-            # Archive the valid submissions pool (not just the batch) for audit.
-            archive = {
-                "window_start": target_window,
-                "randomness": randomness,
-                "environment": self.env.name,
-                "batch": [
-                    {
-                        "hotkey": s.hotkey,
-                        "prompt_idx": s.prompt_idx,
-                        "signed_round": s.signed_round,
-                        "k": s.k,
-                    }
-                    for s in batch
-                ],
-                "valid_submissions": [
-                    {
-                        "hotkey": s.hotkey,
-                        "prompt_idx": s.prompt_idx,
-                        "signed_round": s.signed_round,
-                        "k": s.k,
-                    }
-                    for s in batcher.valid_submissions()
-                ],
-            }
-            try:
-                await storage.upload_window_dataset(
-                    target_window,
-                    archive,
-                    validator_hotkey=self.wallet.hotkey.ss58_address,
-                )
-            except Exception:
-                logger.exception("Failed to upload window dataset")
-        finally:
-            self.server.set_active_batcher(None)
+            self._cooldown_map.rebuild_from_history(
+                archives, current_window=current_window,
+            )
+            logger.info(
+                "Rebuilt cooldown from %d archive windows (current=%d, map size=%d)",
+                len(archives), current_window, len(self._cooldown_map),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to rebuild cooldown from history; starting with empty state"
+            )
 
     async def _derive_randomness(self, subtensor, target_window: int) -> str:
         block_hash = await chain.get_block_hash(subtensor, target_window)
@@ -371,3 +415,8 @@ class ValidationService:
     @staticmethod
     def _compute_target_window(current_block: int) -> int:
         return (current_block // WINDOW_LENGTH) * WINDOW_LENGTH - WINDOW_LENGTH
+
+    # _run_window is superseded by _open_window + _train_and_publish + _archive_window.
+    # Kept as dead code for Task 13 cleanup.
+    async def _run_window(self, subtensor, target_window: int) -> None:
+        pass

@@ -2,25 +2,39 @@
 
 This is the minimal guide to start a validator on Bittensor subnet 81.
 
-## What a validator does (v2)
+## What a validator does (v2.1)
 
-Each window (≈ 60 s, 1 GRPO training step), the validator:
+Windows are event-driven: a window seals the instant B=8 valid distinct-prompt
+submissions land. There is no fixed per-window timer — only the
+`WINDOW_TIMEOUT_SECONDS = 600` safety net fires if fewer than B submissions
+arrive in time.
 
-1. Runs a `GrpoWindowBatcher` that accepts miner submissions and tracks a
-   shared `CooldownMap` of recently-batched prompts.
-2. Exposes an HTTP endpoint (`/submit`, `/window/{n}/state`, `/health`) on
-   port 8888.
-3. Processes each `BatchSubmissionRequest` through the full verification
-   pipeline (see below) and appends valid submissions to the in-flight pool.
-4. At window close, calls `seal_batch()` — selects the first `B = 8`
-   distinct-prompt, in-zone submissions (FIFO by `signed_round`), records
-   each batched `prompt_idx` into the cooldown map, and archives the sealed
-   batch to R2.
-5. Runs the GRPO training step on the sealed batch; checkpoint is rotated
-   on-chain after each step.
-6. Every `WEIGHT_SUBMISSION_INTERVAL` blocks (≈ 72 windows / ~1 h),
-   aggregates batch hotkeys across the rolling interval (flat `1/B` per
-   miner slot) and sets on-chain weights. Unused slots burn to `UID_BURN`.
+The validator runs a state machine with four phases per window:
+
+1. **`OPEN`** — `_open_window()` creates a new `GrpoWindowBatcher`, sets
+   `ValidationService._state.window_n`, and begins accepting submissions at
+   `/submit`. The `/window/state` endpoint returns `state = "open"` plus
+   `checkpoint_n`, `checkpoint_url`, `checkpoint_hash`, and `cooldown_prompts`.
+2. **`TRAINING`** — the instant `seal_event` fires (B-th distinct valid
+   submission received, or timeout), the service transitions to `TRAINING`.
+   Submissions are rejected with `WINDOW_NOT_ACTIVE`. `_train_and_publish()`
+   calls `train_step()` (stub in v2.1; real GRPO loss plugs in here with
+   no protocol change — see `reliquary/validator/training.py`).
+3. **`PUBLISHING`** — after training, the new checkpoint is written locally,
+   uploaded to R2 at
+   `reliquary/checkpoints/{validator_hotkey}/{checkpoint_n}.safetensors`,
+   signed with ed25519 (`sign(checkpoint_n || file_hash)`), and the
+   `/checkpoint` manifest is updated.
+4. **`READY`** — manifest is live; `checkpoint_n` increments. The service
+   immediately transitions back to `OPEN` for the next window.
+
+Validator state (`window_n`, `checkpoint_n`) is persisted to
+`reliquary/state/checkpoint.json` and survives restarts without loss.
+
+Every `WEIGHT_SUBMISSION_INTERVAL` blocks, the validator aggregates batch
+hotkeys across the rolling `ROLLING_WINDOWS = 72` window interval (flat
+`1/B` per miner slot) and sets on-chain weights. Unused slots burn to
+`UID_BURN`.
 
 **Only one validator is active per window.** Miners auto-discover it from
 the metagraph via `validator_permit=True` + a routable axon.
@@ -29,21 +43,28 @@ the metagraph via `validator_permit=True` + a routable axon.
 
 Submissions are accepted or rejected in this exact order:
 
-1. **Signature** — ECDSA signature over the submission hash must verify
-   against the submitting hotkey.
-2. **`prompt_idx` range** — must be `0 ≤ prompt_idx < len(env)`.
-3. **Round freshness** — `signed_round` must be within the window's
-   acceptable drand range (not stale, not from the future).
-4. **Cooldown check** — `prompt_idx` must not appear in the active
+1. **Window state** — rejected with `WINDOW_NOT_ACTIVE` if the current
+   state is not `OPEN` (e.g. validator is in `TRAINING` or `PUBLISHING`).
+2. **Window match** — `window_start` in the request must equal the current
+   `window_n` (`WINDOW_MISMATCH` if not).
+3. **Checkpoint hash** — `checkpoint_hash` must match the active window's
+   hash (`WRONG_CHECKPOINT` if not). An empty batcher hash disables this
+   gate (pre-first-publish convenience).
+4. **`prompt_idx` range** — must be `0 ≤ prompt_idx < len(env)`.
+5. **Round freshness** — `signed_round` must be within `STALE_ROUND_LAG_MAX`
+   rounds of `current_round` (not stale, not from the future).
+6. **Cooldown check** — `prompt_idx` must not appear in the active
    `CooldownMap` (`PROMPT_IN_COOLDOWN` if it does).
-5. **Reward match** — validator recomputes `env.compute_reward` for each
+7. **Reward match** — validator recomputes `env.compute_reward` for each
    rollout; claim must match exactly (`REWARD_MISMATCH` if not).
-6. **GRAIL sketch** — validator re-runs the bit-identical forward pass and
-   compares sketch commitments (`GRAIL_FAIL` if they diverge).
-7. **Zone filter** — `k` (number of correct rollouts) must satisfy
+8. **Zone filter** — `k` (number of correct rollouts) must satisfy
    `k ∈ [2, 6]` (`OUT_OF_ZONE` if not). During bootstrap: `k ∈ [1, 7]`.
+9. **GRAIL sketch** — validator re-runs the bit-identical forward pass and
+   compares sketch commitments (`GRAIL_FAIL` if they diverge).
 
 Submissions that pass all checks are appended to the window's valid pool.
+When the pool reaches B=8 distinct-prompt valid submissions, `seal_event`
+fires automatically.
 
 ### CooldownMap
 
@@ -56,21 +77,46 @@ is consistent even after a hard restart.
 - **Bootstrap mode**: first `BOOTSTRAP_WINDOWS` windows use a 10-window
   cooldown and wider zone `[1, 7]` to fill the initial batches faster.
 
-### `/window/{n}/state` endpoint
+### `/window/state` endpoint
 
 Returns a `GrpoBatchState` JSON object:
 
 ```json
 {
-  "window_start": 1234567,
+  "state": "open",
+  "window_n": 42,
+  "anchor_block": 1234567,
+  "current_round": 9182736,
   "cooldown_prompts": [42, 1701, 3388, ...],
   "valid_submissions": 3,
-  "batch_sealed": false
+  "checkpoint_n": 7,
+  "checkpoint_url": "https://<r2>/.../7.safetensors",
+  "checkpoint_hash": "sha256:abc123..."
 }
 ```
 
-Miners must read `cooldown_prompts` before picking their `prompt_idx` to
-avoid a `PROMPT_IN_COOLDOWN` rejection.
+Miners must read `cooldown_prompts` before picking their `prompt_idx` and
+must copy `checkpoint_hash` verbatim into every `BatchSubmissionRequest`.
+When `checkpoint_n` advances between polls, miners must download
+`checkpoint_url` and reload their weights before submitting.
+
+### `/checkpoint` endpoint
+
+Returns the current checkpoint manifest signed by the validator hotkey:
+
+```json
+{
+  "checkpoint_n": 7,
+  "url": "https://<r2>/.../7.safetensors",
+  "file_hash": "sha256:abc123...",
+  "signature": "<ed25519-sig-hex>",
+  "validator_hotkey": "5xxx..."
+}
+```
+
+The signature covers `checkpoint_n || file_hash` (big-endian uint64 +
+UTF-8 hash string). Miners and external consumers can verify authenticity
+using the validator's on-chain hotkey.
 
 ### R2 archive format
 
@@ -214,13 +260,17 @@ CLI flags:
 ... | Loading model from ./checkpoints/current...
 ... | Validator HTTP server listening on 0.0.0.0:8888
 ... | Validator started: env=gsm8k, netuid=81, http=0.0.0.0:8888, rolling_windows=72
-... | Window 1234567 open — cooldown_size=142
+... | Window 42 open — checkpoint_n=7 cooldown_size=142
 ... | Accepted submission: hotkey=5xxx… prompt_idx=4821 k=4 round=9182736
-... | Window 1234567 sealed: batch_size=8 burn_slots=0
-... | Uploaded GRPO dataset for window 1234567 (8 prompts, 1347212 bytes)
+... | seal_event fired — 8 distinct valid submissions received (window=42)
+... | State → TRAINING (window=42)
+... | train_step (stub) called with batch of 8 submissions — weights not modified
+... | State → PUBLISHING (window=42, checkpoint_n=8)
+... | Checkpoint 8 uploaded to R2 — sha256:abc123…
+... | State → READY; next window opening
 ```
 
-Every 72 windows (≈ 72 min) you'll also see the weight submission log:
+Every 72 windows you'll also see the weight submission log:
 
 ```
 ... | Submitting weights: 14 miners + burn to UID 0
@@ -233,15 +283,14 @@ Sanity checks:
 
 ```bash
 curl http://localhost:8888/health
-# → {"status":"ok","active_window":1234567}
+# → {"status":"ok","window_n":42,"checkpoint_n":7}
 
-curl http://localhost:8888/window/1234567/state
-# → {"window_start":1234567,"cooldown_prompts":[...],"valid_submissions":3,"batch_sealed":false}
+curl http://localhost:8888/window/state
+# → {"state":"open","window_n":42,"checkpoint_n":7,"checkpoint_url":"...","checkpoint_hash":"sha256:...","cooldown_prompts":[...],"valid_submissions":3,...}
+
+curl http://localhost:8888/checkpoint
+# → {"checkpoint_n":7,"url":"...","file_hash":"sha256:...","signature":"...","validator_hotkey":"5xxx..."}
 ```
-
-`active_window` is `null` between windows (briefly, while the next one
-spins up). `/window/{n}/state` returns `404 window_not_active` for any `n`
-that isn't the currently open window.
 
 ## Monitoring
 
@@ -274,8 +323,20 @@ aws s3 ls s3://reliquary/dataset/ --endpoint-url https://<account>.r2.cloudflare
   too many submissions are landing `OUT_OF_ZONE` or `PROMPT_IN_COOLDOWN`.
   Check per-rejection-reason counters in the logs. During the first
   `BOOTSTRAP_WINDOWS`, the wider zone and shorter cooldown should mitigate
-  this automatically.
+  this automatically. If no batch seals before `WINDOW_TIMEOUT_SECONDS = 600`,
+  the partial batch seals automatically — unused slots burn.
+- **Window stuck in `TRAINING` / `PUBLISHING`**: the train or upload step is
+  taking longer than expected. Check GPU availability (`nvidia-smi`) and R2
+  connectivity. The state machine does not advance until the step completes.
 - **CooldownMap diverged after restart**: the validator rebuilds the cooldown
   map from R2 on startup. If R2 is unavailable at startup, the map starts
   empty — miners may temporarily get `PROMPT_IN_COOLDOWN` once it repopulates
   over subsequent windows.
+- **State file missing / corrupted**: if `reliquary/state/checkpoint.json` is
+  absent, the validator starts from `window_n=0, checkpoint_n=0`. This is safe
+  for a fresh deployment. After recovery, `checkpoint_n` will not match the
+  last published checkpoint — miners will see a `WRONG_CHECKPOINT` gap until
+  the next checkpoint publishes.
+- **High `WRONG_CHECKPOINT` rate**: miners are lagging behind checkpoint
+  updates. This is normal for 1–2 submissions right after a publish. Sustained
+  high rates indicate miners are not polling `/window/state` frequently enough.
