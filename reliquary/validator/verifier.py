@@ -132,3 +132,36 @@ def verify_reward_claim(
     except Exception:
         return False
     return abs(float(actual) - float(claimed)) <= tolerance
+
+
+def rewards_to_k(rewards: list[float], *, success_threshold: float = 0.5) -> int:
+    """Count rewards that are successes (> success_threshold).
+
+    GSM8K returns binary {0.0, 1.0}; the threshold tolerates float round-trip
+    noise and future continuous envs where "success" is >= some level.
+    """
+    return sum(1 for r in rewards if r > success_threshold)
+
+
+def is_in_zone(k: int, *, bootstrap: bool = False) -> bool:
+    """True iff k lies strictly inside the apprenable zone.
+
+    Steady state: ``ZONE_K_MIN <= k <= ZONE_K_MAX`` (default [2, 6]).
+    Bootstrap mode: ``BOOTSTRAP_ZONE_K_MIN <= k <= BOOTSTRAP_ZONE_K_MAX``
+    (default [1, 7]) — wider to keep the batch filling while miner
+    population and env coverage are thin.
+
+    ``k=0`` (trivially hard) and ``k=M_ROLLOUTS`` (trivially easy) are
+    always rejected regardless of bootstrap flag — these have zero
+    GRPO signal by definition.
+    """
+    from reliquary.constants import (
+        BOOTSTRAP_ZONE_K_MAX, BOOTSTRAP_ZONE_K_MIN,
+        M_ROLLOUTS, ZONE_K_MAX, ZONE_K_MIN,
+    )
+
+    if k <= 0 or k >= M_ROLLOUTS:
+        return False
+    if bootstrap:
+        return BOOTSTRAP_ZONE_K_MIN <= k <= BOOTSTRAP_ZONE_K_MAX
+    return ZONE_K_MIN <= k <= ZONE_K_MAX
