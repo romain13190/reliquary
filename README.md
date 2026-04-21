@@ -11,32 +11,43 @@ usable as training data without trusting any individual miner.
 
 ---
 
-## How it works (v2 GRPO market)
+## How it works (v2.1 batch-driven training)
 
-Each window (~60 s, 1 training step):
+Each window is one training step. The cadence is event-driven, not
+time-based: a window seals the instant 8 valid distinct-prompt
+non-cooldown submissions land.
 
-1. Miners pick a `prompt_idx` from the env (GSM8K, ~7473 problems) —
-   avoiding the validator's published cooldown set.
-2. Each miner generates 8 rollouts at `T_PROTO` (≈ 0.9), computes local
-   rewards, builds GRAIL commits, and POSTs a `BatchSubmissionRequest`
-   to the validator.
-3. Validator verifies in order: signature → prompt_idx in range → round
-   freshness → prompt not in cooldown → reward claims match
-   `env.compute_reward` → GRAIL sketch matches model forward-pass
-   → `k ∈ [2, 6]` (approvable zone).
-4. At window close, validator selects the first `B = 8` in-zone
-   submissions (FIFO by signed drand round, distinct prompts) for the
-   training batch. Sealed batch becomes the GRPO step input; each
-   batched prompt enters a 50-window cooldown (or 10 during bootstrap).
-5. Weights: each batch member earns `1/B` of window emission; unused
-   slots burn to `UID_BURN`.
+1. Validator opens a window. `/window/state` exposes `state = OPEN`
+   and the current `checkpoint_n`, `checkpoint_url`, `checkpoint_hash`.
+2. Miners poll `/window/state`. If `checkpoint_n` advanced, they
+   download `checkpoint_url` and load the new weights.
+3. Miner picks a `prompt_idx` (skipping cooldown prompts), generates 8
+   rollouts at protocol-fixed `T_PROTO=0.9`, computes local rewards,
+   builds GRAIL commits, and POSTs a `BatchSubmissionRequest` — the
+   payload includes `checkpoint_hash` so stale-checkpoint submissions
+   fail fast.
+4. Validator verifies: checkpoint_hash → window match → prompt_idx bounds
+   → round freshness → cooldown → reward claims → zone (`k ∈ [2, 6]`) →
+   GRAIL sketch. Any failure returns a `RejectReason`.
+5. The instant B=8 valid distinct-prompt submissions land, the batcher
+   fires `seal_event`. Validator transitions state to `TRAINING` and
+   runs one GRPO step (stub in v2.1; real loss plugs into
+   `validator/training.py`).
+6. Validator transitions state to `PUBLISHING`, writes the new
+   checkpoint, uploads to R2, signs `(checkpoint_n || file_hash)` with
+   ed25519, updates the `/checkpoint` manifest.
+7. State → `READY`. Next window opens. Batched prompts enter a 50-window
+   cooldown.
+8. Every `ROLLING_WINDOWS` windows (default 72), weights are submitted
+   on-chain: each batch member of the interval earns `1/B` of its window
+   share, unused slots burn to `UID_BURN`.
 
-Miners who submit outside the zone, on cooled-down prompts, or too slow
-to make the batch earn **zero**. The speed + distinct-prompt
-competition removes any incentive for cherry-picking (cherry-picking
-takes extra compute → later `signed_round` → displaced from the batch).
+Safety net: if a window collects fewer than B submissions,
+`WINDOW_TIMEOUT_SECONDS` (default 600 s) fires and the validator seals
+the partial batch — unused slots still burn.
 
-Full design rationale: `docs/superpowers/specs/2026-04-20-grpo-market-design.md`.
+Full design rationale:
+`docs/superpowers/specs/2026-04-21-batch-driven-windows-design.md`.
 
 ---
 
@@ -81,12 +92,13 @@ Miners produced verified rollouts on a frozen reference checkpoint pinned
 by the subnet. 8 validator-derived prompts per window, 32 completions per
 slot, advantage-based scoring.
 
-### v2 — On-policy training inside the subnet *(current)*
+### v2.1 — Batch-driven windows *(current)*
 
 The subnet trains the reference checkpoint itself from the rollouts miners
 produce, then rotates the checkpoint on-chain. Miners freely pick prompts,
 compete on speed and novelty, and earn flat `1/B` for each batch slot they
-fill.
+fill. Windows are event-driven — a window seals the instant B=8 valid
+distinct-prompt submissions land, with a 600 s timeout safety net.
 
 **What shipped:**
 - Free prompt selection — miners pick any `prompt_idx`, no validator-derived
@@ -98,8 +110,18 @@ fill.
 - Flat `1/B` weight per batch member; unused slots burn to `UID_BURN`.
 - Bootstrap mode — first `BOOTSTRAP_WINDOWS` windows use wider zone [1, 7]
   and a shorter 10-window cooldown to fill the first batches faster.
-- GRPO training step runs on the sealed batch each window; checkpoint
-  rotates on-chain after each step.
+- Batch-driven seal: `seal_event` fires on the B-th distinct valid
+  submission, not on a timer. `WINDOW_TIMEOUT_SECONDS = 600` is the
+  safety net for low-traffic conditions.
+- `checkpoint_hash` in every `BatchSubmissionRequest` — stale-checkpoint
+  submissions are rejected immediately with `WRONG_CHECKPOINT`.
+- Checkpoint published to R2 under
+  `reliquary/checkpoints/{validator_hotkey}/{n}.safetensors`, signed by
+  the validator hotkey; `/checkpoint` endpoint returns the manifest.
+- Validator state (`window_n`, `checkpoint_n`) persisted to
+  `reliquary/state/checkpoint.json` — survives restarts.
+- GRPO training step stub in `reliquary/validator/training.py`; real loss
+  plugs in with no protocol change.
 
 ### v3 — Open inference-market API
 

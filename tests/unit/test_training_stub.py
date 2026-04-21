@@ -20,6 +20,6 @@ def test_train_step_with_empty_batch():
 
 
 def test_train_step_logs_batch_size(caplog):
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.INFO, logger="reliquary.validator.training")
     train_step(model=MagicMock(), batch=[MagicMock() for _ in range(5)])
     assert any("5" in rec.message for rec in caplog.records)
