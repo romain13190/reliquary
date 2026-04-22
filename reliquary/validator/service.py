@@ -120,6 +120,11 @@ class ValidationService:
         load_model_fn: Any | None = None,
     ) -> None:
         self.wallet = wallet
+        import importlib.metadata as _im
+        try:
+            reliquary_version = _im.version("reliquary")
+        except _im.PackageNotFoundError:
+            reliquary_version = "dev"
         telemetry.init(
             hotkey_ss58=wallet.hotkey.ss58_address,
             config={
@@ -133,6 +138,7 @@ class ValidationService:
                 "m_rollouts_per_prompt": M_ROLLOUTS,
                 "window_length": WINDOW_LENGTH,
                 "wandb_training_version": WANDB_TRAINING_VERSION,
+                "reliquary_version": reliquary_version,
             },
         )
         self.model = model

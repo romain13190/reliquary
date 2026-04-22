@@ -81,7 +81,7 @@ def log_training_step(metrics: dict, step: int | None) -> None:
 
 def finish() -> None:
     """Close the wandb run. No-op if disabled. Fail-soft."""
-    global _run, _enabled
+    global _run, _enabled, _log_warned
     if not _enabled:
         return
     try:
@@ -92,6 +92,7 @@ def finish() -> None:
     finally:
         _run = None
         _enabled = False
+        _log_warned = False
 
 
 def _reset_for_tests() -> None:
