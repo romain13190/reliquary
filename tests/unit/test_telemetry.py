@@ -81,3 +81,17 @@ def test_init_reads_wandb_entity_env(monkeypatch):
     telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
 
     assert fake_wandb.init.call_args.kwargs["entity"] == "my-team"
+
+
+def test_init_version_env_override_changes_run_id(monkeypatch):
+    """RELIQUARY_WANDB_VERSION overrides the constant, producing a
+    different run id — this is how the operator starts a new run."""
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    monkeypatch.setenv("RELIQUARY_WANDB_VERSION", "v9")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    telemetry.init(hotkey_ss58=hotkey, config={})
+
+    assert fake_wandb.init.call_args.kwargs["id"] == f"{hotkey[:8]}-v9"
