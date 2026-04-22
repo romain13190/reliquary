@@ -1,0 +1,31 @@
+# Trainer validator — no watchtower (sensitive, manual restarts only).
+# Mount ONLY the hotkey file + coldkeypub; never mount the coldkey itself.
+services:
+  reliquary-trainer:
+    image: ghcr.io/romain13190/reliquary-validator:latest
+    container_name: reliquary-trainer
+    restart: unless-stopped
+    env_file: .env
+    # NVIDIA Container Toolkit required on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "${RELIQUARY_HTTP_PORT:-8080}:8080"
+    volumes:
+      # Hotkey (readonly, needed to sign submissions + weights)
+      - type: bind
+        source: ${BT_WALLETS_DIR:?set BT_WALLETS_DIR to the host path of your wallets/}
+        target: /root/.bittensor/wallets
+        read_only: true
+      # Persistent state (staging checkpoints, HF cache)
+      - reliquary-state:/root/reliquary/state
+      - hf-cache:/root/.cache/huggingface
+
+volumes:
+  reliquary-state:
+  hf-cache:

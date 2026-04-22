@@ -1,0 +1,29 @@
+# Weight-only validator + watchtower auto-update.
+# Runs on any Linux host with Docker — no GPU required.
+services:
+  reliquary-weight-only:
+    image: ghcr.io/romain13190/reliquary-validator:latest
+    container_name: reliquary-weight-only
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - type: bind
+        source: ${BT_WALLETS_DIR:?set BT_WALLETS_DIR to the host path of your wallets/}
+        target: /root/.bittensor/wallets
+        read_only: true
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Poll registry every 5 min, only update containers with the label above,
+    # and remove old images to save disk.
+    command: >
+      --interval 300
+      --label-enable
+      --cleanup
+      --include-restarting
