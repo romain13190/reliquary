@@ -14,10 +14,18 @@ from reliquary.constants import (
     CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
     CHECKPOINT_STAGING_DIR_DEFAULT,
     DEFAULT_HF_REPO_ID,
+    GRAD_CLIP_NORM,
+    KL_BETA,
+    LEARNING_RATE,
+    LR_COSINE_MAX_WINDOWS,
+    LR_WARMUP_WINDOWS,
+    M_ROLLOUTS,
     POLL_INTERVAL_SECONDS,
+    PPO_CLIP_EPSILON,
     SUBNET_START_BLOCK,
     UID_BURN,
     VALIDATOR_HTTP_PORT,
+    WANDB_TRAINING_VERSION,
     WEIGHT_SUBMISSION_INTERVAL,
     WINDOW_LENGTH,
     WINDOW_TIMEOUT_SECONDS,
@@ -25,6 +33,7 @@ from reliquary.constants import (
 from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RolloutSubmission, WindowState
+from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
@@ -111,6 +120,21 @@ class ValidationService:
         load_model_fn: Any | None = None,
     ) -> None:
         self.wallet = wallet
+        telemetry.init(
+            hotkey_ss58=wallet.hotkey.ss58_address,
+            config={
+                "learning_rate": LEARNING_RATE,
+                "kl_beta": KL_BETA,
+                "ppo_clip_epsilon": PPO_CLIP_EPSILON,
+                "grad_clip_norm": GRAD_CLIP_NORM,
+                "lr_warmup_windows": LR_WARMUP_WINDOWS,
+                "lr_cosine_max_windows": LR_COSINE_MAX_WINDOWS,
+                "b_batch": B_BATCH,
+                "m_rollouts_per_prompt": M_ROLLOUTS,
+                "window_length": WINDOW_LENGTH,
+                "wandb_training_version": WANDB_TRAINING_VERSION,
+            },
+        )
         self.model = model
         # Enable gradient checkpointing to reduce activation memory.
         # Harmless if already enabled or unsupported by the model.
@@ -302,7 +326,7 @@ class ValidationService:
         # The miners who did submit are still credited via _update_ema.
         trained = len(batch) >= B_BATCH
         if trained:
-            self.model = train_step(self.model, batch)
+            self.model = train_step(self.model, batch, window_index=self._window_n)
         else:
             logger.info(
                 "Window %d sealed with %d/%d submissions — skipping train_step + publish",
@@ -430,6 +454,7 @@ class ValidationService:
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
         finally:
             await self.server.stop()
+            telemetry.finish()
 
     async def _serve_axon_on_chain(self, subtensor) -> None:
         """Publish this validator's axon (ip:port) to the chain metagraph.
