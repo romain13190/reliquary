@@ -10,7 +10,7 @@ Each training window is one GRPO step. The cadence is event-driven: a window sea
 
 The network produces three artefacts: a continuously-trained model (published to HF every ten windows), a per-window rollout dataset (archived to R2), and a signed checkpoint manifest (served from `/checkpoint`) that lets anyone verify the chain of custody from a base model through every training step. The audit trail is cryptographic — each rollout carries a GRAIL sketch that lets the validator re-run the forward pass and confirm the generation came from the announced checkpoint.
 
-Validators hold stake and run the training loop. Miners hold hotkeys, run GPU inference, and earn emission proportional to their share of batch slots over a rolling 72-window scoring interval. Downstream consumers — researchers, fine-tuning pipelines — pull the published HF checkpoint or the R2 rollout dataset directly.
+Validators hold stake and run the training loop. Miners hold hotkeys, run GPU inference, and earn emission proportional to their share of batch slots over a rolling 72-window scoring interval; the main optimization surface for a miner is predicting which prompts sit at the policy's learning frontier — selection intelligence wins slots, and by construction also feeds the GRPO step gradient-rich groups. Downstream consumers — researchers, fine-tuning pipelines — pull the published HF checkpoint or the R2 rollout dataset directly.
 
 ## Quickstart
 

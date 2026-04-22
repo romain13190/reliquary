@@ -2,6 +2,31 @@
 
 How Reliquary works, why it is built this way, and what each mechanism defends against.
 
+## The thesis
+
+DAPO ([ByteDance Seed + Tsinghua, March 2025](https://arxiv.org/abs/2503.14476)) reached state-of-the-art on AIME 2024 (50 points, from a 30-point naive-GRPO baseline) in **50% of the training steps** used by DeepSeek-R1-Zero-Qwen-32B. The paper stacks four techniques; the published ablation (Table 1) credits **Dynamic Sampling** — discarding rollout groups where all answers have the same reward — with the single largest contribution of the stack: **+8 AIME 2024 points** on top of all four other techniques combined (42 → 50). It is a data-selection change, not a loss change. The core finding is that at this scale, *which prompts you train on* is the single largest lever anyone has published.
+
+The catch: DAPO's filter is reactive. The system generates a rollout group, measures its reward variance, discards it if the variance is zero. As the policy strengthens, intermediate-difficulty prompts become rarer, the rejection rate rises, and more compute is spent generating groups the trainer will throw away. The paper flags this cost explicitly.
+
+Reliquary turns this filter problem into a **prediction market**. Every training window, independent GPU miners bet their own compute on which prompt sits at the policy's learning frontier (high σ). The generate-then-discard cost is pushed outside the validator — miners who pick poorly burn their own rollouts; miners who pick well earn batch slots and emission. As the policy matures and the frontier narrows, the market becomes *more* valuable, not less — exactly the regime where DAPO's centralized filter pays the highest tax.
+
+**Expected outcome.** Match or exceed DAPO's 50%-training-step efficiency, with a widening edge as training progresses. Two structural levers push that way:
+
+1. **Ex-ante beats post-hoc.** A predictor that commits only to likely-in-zone prompts dominates a reactive discard-on-measurement filter on compute per gradient-rich group.
+
+2. **Stricter filter, same validator budget.** DAPO's Dynamic Sampling only discards the extremes (`k = 0` and `k = 8` correct out of 8) because a stricter filter would amplify its reactive-discard tax. Reliquary's `σ ≥ 0.43` also drops `k = 1` and `k = 7`, keeping only groups with `k ∈ {2, 3, 4, 5, 6}` — strictly tighter gradient density per training step than DAPO. The tightening is affordable because miners, not the validator, absorb the rejected-rollout cost. Bootstrap mode (`σ ≥ 0.33`) relaxes back to approximately DAPO's extremes-only criterion while the miner population is still warming up.
+
+Both levers compound as the policy strengthens. The claim is directional, not benchmarked.
+
+Two structural guarantees come with the market:
+
+- **Forced curriculum diversity.** A prompt that enters a training batch is locked out for `BATCH_PROMPT_COOLDOWN_WINDOWS = 50` windows. The validator sees roughly 400 distinct prompts before any one recurs — no collapse onto a handful of high-variance outliers, a failure mode that a single-node pipeline has no automatic defense against.
+- **Cryptographic training-data provenance.** Every rollout carries a GRAIL sketch that binds the generation to the model weights that produced it. The validator re-verifies with its own forward pass. Fabricated data earns zero.
+
+The zone filter (`σ ≥ 0.43`, see below) is the mechanical realization of DAPO's Dynamic Sampling, reformulated to be reward-scale-agnostic. The miner-side incentive to predict σ *before* generating is what turns DAPO's post-hoc filter into an ex-ante market.
+
+---
+
 ## The core loop
 
 One full training window, step by step.
@@ -10,7 +35,7 @@ One full training window, step by step.
 Miners poll `GET /state` continuously. The response (`GrpoBatchState`) carries `state`, `window_n`, `checkpoint_n`, `checkpoint_repo_id`, `checkpoint_revision`, and `cooldown_prompts`. If `checkpoint_n` has advanced since the last poll, the miner downloads the new HF revision before doing anything else.
 
 **2. Miner picks a prompt.**
-The miner selects a `prompt_idx` from the environment (GSM8K, ~7 473 problems) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set; operators can implement smarter strategies.
+The miner selects a `prompt_idx` from the environment (GSM8K, ~7 473 problems) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. This is a baseline: smarter miner-side selection — predicting which prompts will pass the zone filter for the current checkpoint — is expected and directly rewarded by FIFO (fewer `OUT_OF_ZONE` rejects → earlier `signed_round`). See [mining.md §Prompt selection strategy](mining.md#prompt-selection-strategy).
 
 **3. Miner generates M=8 rollouts.**
 The miner runs exactly `M_ROLLOUTS = 8` completions at the protocol-fixed temperature `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. No cherry-picking — all eight go in the submission regardless of their rewards.

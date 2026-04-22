@@ -50,7 +50,18 @@ GET /state  →  GrpoBatchState
 - Read `checkpoint_revision` and include it verbatim as `checkpoint_hash` in your submission.
 - Read `window_n` and use it as the authoritative window identifier.
 
-There is no other constraint on which prompt to pick.
+**This is a baseline, not a ceiling.** The protocol enforces no further constraint on `prompt_idx`, but the economics strongly reward miners who can predict which prompts will pass the zone filter (`σ ≥ 0.43`) for the current checkpoint:
+
+- An `OUT_OF_ZONE` rejection wastes the full rollout group (eight generations plus their GRAIL proofs). The retry ships with a later `signed_round`, so miners who guessed right on the first attempt land in the batch ahead of you.
+- A good picker → first submission passes → earlier `signed_round` → FIFO priority → more slots won per window.
+
+Techniques miners are expected to develop (non-exhaustive):
+
+- A per-prompt success-rate estimate, updated online and reset (or decayed) whenever `checkpoint_n` advances.
+- Clustering problems by difficulty or feature signature and sampling preferentially at the policy's current frontier.
+- A cheap proxy (a smaller model, draft decoding, a few low-temperature samples) used only to predict σ — *never* to pre-generate the actual submission, which must be exactly eight rollouts at `T_PROTO = 0.9`.
+
+The goal is to locate the *learning frontier* — prompts where the current policy succeeds on some attempts and fails on others. Every high-σ pick feeds the GRPO step a gradient-rich group instead of a wasted slot: miner optimization and training efficiency are aligned.
 
 ### Zone filter
 
