@@ -5,7 +5,7 @@ concrete environments by name.
 """
 
 from reliquary.environment.base import Environment
-from reliquary.environment.gsm8k import GSM8KEnvironment
+from reliquary.environment.math import MATHEnvironment
 
 
 def load_environment(name: str) -> Environment:
@@ -14,8 +14,8 @@ def load_environment(name: str) -> Environment:
     Raises:
         ValueError: if *name* is not a recognised environment.
     """
-    if name == "gsm8k":
-        return GSM8KEnvironment()
+    if name == "math":
+        return MATHEnvironment()
     raise ValueError(f"Unknown environment: {name}")
 
 

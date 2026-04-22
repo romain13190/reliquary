@@ -225,3 +225,26 @@ def test_math_compute_reward_on_real_row():
     # Feed the env its own ground truth inside a \boxed{} — must score 1.0.
     fake_completion = f"Working...\n\\boxed{{{gt}}}"
     assert env.compute_reward(problem, fake_completion) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Loader tests
+# ---------------------------------------------------------------------------
+
+def test_loader_returns_math_instance():
+    from reliquary.environment import load_environment
+    from reliquary.environment.math import MATHEnvironment
+    env = load_environment("math")
+    assert isinstance(env, MATHEnvironment)
+
+
+def test_loader_raises_on_unknown():
+    from reliquary.environment import load_environment
+    with pytest.raises(ValueError, match="Unknown environment: nope"):
+        load_environment("nope")
+
+
+def test_loader_rejects_legacy_gsm8k():
+    from reliquary.environment import load_environment
+    with pytest.raises(ValueError, match="Unknown environment: gsm8k"):
+        load_environment("gsm8k")

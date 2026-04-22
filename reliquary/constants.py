@@ -91,7 +91,7 @@ MAX_TOKENS_PER_ROLLOUT = MAX_NEW_TOKENS_PROTOCOL_CAP + 4096
 VALIDATOR_HTTP_PORT = 8888
 
 # Active environment name (resolved by reliquary.environment.load_environment).
-ENVIRONMENT_NAME = "gsm8k"
+ENVIRONMENT_NAME = "math"
 
 # UID that receives unused slot emission budget (the burn address).
 UID_BURN = 0
