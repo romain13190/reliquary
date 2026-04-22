@@ -146,10 +146,11 @@ class ValidatorServer:
                         request.prompt_idx, request.miner_hotkey[:12],
                     )
                 else:
+                    rewards = [r.reward for r in request.rollouts]
                     logger.warning(
-                        "rejected prompt=%d hotkey=%s reason=%s",
+                        "rejected prompt=%d hotkey=%s reason=%s rewards=%s",
                         request.prompt_idx, request.miner_hotkey[:12],
-                        response.reason.value,
+                        response.reason.value, rewards,
                     )
             except Exception:
                 logger.exception(
