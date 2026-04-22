@@ -36,3 +36,24 @@ def test_fbox_alias_accepted():
     """Hendrycks data sometimes uses \\fbox{} for the final answer."""
     from reliquary.environment.math import _last_boxed_only_string
     assert _last_boxed_only_string(r"answer: \fbox{7}") == r"\fbox{7}"
+
+
+def test_strip_boxed_wrapper_boxed():
+    from reliquary.environment.math import _strip_boxed_wrapper
+    assert _strip_boxed_wrapper(r"\boxed{42}") == "42"
+
+
+def test_strip_boxed_wrapper_fbox():
+    from reliquary.environment.math import _strip_boxed_wrapper
+    assert _strip_boxed_wrapper(r"\fbox{x+y}") == "x+y"
+
+
+def test_strip_boxed_wrapper_nested_inner():
+    from reliquary.environment.math import _strip_boxed_wrapper
+    assert _strip_boxed_wrapper(r"\boxed{\frac{1}{2}}") == r"\frac{1}{2}"
+
+
+def test_strip_boxed_wrapper_non_boxed_input_returned_unchanged():
+    from reliquary.environment.math import _strip_boxed_wrapper
+    # Not wrapped — returned as-is (lets the reward fn handle raw GT strings).
+    assert _strip_boxed_wrapper("42") == "42"

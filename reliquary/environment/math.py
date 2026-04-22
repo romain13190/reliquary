@@ -41,3 +41,13 @@ def _last_boxed_only_string(text: str) -> Optional[str]:
                 return text[idx : j + 1]
     # Never balanced — unterminated expression.
     return None
+
+
+def _strip_boxed_wrapper(s: str) -> str:
+    """If ``s`` starts with \\boxed{ or \\fbox{ and ends with a matching },
+    return the inner content. Otherwise return ``s`` unchanged.
+    """
+    for prefix in (r"\boxed{", r"\fbox{"):
+        if s.startswith(prefix) and s.endswith("}"):
+            return s[len(prefix) : -1]
+    return s
