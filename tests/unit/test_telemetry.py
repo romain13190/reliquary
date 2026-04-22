@@ -112,3 +112,27 @@ def test_init_fail_soft_on_wandb_exception(monkeypatch, caplog):
 
     assert telemetry.is_active() is False
     assert any("init failed" in rec.message for rec in caplog.records)
+
+
+def test_init_fail_soft_when_wandb_not_installed(monkeypatch, caplog):
+    """If `import wandb` raises ImportError (package not installed),
+    telemetry stays disabled. No exception propagates."""
+    import builtins
+    import logging as _logging
+
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "wandb":
+            raise ImportError("No module named 'wandb'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    caplog.set_level(_logging.WARNING, logger="reliquary.validator.telemetry")
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+
+    assert telemetry.is_active() is False
+    assert any("init failed" in rec.message for rec in caplog.records)
