@@ -95,3 +95,20 @@ def test_init_version_env_override_changes_run_id(monkeypatch):
     telemetry.init(hotkey_ss58=hotkey, config={})
 
     assert fake_wandb.init.call_args.kwargs["id"] == f"{hotkey[:8]}-v9"
+
+
+def test_init_fail_soft_on_wandb_exception(monkeypatch, caplog):
+    """If wandb.init raises (network, auth, quota), telemetry stays
+    disabled and the validator keeps running. No exception propagates."""
+    import logging as _logging
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+
+    fake_wandb = MagicMock()
+    fake_wandb.init.side_effect = RuntimeError("network down")
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    caplog.set_level(_logging.WARNING, logger="reliquary.validator.telemetry")
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})  # must not raise
+
+    assert telemetry.is_active() is False
+    assert any("init failed" in rec.message for rec in caplog.records)
