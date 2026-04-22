@@ -187,6 +187,14 @@ def validate(
         DEFAULT_HF_REPO_ID,
         help="HuggingFace repo ID to publish checkpoints to (must be writable with HF_TOKEN). Trainer mode only.",
     ),
+    resume_from: str = typer.Option(
+        os.getenv("RELIQUARY_RESUME_FROM", ""),
+        help=(
+            "Resume trainer from a checkpoint instead of the base model. "
+            "Accepts 'sha:<40-hex>' (HF commit on --hf-repo-id) or "
+            "'path:<dir>' (local ckpt_<N> directory). Trainer mode only."
+        ),
+    ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
     """Run Reliquary validator (trainer mode by default; --no-train for weight-only)."""
@@ -247,6 +255,7 @@ def validate(
                 external_ip=external_ip or None,
                 external_port=(external_port or http_port) if external_ip else None,
                 hf_repo_id=hf_repo_id,
+                resume_from=resume_from or None,
             )
             await service.run(subtensor)
         else:
