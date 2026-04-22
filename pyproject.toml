@@ -30,6 +30,9 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
+wandb = [
+    "wandb>=0.16",
+]
 
 [project.scripts]
 reliquary = "reliquary.cli.main:app"
