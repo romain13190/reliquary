@@ -24,9 +24,9 @@ huggingface-cli repo create your-org/reliquary-sn --type model
 Seed it with the base model so `snapshot_download` succeeds on the first miner pull:
 
 ```bash
-huggingface-cli download Qwen/Qwen3-4B-Instruct --local-dir ./base-model
+huggingface-cli download Qwen/Qwen3-4B-Instruct-2507 --local-dir ./base-model
 huggingface-cli upload your-org/reliquary-sn ./base-model . \
-    --commit-message "seed from Qwen/Qwen3-4B-Instruct"
+    --commit-message "seed from Qwen/Qwen3-4B-Instruct-2507"
 ```
 
 ### Set the token on the validator host
@@ -102,7 +102,7 @@ reliquary validate \
     --hotkey default \
     --netuid 81 \
     --network finney \
-    --checkpoint Qwen/Qwen3-4B-Instruct \
+    --checkpoint Qwen/Qwen3-4B-Instruct-2507 \
     --hf-repo-id your-org/reliquary-sn \
     --http-host 0.0.0.0 \
     --http-port 8888 \
@@ -120,7 +120,7 @@ Full CLI flag reference:
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--checkpoint` | `Qwen/Qwen3-4B-Instruct` | HF repo id or local path for the initial model load |
+| `--checkpoint` | `Qwen/Qwen3-4B-Instruct-2507` | HF repo id or local path for the initial model load |
 | `--hf-repo-id` | `aivolutionedge/reliquary-sn` | HF repo to push trained checkpoints to |
 | `--environment` | `gsm8k` | Reward environment. Must match miners. |
 | `--http-host` | `0.0.0.0` | Bind address |
@@ -154,7 +154,7 @@ reliquary mine \
     --hotkey default \
     --netuid 81 \
     --network finney \
-    --checkpoint Qwen/Qwen3-4B-Instruct \
+    --checkpoint Qwen/Qwen3-4B-Instruct-2507 \
     --environment gsm8k
 ```
 

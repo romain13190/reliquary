@@ -238,4 +238,4 @@ LR_COSINE_MAX_WINDOWS = 10_000
 
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
-DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct"
+DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"

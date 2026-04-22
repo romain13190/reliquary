@@ -8,7 +8,7 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 2. Discovers the validator's HTTP URL via the Bittensor metagraph (or uses `--validator-url` override).
 3. Calls `GET /state` to read `checkpoint_repo_id` and `checkpoint_revision`.
 4. If the validator has a published checkpoint, downloads it from Hugging Face and loads those weights.
-5. Falls back to `--checkpoint` (default: `Qwen/Qwen3-4B-Instruct`) if no checkpoint is published yet.
+5. Falls back to `--checkpoint` (default: `Qwen/Qwen3-4B-Instruct-2507`) if no checkpoint is published yet.
 6. Enters the main loop in `MiningEngine.mine_window()`:
    - Poll `/state` every tick.
    - If `state.checkpoint_n > local_n`, download the new HF revision and reload both model copies.
@@ -136,15 +136,29 @@ Confirm your hotkey appears in `btcli subnet metagraph --netuid 81` with a valid
 
 ## Launch
 
+> **Subnet-launch phase — `--validator-url` is required.**
+> For the first weeks after subnet go-live, the subnet owner's validator will not yet hold enough stake to earn `validator_permit`, so the metagraph auto-discovery path (`discover_validator_url`) will raise `no validator with permit and routable axon`. Until the owner's hotkey gains the permit, you **must** pin the validator manually with `--validator-url`.
+>
+> The official subnet-owner validator hotkey is:
+>
+> ```
+> 5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF
+> ```
+>
+> Cross-check the axon IP advertised on-chain for this hotkey in `btcli subnet metagraph --netuid 81` before passing it to `--validator-url` — that confirms you are connecting to the real owner validator and not a look-alike.
+
 ```bash
 reliquary mine \
     --network finney \
     --netuid 81 \
     --wallet-name my_miner \
     --hotkey default \
-    --checkpoint Qwen/Qwen3-4B-Instruct \
+    --checkpoint Qwen/Qwen3-4B-Instruct-2507 \
+    --validator-url http://<owner-validator-ip>:8888 \
     --log-level INFO
 ```
+
+Once the owner validator earns `validator_permit`, you can drop `--validator-url` and the miner will auto-discover it from the metagraph.
 
 The miner queries the validator at boot and downloads the current HF checkpoint automatically. You do not need to find or pin the checkpoint hash manually.
 
@@ -154,7 +168,7 @@ Additional flags:
 |---|---|---|
 | `--environment` | `gsm8k` | Pinned by the protocol; do not change unless the subnet announces a migration. |
 | `--use-drand` / `--no-use-drand` | `--use-drand` | Turn off only for offline testing. Mainnet always uses drand. |
-| `--validator-url` | *(auto-discovered)* | Override for local testing, e.g. `http://127.0.0.1:8888`. In production leave empty; the miner discovers the active validator from the metagraph. |
+| `--validator-url` | *(auto-discovered)* | **Required during the subnet-launch phase** (see note above) and for local testing, e.g. `http://127.0.0.1:8888`. Once the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) holds `validator_permit`, leave empty and the miner will discover it from the metagraph. |
 
 Environment variables:
 
@@ -192,7 +206,7 @@ grep -E "submitted|rejected|accepted" ~/miner.log | tail -50
 
 ## Troubleshooting
 
-- **`no validator with permit and routable axon`**: no active validator has published an HTTP endpoint on the metagraph. Wait or use `--validator-url` to point at a known one.
+- **`no validator with permit and routable axon`**: no active validator has published an HTTP endpoint on the metagraph. During the subnet-launch phase this is expected — the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) does not yet hold `validator_permit`. Pass `--validator-url http://<owner-validator-ip>:8888` to pin it explicitly (see [Launch](#launch)). After launch, wait for a validator to come back online or point at a known one.
 - **CUDA out of memory**: two copies of Qwen3-4B-Instruct require ~16 GB bfloat16 total. If you have a single GPU with less than 24 GB you may hit OOM. Use a GPU with more VRAM or reduce precision.
 - **`GRAIL_FAIL` / `REWARD_MISMATCH`**: your local compute diverged from the validator's. Most often caused by a different `attn_implementation` build, CUDA/torch version mismatch, or wrong checkpoint. Re-install on a clean environment and confirm you are on the same HF revision as the validator (check `/state`).
 - **All submissions land `OUT_OF_ZONE`**: the prompts you are selecting are too easy (σ ≈ 0) or too hard (σ ≈ 0) for the current checkpoint. The reference engine samples uniformly; if you have overridden prompt selection, broaden the range.

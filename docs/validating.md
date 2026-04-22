@@ -200,7 +200,7 @@ reliquary validate \
     --netuid 81 \
     --wallet-name my_validator \
     --hotkey default \
-    --checkpoint Qwen/Qwen3-4B-Instruct \
+    --checkpoint Qwen/Qwen3-4B-Instruct-2507 \
     --hf-repo-id your-org/reliquary-sn \
     --http-host 0.0.0.0 \
     --http-port 8888 \
@@ -213,7 +213,7 @@ CLI flags:
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--checkpoint` | `Qwen/Qwen3-4B-Instruct` | HF repo id or local path for initial model load |
+| `--checkpoint` | `Qwen/Qwen3-4B-Instruct-2507` | HF repo id or local path for initial model load |
 | `--hf-repo-id` | `aivolutionedge/reliquary-sn` | HF repo to push trained checkpoints to |
 | `--environment` | `gsm8k` | Must match what miners are running |
 | `--http-host` | `0.0.0.0` | Bind address |
@@ -226,7 +226,7 @@ CLI flags:
 
 ```
 ... | Starting Reliquary validator (network=finney, netuid=81, env=gsm8k, http=0.0.0.0:8888)
-... | Loading model from Qwen/Qwen3-4B-Instruct...
+... | Loading model from Qwen/Qwen3-4B-Instruct-2507...
 ... | Validator HTTP server listening on 0.0.0.0:8888
 ... | Rebuilt cooldown from 0 archive windows (current=0, map size=0)
 ... | Validator started (v2.1): env=gsm8k, netuid=81, http=0.0.0.0:8888
