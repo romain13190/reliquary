@@ -1,6 +1,6 @@
 """Hendrycks MATH environment for Reliquary verifiable inference.
 
-Loads the hendrycks/competition_math dataset (train split, 7 500 problems)
+Loads the full Hendrycks MATH dataset (12 500 problems) from the qwedsacf mirror
 and scores completions by extracting the final \\boxed{...} answer and
 comparing it to the ground truth after LaTeX normalization.
 """
@@ -109,11 +109,14 @@ def _compute_math_reward(problem: dict, completion: str) -> float:
 
 
 class MATHEnvironment:
-    """Environment backed by the Hendrycks MATH train split (7 500 problems).
+    """Environment backed by the full Hendrycks MATH set (12 500 problems).
 
     Ground truths are extracted once from the ``solution`` field by taking
     the content of the last \\boxed{...}; completions are scored with the
     same extraction against the completion text.
+
+    Uses the ``qwedsacf/competition_math`` HF mirror — the original
+    ``hendrycks/competition_math`` was removed from the Hub.
     """
 
     name: str = "math"
@@ -126,7 +129,7 @@ class MATHEnvironment:
         if MATHEnvironment._dataset_cache is None:
             import datasets as hf_datasets  # local import keeps module importable w/o datasets
             MATHEnvironment._dataset_cache = hf_datasets.load_dataset(
-                "hendrycks/competition_math", split="train", trust_remote_code=True
+                "qwedsacf/competition_math", split="train"
             )
         self._dataset = MATHEnvironment._dataset_cache
 
