@@ -36,7 +36,29 @@ def init(hotkey_ss58: str, config: dict) -> None:
     if not os.getenv("WANDB_API_KEY"):
         logger.info("wandb: WANDB_API_KEY not set, telemetry disabled")
         return
-    # Active paths added in later tasks.
+
+    version = os.getenv("RELIQUARY_WANDB_VERSION", WANDB_TRAINING_VERSION)
+    project = os.getenv("WANDB_PROJECT", WANDB_PROJECT)
+    entity = os.getenv("WANDB_ENTITY")
+    run_id = f"{hotkey_ss58[:8]}-{version}"
+
+    try:
+        import wandb  # lazy: optional dependency
+        _run = wandb.init(
+            project=project,
+            entity=entity,
+            id=run_id,
+            resume="allow",
+            config=config,
+        )
+        _enabled = True
+        logger.info(
+            "wandb: initialised (project=%s id=%s entity=%s)",
+            project, run_id, entity or "<default>",
+        )
+    except Exception as e:  # noqa: BLE001 — fail-soft by design
+        logger.warning("wandb: init failed (%s), telemetry disabled", e)
+        _enabled = False
 
 
 def log_training_step(metrics: dict, step: int | None) -> None:

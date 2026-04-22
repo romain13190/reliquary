@@ -33,3 +33,51 @@ def test_log_training_step_is_safe_when_disabled():
 
 def test_finish_is_safe_when_disabled():
     telemetry.finish()  # must not raise
+
+
+from unittest.mock import MagicMock
+
+
+def test_init_happy_path_with_mocked_wandb(monkeypatch):
+    """With WANDB_API_KEY set and wandb.init mocked, telemetry activates
+    and passes the expected kwargs."""
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+
+    fake_wandb = MagicMock()
+    fake_wandb.init.return_value = MagicMock(id="fakerun")
+    # Inject fake wandb into sys.modules so the lazy `import wandb` inside
+    # init() picks it up.
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    hotkey = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+    telemetry.init(hotkey_ss58=hotkey, config={"learning_rate": 1e-5})
+
+    assert telemetry.is_active() is True
+    fake_wandb.init.assert_called_once()
+    kwargs = fake_wandb.init.call_args.kwargs
+    assert kwargs["project"] == "reliquary-validator"
+    assert kwargs["id"] == f"{hotkey[:8]}-v1"
+    assert kwargs["resume"] == "allow"
+    assert kwargs["config"]["learning_rate"] == 1e-5
+
+
+def test_init_reads_wandb_project_env_override(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    monkeypatch.setenv("WANDB_PROJECT", "my-custom-project")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+
+    assert fake_wandb.init.call_args.kwargs["project"] == "my-custom-project"
+
+
+def test_init_reads_wandb_entity_env(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    monkeypatch.setenv("WANDB_ENTITY", "my-team")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+
+    assert fake_wandb.init.call_args.kwargs["entity"] == "my-team"
