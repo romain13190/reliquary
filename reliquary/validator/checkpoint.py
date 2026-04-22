@@ -39,8 +39,12 @@ class CheckpointStore:
     """Owns the in-memory current manifest + the publish lifecycle.
 
     Production wiring (defaults):
-      * ``save_weights_fn`` → ``torch.save(model.state_dict(), path)``
-      * ``upload_fn`` → HuggingFace Hub upload_file (lazy import)
+      * ``save_fn(model, tokenizer, dir)`` → ``model.save_pretrained(dir, safe_serialization=True)``
+        + ``tokenizer.save_pretrained(dir)`` — produces ``model.safetensors``,
+        ``config.json``, and tokenizer files in one directory so the miner's
+        ``AutoModelForCausalLM.from_pretrained`` can reload them.
+      * ``upload_fn(folder_path, repo_id, commit_message)`` → HuggingFace
+        ``HfApi.upload_folder`` — one commit covers the whole snapshot.
     Tests inject both as mocks to avoid torch + HF deps.
     """
 
@@ -52,17 +56,19 @@ class CheckpointStore:
         staging_dir_path: str,
         *,
         hf_token: str | None = None,
+        tokenizer: Any = None,
         upload_fn: Callable[..., Awaitable[str]] | None = None,
-        save_weights_fn: Callable[[Any, Path], None] | None = None,
+        save_fn: Callable[[Any, Any, Path], None] | None = None,
     ) -> None:
         self.validator_hotkey = validator_hotkey
         self.wallet = wallet
         self.repo_id = repo_id
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
+        self.tokenizer = tokenizer
         self.staging_dir = Path(staging_dir_path)
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self._upload = upload_fn or _default_upload
-        self._save_weights = save_weights_fn or _default_save_weights
+        self._save = save_fn or _default_save_hf_format
         self._current: ManifestEntry | None = None
 
     def current_manifest(self) -> ManifestEntry | None:
@@ -70,15 +76,15 @@ class CheckpointStore:
 
     async def publish(self, checkpoint_n: int, model: Any) -> ManifestEntry:
         """Save locally → upload to HF → sign (n || revision) → install manifest."""
-        # 1. Save locally
-        path = self.staging_dir / f"{checkpoint_n}.safetensors"
-        self._save_weights(model, path)
+        # 1. Save HF-format snapshot locally (dir with safetensors + config + tokenizer).
+        snapshot_dir = self.staging_dir / f"ckpt_{checkpoint_n}"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        self._save(model, self.tokenizer, snapshot_dir)
 
-        # 2. Upload to HF — returns the new commit revision (SHA)
+        # 2. Upload the whole folder to HF — one commit per checkpoint.
         revision = await self._upload(
-            local_path=str(path),
+            folder_path=str(snapshot_dir),
             repo_id=self.repo_id,
-            path_in_repo="model.safetensors",
             commit_message=f"checkpoint {checkpoint_n}",
         )
 
@@ -105,12 +111,11 @@ class CheckpointStore:
 # ---- production defaults (lazy-imported so tests don't drag torch/HF in) ----
 
 async def _default_upload(
-    local_path: str,
+    folder_path: str,
     repo_id: str,
-    path_in_repo: str,
     commit_message: str,
 ) -> str:
-    """Upload via huggingface_hub.HfApi.upload_file.
+    """Upload a snapshot directory via huggingface_hub.HfApi.upload_folder.
 
     Returns the commit revision SHA (strong hash of the repo state).
     Runs in a thread — HfApi is sync.
@@ -120,9 +125,8 @@ async def _default_upload(
 
     def _sync_upload():
         api = HfApi()
-        commit_info = api.upload_file(
-            path_or_fileobj=local_path,
-            path_in_repo=path_in_repo,
+        commit_info = api.upload_folder(
+            folder_path=folder_path,
             repo_id=repo_id,
             commit_message=commit_message,
         )
@@ -132,7 +136,14 @@ async def _default_upload(
     return await asyncio.to_thread(_sync_upload)
 
 
-def _default_save_weights(model: Any, path: Path) -> None:
-    """Default save: torch.save the state_dict."""
-    import torch
-    torch.save(model.state_dict(), path)
+def _default_save_hf_format(model: Any, tokenizer: Any, path: Path) -> None:
+    """Save HF-format snapshot: model.safetensors + config.json + tokenizer files.
+
+    This is what miners expect — ``AutoModelForCausalLM.from_pretrained(path)``
+    needs ``config.json`` to know the architecture. Without it, load fails with
+    "Unrecognized model. Should have a `model_type` key in its config.json".
+    """
+    # safe_serialization=True writes a real safetensors file, not a torch pickle.
+    model.save_pretrained(path, safe_serialization=True)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(path)

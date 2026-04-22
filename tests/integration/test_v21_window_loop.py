@@ -122,9 +122,15 @@ def _patch_open_grpo_window(svc):
 
 
 @pytest.mark.asyncio
-async def test_one_window_lap_bumps_counters():
+async def test_one_window_lap_bumps_counters(monkeypatch):
     """Open → manually fire seal_event → train_and_publish →
-    window_n and checkpoint_n both bumped, state = READY."""
+    window_n and checkpoint_n both bumped, state = READY.
+
+    Patches B_BATCH to 0 so the empty sealed batch counts as "full" (real
+    submission-driven bump is covered by test_batch_full_bumps_counters).
+    """
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+
     svc = _make_service()
 
     initial_wn = svc._window_n
@@ -196,14 +202,22 @@ async def test_submission_with_wrong_hash_rejected():
 
 
 @pytest.mark.asyncio
-async def test_timeout_partial_seal_path():
-    """Window with only 3 valid submissions → seal_batch returns partial."""
+async def test_timeout_partial_seal_skips_train_and_publish():
+    """Partial seal (len(batch) < B_BATCH) → state machine advances to READY
+    but train_step is NOT called and checkpoint_n stays unchanged.
+
+    This is the skip-if-partial contract: a smaller-than-target batch gives
+    a noisy gradient and a different effective LR than a full-batch step,
+    so we refuse to step on it. Miners who did submit still earn slots via
+    _update_ema — this assertion is about training persistence, not payout.
+    """
     svc = _make_service(checkpoint_hash="sha256:cpA")
     with _patch_open_grpo_window(svc):
         svc._open_window()
     batcher = svc._active_batcher
+    initial_cn = svc._checkpoint_n
 
-    # Feed only 3 submissions
+    # Feed only 3 submissions — definitely less than any reasonable B_BATCH
     for i in range(3):
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{i}", prompt_idx=i,
@@ -218,8 +232,9 @@ async def test_timeout_partial_seal_path():
     # seal_event NOT set (fewer than B)
     assert not batcher.seal_event.is_set()
 
-    # But _train_and_publish still advances the state machine (simulating
-    # the timeout path — run loop calls seal_batch regardless).
+    # Run loop calls _train_and_publish after the timeout fires regardless.
     await svc._train_and_publish()
     assert svc._current_window_state == WindowState.READY
-    assert svc._checkpoint_n == 1  # still bumped
+    # New contract: no training → no publish → checkpoint_n unchanged.
+    assert svc._checkpoint_n == initial_cn
+    svc._checkpoint_store.publish.assert_not_awaited()

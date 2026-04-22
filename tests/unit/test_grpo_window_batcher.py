@@ -183,8 +183,10 @@ def test_seal_batch_empty_pool_returns_empty():
 
 def test_seal_batch_fifo_across_many_submissions():
     b = _make_batcher(current_round=1010)
-    for i, round_num in enumerate([1003, 1001, 1005, 1002, 1004,
-                                    1006, 1007, 1008, 1009, 1010]):
+    # Jumbled rounds within the fresh range [1000, 1010] (LAG_MAX=10); duplicates
+    # allowed since that window is only 11 values wide but B_BATCH may exceed 11.
+    round_nums = [1010 - (i * 3) % 11 for i in range(B_BATCH)]
+    for i, round_num in enumerate(round_nums):
         req = _request(
             prompt_idx=i, signed_round=round_num, hotkey=f"hk{i}",
         )
@@ -307,9 +309,11 @@ async def test_seal_event_set_when_b_valid_distinct_landed():
     b = _make_batcher(current_round=2000)
     b.current_checkpoint_hash = "sha256:hash"
     assert not b.seal_event.is_set()
+    # Round must stay in [current_round - LAG_MAX, current_round] = [1990, 2000];
+    # wrap so B_BATCH submissions all land in that range.
     for i in range(B_BATCH):
         req = _request_v21(
-            prompt_idx=i, signed_round=1993 + i, hotkey=f"hk{i}",
+            prompt_idx=i, signed_round=1990 + (i % 11), hotkey=f"hk{i}",
             checkpoint_hash="sha256:hash",
         )
         b.accept_submission(req)

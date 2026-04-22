@@ -15,9 +15,12 @@ class FakeWallet:
     hotkey = _Hk()
 
 
-def _save_weights_stub(model, path):
-    """Pretend to save model weights — write deterministic bytes."""
-    path.write_bytes(b"weights_for_" + str(id(model)).encode())
+def _save_stub(model, tokenizer, path):
+    """Pretend to save an HF-format snapshot — write two deterministic files."""
+    (path / "model.safetensors").write_bytes(b"weights_for_" + str(id(model)).encode())
+    (path / "config.json").write_text('{"model_type": "fake"}')
+    if tokenizer is not None:
+        (path / "tokenizer.json").write_text("{}")
 
 
 def test_initial_manifest_is_none(tmp_path):
@@ -39,7 +42,7 @@ async def test_publish_writes_uploads_signs_and_serves(tmp_path):
         repo_id="aivolutionedge/reliquary-sn",
         staging_dir_path=str(tmp_path),
         upload_fn=fake_upload,
-        save_weights_fn=_save_weights_stub,
+        save_fn=_save_stub,
     )
     model = MagicMock(name="mock_model")
     entry = await store.publish(checkpoint_n=1, model=model)
@@ -64,7 +67,7 @@ async def test_publish_increments_overrides_previous(tmp_path):
         repo_id="aivolutionedge/reliquary-sn",
         staging_dir_path=str(tmp_path),
         upload_fn=fake_upload,
-        save_weights_fn=_save_weights_stub,
+        save_fn=_save_stub,
     )
     await store.publish(checkpoint_n=1, model=MagicMock())
     e2 = await store.publish(checkpoint_n=2, model=MagicMock())
@@ -74,14 +77,13 @@ async def test_publish_increments_overrides_previous(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_upload_fn_receives_correct_kwargs(tmp_path):
-    """upload_fn is called with (local_path, repo_id, path_in_repo, commit_message)."""
+async def test_upload_fn_receives_folder_and_kwargs(tmp_path):
+    """upload_fn is called with (folder_path, repo_id, commit_message)."""
     captured = {}
 
-    async def capturing_upload(local_path, repo_id, path_in_repo, commit_message):
-        captured["local_path"] = local_path
+    async def capturing_upload(folder_path, repo_id, commit_message):
+        captured["folder_path"] = folder_path
         captured["repo_id"] = repo_id
-        captured["path_in_repo"] = path_in_repo
         captured["commit_message"] = commit_message
         return "captured_revision_sha"
 
@@ -91,13 +93,42 @@ async def test_upload_fn_receives_correct_kwargs(tmp_path):
         repo_id="aivolutionedge/reliquary-sn",
         staging_dir_path=str(tmp_path),
         upload_fn=capturing_upload,
-        save_weights_fn=_save_weights_stub,
+        save_fn=_save_stub,
     )
     entry = await store.publish(5, model=object())
     assert captured["repo_id"] == "aivolutionedge/reliquary-sn"
-    assert captured["path_in_repo"] == "model.safetensors"
+    # folder_path points to a real directory under staging
+    from pathlib import Path as _P
+    assert _P(captured["folder_path"]).is_dir()
+    assert (_P(captured["folder_path"]) / "model.safetensors").exists()
+    assert (_P(captured["folder_path"]) / "config.json").exists()
     assert "5" in captured["commit_message"]
     assert entry.revision == "captured_revision_sha"
+
+
+@pytest.mark.asyncio
+async def test_save_receives_tokenizer(tmp_path):
+    """Tokenizer passed through __init__ reaches the save function."""
+    seen = {}
+
+    def capturing_save(model, tokenizer, path):
+        seen["tokenizer"] = tokenizer
+        (path / "model.safetensors").write_bytes(b"x")
+        (path / "config.json").write_text("{}")
+
+    fake_tokenizer = object()
+    fake_upload = AsyncMock(return_value="rev")
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="org/repo",
+        staging_dir_path=str(tmp_path),
+        tokenizer=fake_tokenizer,
+        upload_fn=fake_upload,
+        save_fn=capturing_save,
+    )
+    await store.publish(1, model=object())
+    assert seen["tokenizer"] is fake_tokenizer
 
 
 @pytest.mark.asyncio
@@ -113,7 +144,7 @@ async def test_signature_includes_n_and_revision(tmp_path):
                 return b"fake_sig"
         hotkey = _Hk()
 
-    async def fake_upload(local_path, repo_id, path_in_repo, commit_message):
+    async def fake_upload(folder_path, repo_id, commit_message):
         return "revision_sha_42"
 
     store = CheckpointStore(
@@ -122,7 +153,7 @@ async def test_signature_includes_n_and_revision(tmp_path):
         repo_id="aivolutionedge/reliquary-sn",
         staging_dir_path=str(tmp_path),
         upload_fn=fake_upload,
-        save_weights_fn=_save_weights_stub,
+        save_fn=_save_stub,
     )
     entry = await store.publish(42, model=object())
     assert b"42" in captured["signed"]
@@ -133,7 +164,7 @@ async def test_signature_includes_n_and_revision(tmp_path):
 @pytest.mark.asyncio
 async def test_repo_id_stored_in_manifest(tmp_path):
     """ManifestEntry carries the repo_id so miners can do from_pretrained(repo_id, revision)."""
-    async def fake_upload(local_path, repo_id, path_in_repo, commit_message):
+    async def fake_upload(folder_path, repo_id, commit_message):
         return "some_rev"
 
     store = CheckpointStore(
@@ -142,7 +173,7 @@ async def test_repo_id_stored_in_manifest(tmp_path):
         repo_id="myorg/my-model",
         staging_dir_path=str(tmp_path),
         upload_fn=fake_upload,
-        save_weights_fn=_save_weights_stub,
+        save_fn=_save_stub,
     )
     entry = await store.publish(3, model=object())
     assert entry.repo_id == "myorg/my-model"

@@ -18,7 +18,7 @@ The boot query ensures a miner joining an already-running subnet lands directly 
 
 ## What a miner does (v2.1)
 
-Windows are event-driven, not time-based. A window seals the instant `B_BATCH = 8` valid distinct-prompt submissions land; there is no fixed 60-second cadence.
+Windows are event-driven, not time-based. A window seals the instant `B_BATCH = 16` valid distinct-prompt submissions land; there is no fixed 60-second cadence.
 
 Every miner runs a continuous poll-submit loop:
 
@@ -36,7 +36,7 @@ Every miner runs a continuous poll-submit loop:
 
 6. **Submits.** POSTs a `BatchSubmissionRequest` to `/submit` containing: `prompt_idx`, 8 rollouts, local rewards, GRAIL commits, `merkle_root`, `signed_round` (the current window's `current_round` from `/state`), and `checkpoint_hash` (the HF revision from the last `/state` response).
 
-The validator processes submissions in real time. Only the first `B_BATCH = 8` accepted submissions with distinct `prompt_idx` values that pass all checks form the training batch.
+The validator processes submissions in real time. Only the first `B_BATCH = 16` accepted submissions with distinct `prompt_idx` values that pass all checks form the training batch.
 
 ### Prompt selection strategy
 

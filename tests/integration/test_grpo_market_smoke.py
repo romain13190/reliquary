@@ -58,14 +58,15 @@ def _make_batcher(window, cooldown):
 
 
 def test_two_windows_with_cooldown():
-    """Window 0: 10 miners submit on distinct prompts, 8 win batch.
+    """Window 0: B_BATCH+2 miners submit on distinct prompts, B_BATCH win batch.
     Window 1: same prompts → all rejected for cooldown.
     Window 4 (after cooldown=3): prompt 0 eligible again."""
     cooldown = CooldownMap(cooldown_windows=3)  # small for test speed
+    n_submissions = B_BATCH + 2
 
     # Window 0: current_round = 0 * 10 + 100 = 100; signed_round must be in [90, 100]
     b0 = _make_batcher(window=0, cooldown=cooldown)
-    for i in range(10):
+    for i in range(n_submissions):
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{i}",
             prompt_idx=i,
@@ -79,10 +80,10 @@ def test_two_windows_with_cooldown():
         assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
     batch0 = b0.seal_batch()
     assert len(batch0) == B_BATCH
-    # select_batch sorts by tiebreak hash; any 8 of the 10 prompts may win
+    # select_batch sorts by tiebreak hash; any B_BATCH of the submitted prompts may win
     batched_prompts = {s.prompt_idx for s in batch0}
     assert len(batched_prompts) == B_BATCH
-    assert batched_prompts.issubset(set(range(10)))
+    assert batched_prompts.issubset(set(range(n_submissions)))
 
     # Window 1: re-submit the exact batched prompts → all rejected for cooldown
     b1 = _make_batcher(window=1, cooldown=cooldown)
@@ -159,12 +160,13 @@ def test_weights_for_full_batch():
 
 
 def test_weights_for_partial_batch_burns_rest():
-    """Partial batch (5/8) every window — after convergence, burn ≈ 3/8."""
-    counts = {f"hk{i}": 1 for i in range(5)}
+    """Partial batch (filled/B_BATCH) every window — burn → (B_BATCH - filled) / B_BATCH."""
+    filled = 5
+    counts = {f"hk{i}": 1 for i in range(filled)}
     ema = _run_ema_windows([counts] * 500)
     total = sum(ema.values())
     burn = max(0.0, 1.0 - total)
-    assert abs(burn - 3.0 / B_BATCH) < 0.005
+    assert abs(burn - (B_BATCH - filled) / B_BATCH) < 0.005
 
 
 def test_out_of_zone_rejected_end_to_end():

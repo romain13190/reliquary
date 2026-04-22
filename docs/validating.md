@@ -13,7 +13,7 @@ The rest of this guide focuses on trainer mode. See [docs/deployment.md](deploym
 
 ## What a validator does (v2.1)
 
-Windows are event-driven: a window seals the instant `B_BATCH = 8` valid distinct-prompt submissions land. There is no fixed per-window timer — only the `WINDOW_TIMEOUT_SECONDS = 600` safety net fires if fewer than 8 submissions arrive in time.
+Windows are event-driven: a window seals the instant `B_BATCH = 16` valid distinct-prompt submissions land. There is no fixed per-window timer — only the `WINDOW_TIMEOUT_SECONDS = 600` safety net fires if fewer than `B_BATCH` submissions arrive in time.
 
 The validator runs a four-phase state machine per window:
 

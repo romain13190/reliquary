@@ -11,7 +11,7 @@ def test_v2_sigma_bounds():
 
 def test_v2_group_sizes():
     assert C.M_ROLLOUTS == 8
-    assert C.B_BATCH == 8
+    assert C.B_BATCH == 16
 
 
 def test_v2_temperature_fixed_nonzero():

@@ -130,6 +130,7 @@ class ValidationService:
             wallet=wallet,
             repo_id=hf_repo_id or DEFAULT_HF_REPO_ID,
             staging_dir_path=CHECKPOINT_STAGING_DIR_DEFAULT,
+            tokenizer=tokenizer,
         )
         self._active_batcher = None
         self._current_window_state: WindowState = WindowState.READY
@@ -220,39 +221,52 @@ class ValidationService:
 
         self._set_state(WindowState.TRAINING)
         batch = self._active_batcher.seal_batch()
-        self._update_ema(batch)
+        self._update_ema(batch)  # miners earn slots regardless of training
 
-        self.model = train_step(self.model, batch)
-
-        self._set_state(WindowState.PUBLISHING)
-        # checkpoint_n only advances on publish; use window_n for cadence.
-        next_n = self._checkpoint_n + 1
-        # Push to HF every N windows, or immediately if no checkpoint exists yet.
-        should_publish = (
-            (self._window_n % self._publish_every == 0)
-            or self._checkpoint_store.current_manifest() is None
-        )
-        if should_publish:
-            try:
-                entry = await self._checkpoint_store.publish(
-                    checkpoint_n=next_n, model=self.model,
-                )
-                self._checkpoint_n = next_n
-                try:
-                    self.server.set_current_checkpoint(entry)
-                except AttributeError:
-                    pass
-                logger.info(
-                    "Published checkpoint %d to %s@%s",
-                    entry.checkpoint_n, entry.repo_id, entry.revision[:12],
-                )
-            except Exception:
-                logger.exception("HF publish failed; staying on previous checkpoint")
+        # Only train on a full batch. A partial seal (timeout) means miner
+        # population + cadence didn't produce enough groups to train on;
+        # stepping on a smaller-than-target batch gives a noisier gradient
+        # and a different effective LR than full-batch steps, so we skip.
+        # The miners who did submit are still credited via _update_ema.
+        trained = len(batch) >= B_BATCH
+        if trained:
+            self.model = train_step(self.model, batch)
         else:
             logger.info(
-                "Skipping HF publish for window_n=%d (publishing every %d)",
-                self._window_n, self._publish_every,
+                "Window %d sealed with %d/%d submissions — skipping train_step + publish",
+                self._window_n, len(batch), B_BATCH,
             )
+
+        self._set_state(WindowState.PUBLISHING)
+        if trained:
+            # checkpoint_n only advances on publish; use window_n for cadence.
+            next_n = self._checkpoint_n + 1
+            # Push to HF every N windows, or immediately if no checkpoint exists yet.
+            should_publish = (
+                (self._window_n % self._publish_every == 0)
+                or self._checkpoint_store.current_manifest() is None
+            )
+            if should_publish:
+                try:
+                    entry = await self._checkpoint_store.publish(
+                        checkpoint_n=next_n, model=self.model,
+                    )
+                    self._checkpoint_n = next_n
+                    try:
+                        self.server.set_current_checkpoint(entry)
+                    except AttributeError:
+                        pass
+                    logger.info(
+                        "Published checkpoint %d to %s@%s",
+                        entry.checkpoint_n, entry.repo_id, entry.revision[:12],
+                    )
+                except Exception:
+                    logger.exception("HF publish failed; staying on previous checkpoint")
+            else:
+                logger.info(
+                    "Skipping HF publish for window_n=%d (publishing every %d)",
+                    self._window_n, self._publish_every,
+                )
 
         try:
             await self._archive_window(self._active_batcher, batch)

@@ -49,11 +49,11 @@ def _fake_batch(hotkey_counts: dict[str, int]):
 
 
 def test_ema_converges_to_expected_fraction():
-    """Steady state: one miner winning 2/8 slots every window → EMA ≈ 0.25."""
+    """Steady state: miner winning 2/B_BATCH slots every window → EMA ≈ 2/B_BATCH."""
     svc = _make_service()
     for _ in range(500):
         svc._update_ema(_fake_batch({"alice": 2}))
-    assert abs(svc._miner_scores_ema["alice"] - 0.25) < 0.001
+    assert abs(svc._miner_scores_ema["alice"] - 2.0 / B_BATCH) < 0.001
 
 
 def test_inactive_miner_decays_to_zero():
@@ -61,7 +61,7 @@ def test_inactive_miner_decays_to_zero():
     svc = _make_service()
     # 50 windows active
     for _ in range(50):
-        svc._update_ema(_fake_batch({"alice": 8}))  # full batch
+        svc._update_ema(_fake_batch({"alice": B_BATCH}))  # full batch
     peak = svc._miner_scores_ema["alice"]
     assert peak > 0.5  # pretty active
 
@@ -77,19 +77,20 @@ def test_inactive_miner_decays_to_zero():
 def test_sum_equals_fill_rate_steady_state():
     """If batch consistently half-full, sum(EMAs) converges to ~0.5."""
     svc = _make_service()
-    # Fill 4/8 slots every window — 4 different miners, 1 slot each
+    # Fill B_BATCH/2 slots every window — B_BATCH/2 different miners, 1 slot each
+    half = B_BATCH // 2
     for _ in range(500):
-        svc._update_ema(_fake_batch({"a": 1, "b": 1, "c": 1, "d": 1}))
+        svc._update_ema(_fake_batch({f"hk{i}": 1 for i in range(half)}))
     total = sum(svc._miner_scores_ema.values())
-    assert abs(total - 0.5) < 0.005
+    assert abs(total - half / B_BATCH) < 0.005
 
 
 def test_full_batch_sum_converges_to_one():
     """Full batch every window → sum of EMAs → 1.0 (zero burn at steady state)."""
     svc = _make_service()
     for _ in range(500):
-        # 8 different miners, 1 slot each
-        batch_counts = {f"hk{i}": 1 for i in range(8)}
+        # B_BATCH different miners, 1 slot each
+        batch_counts = {f"hk{i}": 1 for i in range(B_BATCH)}
         svc._update_ema(_fake_batch(batch_counts))
     total = sum(svc._miner_scores_ema.values())
     assert abs(total - 1.0) < 0.005

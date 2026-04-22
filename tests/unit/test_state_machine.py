@@ -67,7 +67,12 @@ def test_set_state_transitions():
 
 
 @pytest.mark.asyncio
-async def test_train_and_publish_bumps_checkpoint_n():
+async def test_train_and_publish_bumps_checkpoint_n(monkeypatch):
+    # Patch B_BATCH to 0 so an empty sealed batch counts as "full" and the
+    # train+publish path runs. Real behaviour with non-zero B_BATCH is
+    # covered by the integration tests that exercise actual submissions.
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+
     svc = _make_service()
     initial_checkpoint = svc._checkpoint_n
 
@@ -126,11 +131,15 @@ def test_open_window_empty_hash_pre_first_publish():
 
 
 @pytest.mark.asyncio
-async def test_publish_every_n_windows():
+async def test_publish_every_n_windows(monkeypatch):
     """With _publish_every=3, publish is called only on windows 3 (first due to
     None manifest) then ... actually on windows 1 (first, manifest is None) and
     then next on window 3 (3 % 3 == 0). Verify: 5 _train_and_publish calls
     produce exactly 2 publish calls when publish_every=3 and manifest starts None."""
+    # Patch B_BATCH so empty batches count as "full" (real-batch behaviour is
+    # covered by the integration test that uses real submissions).
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+
     import reliquary.validator.service as svc_mod
     from reliquary.validator.checkpoint import ManifestEntry
 

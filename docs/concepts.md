@@ -41,7 +41,7 @@ For each rollout the miner calls `env.compute_reward`, then runs a bit-identical
 `POST /submit` sends the request to the validator. The validator runs the full verification pipeline (see below). On success the submission is appended to the open window's valid pool. The response is immediate (`accepted=True`) — the heavy GRAIL verification runs in a background worker.
 
 **6. Validator verifies, filters, selects batch.**
-The validator checks: window match → checkpoint hash → prompt index bounds → round freshness → cooldown → reward match → zone filter (`σ ≥ 0.43`) → GRAIL sketch. Any failure returns a `RejectReason` immediately. Valid submissions accumulate. Once `B_BATCH = 8` submissions with distinct `prompt_idx` values pass, `seal_event` fires.
+The validator checks: window match → checkpoint hash → prompt index bounds → round freshness → cooldown → reward match → zone filter (`σ ≥ 0.43`) → GRAIL sketch. Any failure returns a `RejectReason` immediately. Valid submissions accumulate. Once `B_BATCH = 16` submissions with distinct `prompt_idx` values pass, `seal_event` fires.
 
 **7. Validator runs a GRPO step.**
 State transitions to `TRAINING`. `train_step()` computes group-relative advantages from each group's rewards, runs a PPO-clipped surrogate loss + KL penalty against the frozen reference model, and applies one AdamW step. The EMA scores are updated for all miners seen this window.
@@ -74,7 +74,7 @@ Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): t
 
 ### Cooldown (50 windows) — curriculum rotation
 
-Once a `prompt_idx` enters the training batch it is ineligible for the next `BATCH_PROMPT_COOLDOWN_WINDOWS = 50` training steps. This prevents the policy from overfitting to a small set of high-signal prompts. With 50 windows of cooldown and `B_BATCH = 8` distinct prompts per window, roughly 400 distinct prompts are trained before any one prompt can recur.
+Once a `prompt_idx` enters the training batch it is ineligible for the next `BATCH_PROMPT_COOLDOWN_WINDOWS = 50` training steps. This prevents the policy from overfitting to a small set of high-signal prompts. With 50 windows of cooldown and `B_BATCH = 16` distinct prompts per window, roughly 800 distinct prompts are trained before any one prompt can recur.
 
 The cooldown map is rebuilt from R2 archives at validator startup — up to 50 recent windows are downloaded and replayed — so the curriculum state survives restarts without needing a local state file for cooldowns specifically.
 
@@ -115,16 +115,16 @@ The base model is Qwen3-4B-Instruct (~4 billion parameters, ~8 GB in bfloat16). 
 ### How a miner earns
 
 1. Submit a valid in-zone group on a non-cooldown prompt when the window is `OPEN`.
-2. Be among the first `B_BATCH = 8` submissions with distinct `prompt_idx` values (FIFO by `signed_round`).
+2. Be among the first `B_BATCH = 16` submissions with distinct `prompt_idx` values (FIFO by `signed_round`).
 3. Each batch slot you win contributes `1/B_BATCH` to your EMA update for that window.
 4. Every `WEIGHT_SUBMISSION_INTERVAL = 360` blocks (`ROLLING_WINDOWS = 72` windows), the validator calls `set_weights` on-chain with the current EMA values. Your emission for that interval is proportional to your EMA score.
 
 ### Rough expected earnings
 
-Suppose the network emits `E` TAO per epoch. You win an average of `s` batch slots per window. The EMA converges to approximately `s / B_BATCH = s / 8` of the total filled-slot budget. Your share of emissions per epoch is approximately:
+Suppose the network emits `E` TAO per epoch. You win an average of `s` batch slots per window. The EMA converges to approximately `s / B_BATCH = s / 16` of the total filled-slot budget. Your share of emissions per epoch is approximately:
 
 ```
-(s / 8) / (sum of all miners' EMA scores)
+(s / 16) / (sum of all miners' EMA scores)
 ```
 
 A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the epoch's filled-slot emissions.
