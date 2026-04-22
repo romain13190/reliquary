@@ -20,11 +20,15 @@ ENV PATH="/opt/reliquary-venv/bin:${PATH}"
 RUN pip install --upgrade pip wheel setuptools \
  && pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 
-# flash-attn prebuilt wheel for torch 2.7 / cu12 / cp312 / cxx11abi=TRUE
+# flash-attn prebuilt wheel for torch 2.7 / cu12 / cp312 / cxx11abi=TRUE.
+# Do NOT rename the wheel on download: pip parses the version and platform
+# tags from the filename and rejects anything that doesn't match the
+# ``name-version-...-abi.whl`` shape with "Invalid wheel filename
+# (wrong number of parts)".
 ARG FA_URL=https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
-RUN wget -q "${FA_URL}" -O /tmp/flash_attn.whl \
- && pip install /tmp/flash_attn.whl \
- && rm /tmp/flash_attn.whl
+RUN wget -q "${FA_URL}" -P /tmp/ \
+ && pip install /tmp/flash_attn-*.whl \
+ && rm /tmp/flash_attn-*.whl
 
 # Source + install
 WORKDIR /opt/reliquary
