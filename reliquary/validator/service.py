@@ -176,7 +176,9 @@ class ValidationService:
 
         Increments ``self._window_n`` and wires the active checkpoint hash
         into the batcher so miners on stale checkpoints get WRONG_CHECKPOINT
-        rejected before GRAIL compute.
+        rejected before GRAIL compute. Per-window randomness is set
+        separately by the async caller via ``_set_window_randomness`` —
+        it needs the subtensor, which this sync path doesn't carry.
         """
         self._window_n += 1
         bootstrap = is_bootstrap_window(
@@ -196,6 +198,19 @@ class ValidationService:
         )
         self.server.set_active_batcher(self._active_batcher)
         self._set_state(WindowState.OPEN)
+
+    async def _set_window_randomness(self, subtensor) -> None:
+        """Populate the active batcher's per-window randomness seed.
+
+        GRAIL sketch verification re-derives challenge indices from this
+        seed; miner and validator must agree. The miner derives it from
+        the same block hash + drand round, so the values match bit-for-bit.
+        """
+        if self._active_batcher is None:
+            return
+        self._active_batcher.randomness = await self._derive_randomness(
+            subtensor, self._window_n,
+        )
 
     async def _train_and_publish(self) -> None:
         """TRAINING + PUBLISHING + READY phases."""
@@ -292,6 +307,7 @@ class ValidationService:
             while True:
                 try:
                     self._open_window()
+                    await self._set_window_randomness(subtensor)
                     try:
                         await asyncio.wait_for(
                             self._active_batcher.seal_event.wait(),
