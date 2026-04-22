@@ -415,6 +415,16 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) ->
 
     rnd = data.get("randomness")
     rno = data.get("round")
+    sig = data.get("signature")
+    # The drand v2 HTTP API omits the `randomness` field and only returns
+    # `{round, signature}`. Per drand spec, randomness = SHA256(signature),
+    # so we derive it locally. The signature is still verified below.
+    if rnd is None and sig is not None:
+        import hashlib
+        try:
+            rnd = hashlib.sha256(bytes.fromhex(sig)).hexdigest()
+        except ValueError:
+            rnd = None
     if rnd is None or rno is None:
         logger.debug(f"[Drand] Missing fields in response: {json.dumps(data)[:200]}")
         if use_fallback:
@@ -423,7 +433,6 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) ->
 
     # SECURITY: Verify the beacon's cryptographic signature before trusting it.
     # Without this, a MITM or compromised relay can inject fake randomness.
-    sig = data.get("signature")
     if not verify_beacon_signature(_DRAND_CHAIN_HASH, int(rno), str(rnd), sig):
         logger.error(
             "[Drand] Beacon signature verification FAILED for round %s — rejecting", rno
