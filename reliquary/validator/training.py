@@ -19,6 +19,7 @@ from typing import Any, Optional
 import torch
 import torch.nn.functional as F
 
+from reliquary.validator import telemetry
 from reliquary.constants import (
     GRAD_CLIP_NORM, KL_BETA, LEARNING_RATE, LR_COSINE_MAX_WINDOWS,
     LR_WARMUP_WINDOWS, PPO_CLIP_EPSILON,
@@ -202,8 +203,12 @@ def _rollout_loss(
 # Main entry point — one GRPO step per call
 # ---------------------------------------------------------------------------
 
-def train_step(model, batch: list) -> Any:
+def train_step(model, batch: list, window_index: int | None = None) -> Any:
     """Run one GRPO step on *batch* (list of ValidSubmission).
+
+    If *window_index* is provided, it is used as the wandb step when
+    telemetry is enabled — aligning the x-axis of wandb charts with the
+    subnet window index. Safe to omit in tests.
 
     Each ValidSubmission has M rollouts on the same prompt. Within-group
     advantages are computed from rewards; PPO-clipped surrogate is
@@ -231,11 +236,13 @@ def train_step(model, batch: list) -> Any:
     total_ppo = 0.0
     total_kl = 0.0
     n_processed = 0
+    n_skipped = 0
 
     for group in batch:
         rewards = [r.reward for r in group.rollouts]
         advantages = _compute_advantages(rewards)
         if all(a == 0.0 for a in advantages):
+            n_skipped += 1
             logger.debug("skipping degenerate group on prompt_idx=%d", group.prompt_idx)
             continue
 
@@ -268,4 +275,30 @@ def train_step(model, batch: list) -> Any:
         lr, total_ppo / n_processed, total_kl / n_processed,
         float(grad_norm), n_processed, n_total_rollouts,
     )
+
+    # Emit structured metrics to wandb (no-op if telemetry disabled).
+    all_rewards = [r.reward for g in batch for r in g.rollouts]
+    n_rewards = len(all_rewards)
+    reward_mean = sum(all_rewards) / n_rewards
+    reward_var = sum((r - reward_mean) ** 2 for r in all_rewards) / n_rewards
+    reward_std = reward_var ** 0.5
+    n_groups = len(batch)
+    metrics = {
+        "train/lr": lr,
+        "train/ppo_loss": total_ppo / n_processed,
+        "train/kl": total_kl / n_processed,
+        "train/grad_norm": float(grad_norm),
+        "train/rollouts_processed": n_processed,
+        "train/rollouts_total": n_total_rollouts,
+        "train/valid_rollout_ratio": n_processed / n_total_rollouts,
+        "rewards/mean": reward_mean,
+        "rewards/std": reward_std,
+        "rewards/min": min(all_rewards),
+        "rewards/max": max(all_rewards),
+        "batch/n_groups": n_groups,
+        "batch/n_degenerate_groups": n_skipped,
+        "batch/degenerate_ratio": n_skipped / n_groups,
+    }
+    telemetry.log_training_step(metrics, step=window_index)
+
     return model
