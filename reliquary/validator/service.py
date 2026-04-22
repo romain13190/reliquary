@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from typing import Any
 
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
@@ -78,6 +79,19 @@ def open_grpo_window(
 
 
 
+def _default_load_model(local_path: str):
+    """Default: load a HF checkpoint onto cuda:0 in bfloat16 with the
+    configured attention implementation."""
+    import torch
+    from transformers import AutoModelForCausalLM
+    from reliquary.constants import ATTN_IMPLEMENTATION
+    return AutoModelForCausalLM.from_pretrained(
+        local_path,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=ATTN_IMPLEMENTATION,
+    ).to("cuda:0").eval()
+
+
 class ValidationService:
     def __init__(
         self,
@@ -93,6 +107,8 @@ class ValidationService:
         external_ip: str | None = None,
         external_port: int | None = None,
         hf_repo_id: str | None = None,
+        resume_from: str | None = None,
+        load_model_fn: Any | None = None,
     ) -> None:
         self.wallet = wallet
         self.model = model
@@ -135,6 +151,9 @@ class ValidationService:
         self._active_batcher = None
         self._current_window_state: WindowState = WindowState.READY
 
+        self._resume_from = resume_from
+        self._load_model_fn = load_model_fn or _default_load_model
+
     def _update_ema(self, batch: list) -> None:
         """EMA update on the per-hotkey miner score dict.
 
@@ -171,6 +190,59 @@ class ValidationService:
         except AttributeError:
             # Task 9 adds this method; be tolerant during development.
             pass
+
+    async def _apply_resume_from(self) -> None:
+        """If --resume-from was set, load the model from that source and
+        install a manifest. No-op if unset."""
+        if not self._resume_from:
+            return
+        from reliquary.validator.resume import (
+            parse_resume_source,
+            resolve_resume_source,
+        )
+        from reliquary.validator.checkpoint import ManifestEntry
+
+        def _commit_title(repo_id, revision):
+            from huggingface_hub import HfApi
+            api = HfApi()
+            commits = api.list_repo_commits(repo_id=repo_id)
+            for c in commits:
+                if c.commit_id == revision:
+                    return c.title
+            return ""
+
+        def _download(repo_id, revision):
+            from huggingface_hub import snapshot_download
+            return snapshot_download(repo_id=repo_id, revision=revision)
+
+        source = parse_resume_source(self._resume_from)
+        local_path, checkpoint_n = resolve_resume_source(
+            source,
+            hf_repo_id=self._checkpoint_store.repo_id,
+            download_fn=_download,
+            commit_title_fn=_commit_title,
+        )
+        # Load weights — this replaces the base model loaded at __init__.
+        self.model = self._load_model_fn(local_path)
+        # Reconstruct manifest so miners see the resumed checkpoint via /state.
+        sig_payload = f"{checkpoint_n}|{self._resume_from}".encode()
+        sig_bytes = self.wallet.hotkey.sign(sig_payload)
+        entry = ManifestEntry(
+            checkpoint_n=checkpoint_n,
+            repo_id=self._checkpoint_store.repo_id,
+            revision=self._resume_from,
+            signature="ed25519:" + sig_bytes.hex(),
+        )
+        self._checkpoint_store._current = entry
+        self._checkpoint_n = checkpoint_n
+        try:
+            self.server.set_current_checkpoint(entry)
+        except AttributeError:
+            pass
+        logger.info(
+            "Resumed from %s: checkpoint_n=%d",
+            self._resume_from, checkpoint_n,
+        )
 
     def _open_window(self) -> None:
         """Create a new GrpoWindowBatcher and mark state OPEN.
@@ -311,6 +383,7 @@ class ValidationService:
     async def run(self, subtensor) -> None:
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
+        await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
         await self._rebuild_cooldown_from_history()
         logger.info(

@@ -184,3 +184,82 @@ async def test_publish_every_n_windows(monkeypatch):
     assert mock_store.publish.await_count == 2
     assert published_entries[0].checkpoint_n == 1  # first publish: next_n = 0+1 = 1
     assert published_entries[1].checkpoint_n == 2  # second publish: next_n = 1+1 = 2
+
+
+@pytest.mark.asyncio
+async def test_resume_from_path_installs_manifest():
+    """resume_from="path:/tmp/ckpt_3" loads the directory AND installs a
+    manifest so /state announces checkpoint_n=3 to miners immediately."""
+    import tempfile, os
+    from unittest.mock import MagicMock
+    from reliquary.validator.service import ValidationService
+
+    with tempfile.TemporaryDirectory() as td:
+        ckpt_dir = os.path.join(td, "ckpt_3")
+        os.makedirs(ckpt_dir)
+        load_calls = []
+
+        def fake_load(path):
+            load_calls.append(path)
+            return MagicMock(name="resumed_model")
+
+        svc = ValidationService(
+            wallet=_FakeWallet(),
+            model=MagicMock(name="base_model"),
+            tokenizer=MagicMock(),
+            env=_FakeEnv(),
+            netuid=99,
+            resume_from=f"path:{ckpt_dir}",
+            load_model_fn=fake_load,
+        )
+        await svc._apply_resume_from()
+
+        assert svc.model is not None
+        assert load_calls == [ckpt_dir]
+        mf = svc._checkpoint_store.current_manifest()
+        assert mf is not None
+        assert mf.checkpoint_n == 3
+        assert svc._checkpoint_n == 3
+
+
+@pytest.mark.asyncio
+async def test_resume_from_none_is_noop():
+    """No resume_from → service boots with the base model, no manifest."""
+    from reliquary.validator.service import ValidationService
+    from unittest.mock import MagicMock
+    svc = ValidationService(
+        wallet=_FakeWallet(),
+        model=MagicMock(),
+        tokenizer=MagicMock(),
+        env=_FakeEnv(),
+        netuid=99,
+    )
+    await svc._apply_resume_from()
+    assert svc._checkpoint_store.current_manifest() is None
+
+
+@pytest.mark.asyncio
+async def test_resume_from_load_failure_aborts():
+    """If the resume source fails to load, abort — never fall back silently
+    to the base model (would cause GRAIL mismatch on first submission)."""
+    from unittest.mock import MagicMock
+    from reliquary.validator.service import ValidationService
+    import os, tempfile
+
+    def failing_load(path):
+        raise RuntimeError("corrupt checkpoint")
+
+    with tempfile.TemporaryDirectory() as td:
+        ckpt_dir = os.path.join(td, "ckpt_3")
+        os.makedirs(ckpt_dir)
+        svc = ValidationService(
+            wallet=_FakeWallet(),
+            model=MagicMock(),
+            tokenizer=MagicMock(),
+            env=_FakeEnv(),
+            netuid=99,
+            resume_from=f"path:{ckpt_dir}",
+            load_model_fn=failing_load,
+        )
+        with pytest.raises(RuntimeError, match="corrupt checkpoint"):
+            await svc._apply_resume_from()
