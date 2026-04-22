@@ -136,3 +136,31 @@ def test_init_fail_soft_when_wandb_not_installed(monkeypatch, caplog):
 
     assert telemetry.is_active() is False
     assert any("init failed" in rec.message for rec in caplog.records)
+
+
+def test_log_training_step_forwards_metrics(monkeypatch):
+    """When active, log_training_step calls wandb.log with the same dict
+    and step."""
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+    assert telemetry.is_active() is True
+
+    metrics = {"train/lr": 1e-5, "train/ppo_loss": 0.42}
+    telemetry.log_training_step(metrics, step=7)
+
+    fake_wandb.log.assert_called_once_with(metrics, step=7)
+
+
+def test_log_training_step_accepts_none_step(monkeypatch):
+    """step=None is valid — wandb picks its own counter."""
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+    telemetry.log_training_step({"x": 1}, step=None)
+
+    fake_wandb.log.assert_called_once_with({"x": 1}, step=None)

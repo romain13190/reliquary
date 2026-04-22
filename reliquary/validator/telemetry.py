@@ -62,10 +62,21 @@ def init(hotkey_ss58: str, config: dict) -> None:
 
 
 def log_training_step(metrics: dict, step: int | None) -> None:
-    """Forward a metrics dict to wandb.log. No-op if disabled. Fail-soft."""
+    """Forward a metrics dict to wandb.log. No-op if disabled. Fail-soft.
+
+    Only the first exception is logged — subsequent failures in the same
+    session are silenced to avoid flooding the log on prolonged outages.
+    """
+    global _log_warned
     if not _enabled:
         return
-    # Active path added in later task.
+    try:
+        import wandb  # already imported successfully in init()
+        wandb.log(metrics, step=step)
+    except Exception as e:  # noqa: BLE001
+        if not _log_warned:
+            logger.warning("wandb: log failed (%s), suppressing further warnings", e)
+            _log_warned = True
 
 
 def finish() -> None:
