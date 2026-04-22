@@ -106,3 +106,48 @@ def _compute_math_reward(problem: dict, completion: str) -> float:
         return 1.0 if candidate == gt and gt != "" else 0.0
     except Exception:
         return 0.0
+
+
+class MATHEnvironment:
+    """Environment backed by the Hendrycks MATH train split (7 500 problems).
+
+    Ground truths are extracted once from the ``solution`` field by taking
+    the content of the last \\boxed{...}; completions are scored with the
+    same extraction against the completion text.
+    """
+
+    name: str = "math"
+
+    # Class-level cache: populated on first instantiation so tests in the
+    # same process share the one HF download.
+    _dataset_cache: ClassVar[Optional[object]] = None
+
+    def __init__(self) -> None:
+        if MATHEnvironment._dataset_cache is None:
+            import datasets as hf_datasets  # local import keeps module importable w/o datasets
+            MATHEnvironment._dataset_cache = hf_datasets.load_dataset(
+                "hendrycks/competition_math", split="train", trust_remote_code=True
+            )
+        self._dataset = MATHEnvironment._dataset_cache
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def get_problem(self, index: int) -> dict:
+        """Return problem at *index* (wraps modulo dataset length)."""
+        idx = index % len(self._dataset)
+        row = self._dataset[idx]
+        question: str = row["problem"]
+        solution: str = row["solution"]
+        boxed = _last_boxed_only_string(solution)
+        gt_str = _strip_boxed_wrapper(boxed) if boxed else ""
+        problem_id = hashlib.sha256(question.encode()).hexdigest()[:16]
+        return {
+            "prompt": question,
+            "ground_truth": gt_str,
+            "id": problem_id,
+        }
+
+    def compute_reward(self, problem: dict, completion: str) -> float:
+        """Score a completion using MATH boxed-answer reward."""
+        return _compute_math_reward(problem, completion)

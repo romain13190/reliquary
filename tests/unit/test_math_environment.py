@@ -165,3 +165,63 @@ def test_reward_handles_gt_already_boxed():
     from reliquary.environment.math import _compute_math_reward
     problem = {"ground_truth": r"\boxed{42}"}
     assert _compute_math_reward(problem, r"\boxed{42}") == 1.0
+
+
+# ---------------------------------------------------------------------------
+# MATHEnvironment class tests
+# ---------------------------------------------------------------------------
+
+def _load_math_env():
+    """Helper: load MATH env, skip on any dataset error."""
+    try:
+        from reliquary.environment.math import MATHEnvironment
+        return MATHEnvironment()
+    except Exception as exc:
+        pytest.skip(f"Could not load MATH dataset: {exc}")
+
+
+def test_math_env_name():
+    from reliquary.environment.math import MATHEnvironment
+    assert MATHEnvironment.name == "math"
+
+
+def test_math_dataset_loaded_and_indexable():
+    env = _load_math_env()
+    assert len(env) > 0
+    problem = env.get_problem(0)
+    assert isinstance(problem["prompt"], str) and len(problem["prompt"]) > 0
+    assert isinstance(problem["ground_truth"], str) and len(problem["ground_truth"]) > 0
+    assert "id" in problem and len(problem["id"]) == 16
+
+
+def test_math_ground_truth_is_stripped_of_boxed_wrapper():
+    env = _load_math_env()
+    problem = env.get_problem(0)
+    # get_problem must present the bare answer; reward_fn also strips but
+    # storing the bare form keeps logs/diagnostics readable.
+    assert not problem["ground_truth"].startswith("\\boxed{")
+
+
+def test_math_problem_id_is_stable_sha_prefix():
+    env = _load_math_env()
+    p1 = env.get_problem(0)
+    p2 = env.get_problem(0)
+    assert p1["id"] == p2["id"]
+    expected = hashlib.sha256(p1["prompt"].encode()).hexdigest()[:16]
+    assert p1["id"] == expected
+
+
+def test_math_index_wraps_modulo_length():
+    env = _load_math_env()
+    p0 = env.get_problem(0)
+    p_wrap = env.get_problem(len(env))
+    assert p_wrap["id"] == p0["id"]
+
+
+def test_math_compute_reward_on_real_row():
+    env = _load_math_env()
+    problem = env.get_problem(0)
+    gt = problem["ground_truth"]
+    # Feed the env its own ground truth inside a \boxed{} — must score 1.0.
+    fake_completion = f"Working...\n\\boxed{{{gt}}}"
+    assert env.compute_reward(problem, fake_completion) == 1.0
