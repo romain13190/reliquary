@@ -87,3 +87,22 @@ def _normalize_answer(s: str) -> str:
     # Collapse whitespace (MATH answers should be whitespace-insensitive).
     s = re.sub(r"\s+", "", s)
     return s
+
+
+def _compute_math_reward(problem: dict, completion: str) -> float:
+    """Score a MATH completion.
+
+    Returns 1.0 when the last ``\\boxed{...}`` in the completion, stripped
+    and normalized, equals the ground-truth answer (also stripped/normalized).
+    Returns 0.0 otherwise. Never raises.
+    """
+    try:
+        boxed = _last_boxed_only_string(completion)
+        if boxed is None:
+            return 0.0
+        candidate = _normalize_answer(_strip_boxed_wrapper(boxed))
+        gt_raw = str(problem.get("ground_truth", ""))
+        gt = _normalize_answer(_strip_boxed_wrapper(gt_raw))
+        return 1.0 if candidate == gt and gt != "" else 0.0
+    except Exception:
+        return 0.0

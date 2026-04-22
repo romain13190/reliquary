@@ -106,3 +106,62 @@ def test_normalize_is_idempotent():
     once = _normalize_answer(r"\left(\dfrac{1}{2}\right)")
     twice = _normalize_answer(once)
     assert once == twice
+
+
+def test_reward_exact_boxed_match():
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": "42"}
+    assert _compute_math_reward(problem, r"...\boxed{42}") == 1.0
+
+
+def test_reward_frac_vs_dfrac_equivalent():
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": r"\frac{1}{2}"}
+    assert _compute_math_reward(problem, r"\boxed{\dfrac{1}{2}}") == 1.0
+
+
+def test_reward_left_right_stripped():
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": r"(x+1)"}
+    assert _compute_math_reward(problem, r"\boxed{\left(x+1\right)}") == 1.0
+
+
+def test_reward_whitespace_insensitive():
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": "x+1"}
+    assert _compute_math_reward(problem, r"\boxed{x + 1}") == 1.0
+
+
+def test_reward_wrong_answer_is_zero():
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": "42"}
+    assert _compute_math_reward(problem, r"\boxed{41}") == 0.0
+
+
+def test_reward_no_boxed_falls_back_to_last_token():
+    from reliquary.environment.math import _compute_math_reward
+    # MATH expects \boxed{}; missing it → 0.0 (strict). No numeric fallback
+    # because MATH answers are often non-numeric (polynomials, sets, etc.).
+    problem = {"ground_truth": "42"}
+    assert _compute_math_reward(problem, "the answer is 42") == 0.0
+
+
+def test_reward_handles_empty_completion():
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": "42"}
+    assert _compute_math_reward(problem, "") == 0.0
+
+
+def test_reward_handles_unbalanced_boxed():
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": "42"}
+    assert _compute_math_reward(problem, r"\boxed{42") == 0.0
+
+
+def test_reward_handles_gt_already_boxed():
+    """Hendrycks solution fields contain \\boxed{...}; the env loader is
+    expected to strip it, but the reward fn should still behave if not.
+    """
+    from reliquary.environment.math import _compute_math_reward
+    problem = {"ground_truth": r"\boxed{42}"}
+    assert _compute_math_reward(problem, r"\boxed{42}") == 1.0
