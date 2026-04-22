@@ -26,7 +26,7 @@ class _FakeWallet:
     hotkey = _Hk()
 
 
-def _make_service(tmp_path):
+def _make_service():
     from reliquary.validator.service import ValidationService
 
     svc = ValidationService(
@@ -36,34 +36,30 @@ def _make_service(tmp_path):
         env=_FakeEnv(),
         netuid=99,
     )
-    # Point persistence at a temp location so tests don't clobber real state.
-    svc._state_path = str(tmp_path / "s.json")
-    from reliquary.validator.state_persistence import ValidatorState
-    svc._state = ValidatorState(svc._state_path)
     return svc
 
 
-def test_service_initial_state_is_ready(tmp_path):
-    svc = _make_service(tmp_path)
+def test_service_initial_state_is_ready():
+    svc = _make_service()
     assert svc._current_window_state == WindowState.READY
 
 
-def test_open_window_sets_state_to_open(tmp_path):
-    svc = _make_service(tmp_path)
+def test_open_window_sets_state_to_open():
+    svc = _make_service()
     svc._open_window()
     assert svc._current_window_state == WindowState.OPEN
     assert svc._active_batcher is not None
 
 
-def test_open_window_increments_window_n(tmp_path):
-    svc = _make_service(tmp_path)
-    initial = svc._state.window_n
+def test_open_window_increments_window_n():
+    svc = _make_service()
+    initial = svc._window_n
     svc._open_window()
-    assert svc._state.window_n == initial + 1
+    assert svc._window_n == initial + 1
 
 
-def test_set_state_transitions(tmp_path):
-    svc = _make_service(tmp_path)
+def test_set_state_transitions():
+    svc = _make_service()
     for state in (WindowState.OPEN, WindowState.TRAINING,
                   WindowState.PUBLISHING, WindowState.READY):
         svc._set_state(state)
@@ -71,9 +67,9 @@ def test_set_state_transitions(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_train_and_publish_bumps_checkpoint_n(tmp_path):
-    svc = _make_service(tmp_path)
-    initial_checkpoint = svc._state.checkpoint_n
+async def test_train_and_publish_bumps_checkpoint_n():
+    svc = _make_service()
+    initial_checkpoint = svc._checkpoint_n
 
     # Open a window so there's an active batcher + seal_event to drive
     svc._open_window()
@@ -100,14 +96,14 @@ async def test_train_and_publish_bumps_checkpoint_n(tmp_path):
     finally:
         svc_mod.storage.upload_window_dataset = original_upload
 
-    assert svc._state.checkpoint_n == initial_checkpoint + 1
+    assert svc._checkpoint_n == initial_checkpoint + 1
     assert svc._current_window_state == WindowState.READY
     assert svc._active_batcher is None
     svc._checkpoint_store.publish.assert_awaited_once()
 
 
-def test_open_window_wires_checkpoint_hash_into_batcher(tmp_path):
-    svc = _make_service(tmp_path)
+def test_open_window_wires_checkpoint_hash_into_batcher():
+    svc = _make_service()
     from reliquary.validator.checkpoint import ManifestEntry
     svc._checkpoint_store = MagicMock()
     svc._checkpoint_store.current_manifest = MagicMock(return_value=ManifestEntry(
@@ -120,8 +116,8 @@ def test_open_window_wires_checkpoint_hash_into_batcher(tmp_path):
     assert svc._active_batcher.current_checkpoint_hash == "rev_sha_005"
 
 
-def test_open_window_empty_hash_pre_first_publish(tmp_path):
-    svc = _make_service(tmp_path)
+def test_open_window_empty_hash_pre_first_publish():
+    svc = _make_service()
     # No checkpoint published yet → current_manifest returns None
     svc._checkpoint_store = MagicMock()
     svc._checkpoint_store.current_manifest = MagicMock(return_value=None)
@@ -130,7 +126,7 @@ def test_open_window_empty_hash_pre_first_publish(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_publish_every_n_windows(tmp_path):
+async def test_publish_every_n_windows():
     """With _publish_every=3, publish is called only on windows 3 (first due to
     None manifest) then ... actually on windows 1 (first, manifest is None) and
     then next on window 3 (3 % 3 == 0). Verify: 5 _train_and_publish calls
@@ -138,7 +134,7 @@ async def test_publish_every_n_windows(tmp_path):
     import reliquary.validator.service as svc_mod
     from reliquary.validator.checkpoint import ManifestEntry
 
-    svc = _make_service(tmp_path)
+    svc = _make_service()
     svc._publish_every = 3
 
     # Start with no manifest so first call always publishes.

@@ -48,23 +48,20 @@ def _rollouts(k):
     ]
 
 
-def _make_service(tmp_path, checkpoint_hash="sha256:cp"):
-    """Construct a ValidationService with state paths in tmp_path and
-    a mocked checkpoint store (no HF) + training stub.
+def _make_service(checkpoint_hash="sha256:cp"):
+    """Construct a ValidationService with a mocked checkpoint store (no HF) +
+    training stub.
 
     Sets publish_every=1 so every window triggers a publish, keeping
     existing test assertions simple.
     """
     from reliquary.validator.service import ValidationService
-    from reliquary.validator.state_persistence import ValidatorState
     from reliquary.validator.checkpoint import ManifestEntry
 
     svc = ValidationService(
         wallet=_FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
         env=_FakeEnv(), netuid=99,
     )
-    svc._state_path = str(tmp_path / "state.json")
-    svc._state = ValidatorState(svc._state_path)
     # Publish on every window so counter tests stay simple.
     svc._publish_every = 1
 
@@ -125,34 +122,34 @@ def _patch_open_grpo_window(svc):
 
 
 @pytest.mark.asyncio
-async def test_one_window_lap_bumps_counters(tmp_path):
+async def test_one_window_lap_bumps_counters():
     """Open → manually fire seal_event → train_and_publish →
     window_n and checkpoint_n both bumped, state = READY."""
-    svc = _make_service(tmp_path)
+    svc = _make_service()
 
-    initial_wn = svc._state.window_n
-    initial_cn = svc._state.checkpoint_n
+    initial_wn = svc._window_n
+    initial_cn = svc._checkpoint_n
 
     with _patch_open_grpo_window(svc):
         svc._open_window()
     assert svc._current_window_state == WindowState.OPEN
-    assert svc._state.window_n == initial_wn + 1
+    assert svc._window_n == initial_wn + 1
 
     # Simulate the B-th valid submission arriving.
     svc._active_batcher.seal_event.set()
 
     await svc._train_and_publish()
 
-    assert svc._state.checkpoint_n == initial_cn + 1
+    assert svc._checkpoint_n == initial_cn + 1
     assert svc._current_window_state == WindowState.READY
     assert svc._active_batcher is None
     svc._checkpoint_store.publish.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_submission_with_matching_hash_accepted_during_open(tmp_path):
+async def test_submission_with_matching_hash_accepted_during_open():
     """Inject an 8-submission batch into an OPEN batcher; seal_event fires."""
-    svc = _make_service(tmp_path, checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash="sha256:cpA")
 
     # Open a window (hash wired to current_manifest by _open_window)
     with _patch_open_grpo_window(svc):
@@ -179,8 +176,8 @@ async def test_submission_with_matching_hash_accepted_during_open(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_submission_with_wrong_hash_rejected(tmp_path):
-    svc = _make_service(tmp_path, checkpoint_hash="sha256:cpA")
+async def test_submission_with_wrong_hash_rejected():
+    svc = _make_service(checkpoint_hash="sha256:cpA")
     with _patch_open_grpo_window(svc):
         svc._open_window()
     batcher = svc._active_batcher
@@ -199,9 +196,9 @@ async def test_submission_with_wrong_hash_rejected(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_timeout_partial_seal_path(tmp_path):
+async def test_timeout_partial_seal_path():
     """Window with only 3 valid submissions → seal_batch returns partial."""
-    svc = _make_service(tmp_path, checkpoint_hash="sha256:cpA")
+    svc = _make_service(checkpoint_hash="sha256:cpA")
     with _patch_open_grpo_window(svc):
         svc._open_window()
     batcher = svc._active_batcher
@@ -225,4 +222,4 @@ async def test_timeout_partial_seal_path(tmp_path):
     # the timeout path — run loop calls seal_batch regardless).
     await svc._train_and_publish()
     assert svc._current_window_state == WindowState.READY
-    assert svc._state.checkpoint_n == 1  # still bumped
+    assert svc._checkpoint_n == 1  # still bumped

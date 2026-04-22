@@ -1,4 +1,4 @@
-"""Regression: _rebuild_cooldown_from_history uses self._state.window_n,
+"""Regression: _rebuild_cooldown_from_history uses self._window_n,
 not a block-derived window. The archives on R2 are keyed by window_n
 since v2.1."""
 
@@ -27,7 +27,7 @@ class _FakeWallet:
 
 @pytest.mark.asyncio
 async def test_rebuild_uses_state_window_n_not_block_derived():
-    """Rebuild must call list_recent_datasets with state.window_n, not a
+    """Rebuild must call list_recent_datasets with _window_n + 1, not a
     block-derived value. Proves the bug fix holds."""
     from reliquary.validator.service import ValidationService
 
@@ -35,10 +35,10 @@ async def test_rebuild_uses_state_window_n_not_block_derived():
         wallet=_FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
         env=_FakeEnv(), netuid=99,
     )
-    svc._state.window_n = 42  # authoritative v2.1 counter
+    svc._window_n = 42  # authoritative v2.1 counter
 
     captured = {}
-    async def fake_list(hotkey, current_window, n):
+    async def fake_list(current_window, n):
         captured["current_window"] = current_window
         return []
 
@@ -48,4 +48,5 @@ async def test_rebuild_uses_state_window_n_not_block_derived():
     ):
         await svc._rebuild_cooldown_from_history()
 
-    assert captured["current_window"] == 42
+    # _rebuild passes current_window = _window_n + 1 to list_recent_datasets
+    assert captured["current_window"] == 43

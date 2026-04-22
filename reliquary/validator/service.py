@@ -12,7 +12,6 @@ from reliquary.constants import (
     BOOTSTRAP_WINDOWS,
     CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
     CHECKPOINT_STAGING_DIR_DEFAULT,
-    CHECKPOINT_STATE_PATH_DEFAULT,
     DEFAULT_HF_REPO_ID,
     POLL_INTERVAL_SECONDS,
     SUBNET_START_BLOCK,
@@ -29,7 +28,6 @@ from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
-from reliquary.validator.state_persistence import ValidatorState
 from reliquary.validator.training import train_step
 
 logger = logging.getLogger(__name__)
@@ -121,14 +119,11 @@ class ValidationService:
 
         self.server = ValidatorServer(host=http_host, port=http_port)
 
-        # v2.1 state machine infrastructure
-        self._state_path = CHECKPOINT_STATE_PATH_DEFAULT
-        self._state = ValidatorState(self._state_path)
-        self._state.load()
-        # Load EMA from persisted state (survives restarts).
-        self._miner_scores_ema: defaultdict[str, float] = defaultdict(
-            float, self._state.miner_scores_ema
-        )
+        # v2.1 state machine infrastructure — in-memory only, bootstrapped at
+        # startup from R2 + HF (no local JSON state file).
+        self._window_n: int = 0
+        self._checkpoint_n: int = 0
+        self._miner_scores_ema: defaultdict[str, float] = defaultdict(float)
         self._publish_every = CHECKPOINT_PUBLISH_INTERVAL_WINDOWS
         self._checkpoint_store = CheckpointStore(
             validator_hotkey=wallet.hotkey.ss58_address,
@@ -167,10 +162,6 @@ class ValidationService:
             hk: v for hk, v in self._miner_scores_ema.items() if v > 1e-6
         })
 
-        # Persist so the EMA survives restarts.
-        self._state.miner_scores_ema = dict(self._miner_scores_ema)
-        self._state.save()
-
     def _set_state(self, s: WindowState) -> None:
         self._current_window_state = s
         # Also notify the server so /state returns the right value.
@@ -183,18 +174,18 @@ class ValidationService:
     def _open_window(self) -> None:
         """Create a new GrpoWindowBatcher and mark state OPEN.
 
-        Increments ``self._state.window_n`` and wires the active
-        checkpoint hash into the batcher so miners on stale checkpoints
-        get WRONG_CHECKPOINT rejected before GRAIL compute.
+        Increments ``self._window_n`` and wires the active checkpoint hash
+        into the batcher so miners on stale checkpoints get WRONG_CHECKPOINT
+        rejected before GRAIL compute.
         """
-        self._state.window_n += 1
+        self._window_n += 1
         bootstrap = is_bootstrap_window(
-            window_start=self._state.window_n,
+            window_start=self._window_n,
             subnet_start=SUBNET_START_BLOCK,
         )
         self._active_batcher = open_grpo_window(
-            window_start=self._state.window_n,
-            current_round=self._state.window_n,  # placeholder; drand wiring later
+            window_start=self._window_n,
+            current_round=self._window_n,  # placeholder; drand wiring later
             env=self.env, model=self.model,
             cooldown_map=self._cooldown_map, tokenizer=self.tokenizer,
             bootstrap=bootstrap,
@@ -220,10 +211,10 @@ class ValidationService:
 
         self._set_state(WindowState.PUBLISHING)
         # checkpoint_n only advances on publish; use window_n for cadence.
-        next_n = self._state.checkpoint_n + 1
+        next_n = self._checkpoint_n + 1
         # Push to HF every N windows, or immediately if no checkpoint exists yet.
         should_publish = (
-            (self._state.window_n % self._publish_every == 0)
+            (self._window_n % self._publish_every == 0)
             or self._checkpoint_store.current_manifest() is None
         )
         if should_publish:
@@ -231,8 +222,7 @@ class ValidationService:
                 entry = await self._checkpoint_store.publish(
                     checkpoint_n=next_n, model=self.model,
                 )
-                self._state.checkpoint_n = next_n
-                self._state.save()
+                self._checkpoint_n = next_n
                 try:
                     self.server.set_current_checkpoint(entry)
                 except AttributeError:
@@ -246,7 +236,7 @@ class ValidationService:
         else:
             logger.info(
                 "Skipping HF publish for window_n=%d (publishing every %d)",
-                self._state.window_n, self._publish_every,
+                self._window_n, self._publish_every,
             )
 
         try:
@@ -282,18 +272,17 @@ class ValidationService:
 
         archive = {
             "window_start": batcher.window_start,
+            "validator_hotkey": self.wallet.hotkey.ss58_address,  # provenance
             "randomness": batcher.randomness,
             "environment": self.env.name,
             "batch": batch_entries,
         }
-        await storage.upload_window_dataset(
-            batcher.window_start, archive,
-            validator_hotkey=self.wallet.hotkey.ss58_address,
-        )
+        await storage.upload_window_dataset(batcher.window_start, archive)
 
     async def run(self, subtensor) -> None:
         await self.server.start()
         await self._serve_axon_on_chain(subtensor)
+        await self._bootstrap_state_from_external()
         await self._rebuild_cooldown_from_history()
         logger.info(
             "Validator started (v2.1): env=%s, netuid=%d, http=%s:%d",
@@ -310,18 +299,18 @@ class ValidationService:
                         )
                         logger.info(
                             "Window %d sealed (B valid received)",
-                            self._state.window_n,
+                            self._window_n,
                         )
                     except asyncio.TimeoutError:
                         logger.warning(
                             "Window %d timed out at %ds — sealing partial",
-                            self._state.window_n, WINDOW_TIMEOUT_SECONDS,
+                            self._window_n, WINDOW_TIMEOUT_SECONDS,
                         )
 
                     await self._train_and_publish()
 
                     # Weight cadence: every ROLLING_WINDOWS sealed windows.
-                    if self._state.window_n % ROLLING_WINDOWS == 0:
+                    if self._window_n % ROLLING_WINDOWS == 0:
                         submitted = await self._submit_weights(subtensor)
                         if not submitted:
                             logger.warning(
@@ -388,6 +377,66 @@ class ValidationService:
                 "serve_axon threw — miners will have to use --validator-url"
             )
 
+    async def _bootstrap_state_from_external(self) -> None:
+        """Derive window_n, checkpoint_n, and miner_scores_ema from R2 + HF.
+
+        Called once at startup before the main loop. Zero local state required.
+        """
+        # 1. window_n from R2 archive keys
+        try:
+            windows = await storage.list_all_window_keys()
+            if windows:
+                self._window_n = max(windows)
+                logger.info("Bootstrapped window_n=%d from R2", self._window_n)
+            else:
+                logger.info("No archives in R2 — starting from window_n=0")
+        except Exception:
+            logger.exception("Failed to bootstrap window_n from R2; starting at 0")
+
+        # 2. checkpoint_n from HF commit history
+        try:
+            from huggingface_hub import HfApi
+            repo_id = self._checkpoint_store.repo_id
+            api = HfApi()
+            commits = api.list_repo_commits(repo_id=repo_id)
+            ckpt_count = sum(1 for c in commits if c.title.startswith("checkpoint "))
+            self._checkpoint_n = ckpt_count
+            logger.info("Bootstrapped checkpoint_n=%d from HF", self._checkpoint_n)
+        except Exception:
+            logger.exception("Failed to bootstrap checkpoint_n from HF; starting at 0")
+
+        # 3. miner_scores_ema by replaying last K archives
+        try:
+            archives = await storage.list_recent_datasets(
+                current_window=self._window_n + 1,
+                n=ROLLING_WINDOWS * 3,  # enough for EMA half-life to converge
+            )
+            self._miner_scores_ema = self._replay_ema(archives)
+            logger.info(
+                "Bootstrapped EMA from %d archives, %d hotkeys tracked",
+                len(archives), len(self._miner_scores_ema),
+            )
+        except Exception:
+            logger.exception("Failed to bootstrap EMA from R2; starting empty")
+
+    def _replay_ema(self, archives: list[dict]) -> "defaultdict[str, float]":
+        """Deterministically derive EMA state from a list of archives."""
+        from reliquary.constants import EMA_ALPHA
+        ema: defaultdict[str, float] = defaultdict(float)
+        alpha = EMA_ALPHA
+        # Sort ascending by window_start to replay in order
+        for record in sorted(archives, key=lambda r: int(r["window_start"])):
+            window_contribs: dict[str, int] = defaultdict(int)
+            for entry in record.get("batch", []):
+                window_contribs[entry["hotkey"]] += 1
+            all_hotkeys = set(ema) | set(window_contribs)
+            for hk in all_hotkeys:
+                fraction = window_contribs.get(hk, 0) / B_BATCH
+                old = ema[hk]
+                ema[hk] = alpha * fraction + (1 - alpha) * old
+            ema = defaultdict(float, {hk: v for hk, v in ema.items() if v > 1e-6})
+        return ema
+
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, reconstruct CooldownMap from the last
         BATCH_PROMPT_COOLDOWN_WINDOWS archived windows on R2.
@@ -401,10 +450,9 @@ class ValidationService:
             current cooldown state without coordination
         """
         try:
-            current_window = self._state.window_n
+            current_window = self._window_n
             archives = await storage.list_recent_datasets(
-                hotkey=self.wallet.hotkey.ss58_address,
-                current_window=current_window,
+                current_window=current_window + 1,
                 n=BATCH_PROMPT_COOLDOWN_WINDOWS,
             )
             self._cooldown_map.rebuild_from_history(

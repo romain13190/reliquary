@@ -62,7 +62,7 @@ async def test_rebuild_cooldown_from_history_populates_map():
         {"window_start": 100, "batch": [{"prompt_idx": 42}]},
         {"window_start": 101, "batch": [{"prompt_idx": 7}]},
     ]
-    svc._state.window_n = 105  # v2.1 authoritative counter
+    svc._window_n = 105  # authoritative counter
 
     with patch(
         "reliquary.infrastructure.storage.list_recent_datasets",
@@ -79,7 +79,6 @@ def test_service_update_ema_for_sealed_batch():
     from collections import defaultdict
     from reliquary.protocol.submission import RolloutSubmission
     from reliquary.validator.service import ValidationService
-    from reliquary.validator.state_persistence import ValidatorState
     from reliquary.constants import EMA_ALPHA
 
     class FakeWallet:
@@ -102,19 +101,15 @@ def test_service_update_ema_for_sealed_batch():
     ]
 
     from unittest.mock import MagicMock
-    import tempfile, os
-    with tempfile.TemporaryDirectory() as tmp:
-        svc = ValidationService(
-            wallet=FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
-            env=MagicMock(), netuid=99,
-        )
-        state_path = os.path.join(tmp, "s.json")
-        svc._state = ValidatorState(state_path)
-        svc._miner_scores_ema = defaultdict(float)
+    svc = ValidationService(
+        wallet=FakeWallet(), model=MagicMock(), tokenizer=MagicMock(),
+        env=MagicMock(), netuid=99,
+    )
+    svc._miner_scores_ema = defaultdict(float)
 
-        svc._update_ema(batch)
+    svc._update_ema(batch)
 
-        # 5 miners each contributed 1/B_BATCH of the batch.
-        for i in range(5):
-            expected = EMA_ALPHA * (1.0 / B_BATCH)
-            assert abs(svc._miner_scores_ema[f"hk{i}"] - expected) < 1e-9
+    # 5 miners each contributed 1/B_BATCH of the batch.
+    for i in range(5):
+        expected = EMA_ALPHA * (1.0 / B_BATCH)
+        assert abs(svc._miner_scores_ema[f"hk{i}"] - expected) < 1e-9

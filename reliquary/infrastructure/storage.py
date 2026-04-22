@@ -197,24 +197,18 @@ async def upload_window_rollouts(
 async def upload_window_dataset(
     window_start: int,
     data: dict,
-    *,
-    validator_hotkey: str | None = None,
     **client_kwargs,
 ) -> bool:
-    """Upload the settled GRPO dataset (prompt + 32 completions + rewards) for a window.
+    """Upload archive to flat R2 path reliquary/dataset/window-<N>.json.gz.
 
     The output of this is the actual deliverable of the network: a stream of
     {prompt, completions, rewards} bundles ready to feed a training pipeline.
-    Stored under ``reliquary/dataset/<validator_hotkey>/window-{n}.json.gz``
-    when a hotkey is provided (the standard production path — each validator's
-    output is scoped under its own prefix so multiple validators can share a
-    bucket without clobbering), or ``reliquary/dataset/window-{n}.json.gz``
-    when no hotkey is given (legacy / single-validator shortcut).
+    The ``validator_hotkey`` is embedded in the archive body for provenance
+    (see ``_archive_window``). Paths are flat so any reader — trainer or
+    weight-only validator — can enumerate windows without knowing which
+    validator wrote them.
     """
-    if validator_hotkey:
-        key = f"reliquary/dataset/{validator_hotkey}/window-{window_start}.json.gz"
-    else:
-        key = f"reliquary/dataset/window-{window_start}.json.gz"
+    key = f"reliquary/dataset/window-{window_start}.json.gz"
     payload = json.dumps(data, separators=(",", ":")).encode()
     compressed = gzip.compress(payload)
     async with get_s3_client(**client_kwargs) as client:
@@ -228,19 +222,18 @@ async def upload_window_dataset(
 
 
 async def list_recent_datasets(
-    hotkey: str,
     current_window: int,
     n: int,
     **client_kwargs,
 ) -> list[dict]:
-    """Download the last *n* window datasets for *hotkey* in ascending order.
+    """Download last *n* window archives from the flat R2 prefix in ascending order.
 
     Returns a list of parsed archive payloads (the dicts written by
     ``upload_window_dataset``). Tries windows in ``[current_window - n,
     current_window)``; skips any that don't exist or fail to parse.
 
     Used by the validator at startup to reconstruct ``CooldownMap`` state
-    via ``CooldownMap.rebuild_from_history``.
+    and replay the EMA.
     """
     from botocore.exceptions import ClientError
 
@@ -249,7 +242,7 @@ async def list_recent_datasets(
 
     start = max(0, current_window - n)
     keys = [
-        (w, f"reliquary/dataset/{hotkey}/window-{w}.json.gz")
+        (w, f"reliquary/dataset/window-{w}.json.gz")
         for w in range(start, current_window)
     ]
 
@@ -273,6 +266,34 @@ async def list_recent_datasets(
             except Exception as e:
                 logger.warning("skip window %d: parse failed (%s)", window_start, e)
     return archives
+
+
+async def list_all_window_keys(**client_kwargs) -> list[int]:
+    """Paginate the flat dataset prefix and return all window_n ints present.
+
+    Used by validators at startup to derive ``window_n`` without local state.
+    Returns a sorted ascending list, empty if no archives exist.
+    """
+    import re
+    from botocore.exceptions import ClientError
+
+    bucket = client_kwargs.get("bucket_name") or os.getenv("R2_BUCKET_ID", "reliquary")
+    prefix = "reliquary/dataset/window-"
+    pattern = re.compile(r"reliquary/dataset/window-(\d+)\.json\.gz$")
+
+    windows: list[int] = []
+    async with get_s3_client(**client_kwargs) as client:
+        paginator = client.get_paginator("list_objects_v2")
+        try:
+            async for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                for obj in page.get("Contents", []) or []:
+                    m = pattern.match(obj["Key"])
+                    if m:
+                        windows.append(int(m.group(1)))
+        except ClientError:
+            logger.exception("list_all_window_keys failed")
+            return []
+    return sorted(windows)
 
 
 async def download_window_rollouts(

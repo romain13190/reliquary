@@ -39,7 +39,7 @@ The validator reads `HF_TOKEN` from the environment at startup. The default targ
 
 ## 3. R2 (or S3) setup
 
-The validator archives per-window rollout datasets to R2 at `reliquary/dataset/<validator_hotkey>/window-<N>.json.gz`. It also reads these archives at startup to reconstruct the prompt cooldown map.
+The validator archives per-window rollout datasets to R2 at `reliquary/dataset/window-<N>.json.gz` (flat layout — no hotkey prefix). The `validator_hotkey` is stored inside the archive JSON body for provenance. The validator reads these archives at startup to derive `window_n`, replay the EMA, and reconstruct the prompt cooldown map.
 
 Environment variables required on the validator host:
 
@@ -129,7 +129,24 @@ Full CLI flag reference:
 | `--external-port` | `0` (→ http-port) | Public port advertised on-chain |
 | `--use-drand` / `--no-use-drand` | `--use-drand` | Disable only for offline testing |
 
-## 7. Launch a miner
+## 7. Running a weight-only validator
+
+A weight-only validator reads archives from R2 and submits weights on-chain. It does not train, does not require a GPU, and does not write to HF. Operators who want to participate in consensus without the compute cost of training run this mode.
+
+Environment variables needed: `R2_*` (read access) and bittensor wallet setup. No `HF_TOKEN` required.
+
+```bash
+reliquary validate --no-train \
+    --wallet-name my_validator \
+    --hotkey default \
+    --netuid 81
+```
+
+The node polls the chain; every `WEIGHT_SUBMISSION_INTERVAL = 360` blocks it reads the last ~216 windows' archives from R2, replays the EMA, and sets weights on-chain. Multiple weight-only validators reading the same R2 bucket submit identical weights (deterministic EMA replay).
+
+**Note (v2.1):** There is a single trainer writing to R2. Multiple trainers in the same bucket would collide on archive keys. Multi-trainer consensus is v2.2 work.
+
+## 8. Launch a miner
 
 ```bash
 reliquary mine \
@@ -158,7 +175,7 @@ Full CLI flag reference:
 | `--validator-url` | *(auto-discovered)* | Override for local testing or when metagraph discovery fails |
 | `--use-drand` / `--no-use-drand` | `--use-drand` | Disable only for offline testing |
 
-## 8. First-run checklist
+## 9. First-run checklist
 
 Verify each of these before considering the deployment healthy:
 
@@ -171,19 +188,19 @@ Verify each of these before considering the deployment healthy:
 - [ ] Miner logs `Validator at http://... is on checkpoint N`
 - [ ] Miner logs `submitted window=N prompt=X accepted=True` at least once
 
-## 9. Operational concerns
+## 10. Operational concerns
 
 **HF repo bloat.** There is no automatic checkpoint GC. Each publish creates a new HF commit; old revisions accumulate. Plan periodic manual cleanup or a cron that deletes commits older than N days.
 
 **R2 bucket growth.** Every window archives roughly 1 MB compressed. Set a lifecycle rule in your R2 bucket to expire objects under `reliquary/dataset/` older than your retention target.
 
-**Validator restarts.** The optimizer (AdamW momentum) and LR scheduler step count are module-level singletons — they are not persisted across restarts. A restart resets warmup, causing a brief training instability. Minimize unnecessary restarts. The EMA scores and `window_n` / `checkpoint_n` counters _are_ persisted to `reliquary/state/checkpoint.json` and survive restarts cleanly.
+**Validator restarts.** The optimizer (AdamW momentum) and LR scheduler step count are module-level singletons — they are not persisted across restarts. A restart resets warmup, causing a brief training instability. Minimize unnecessary restarts. `window_n` is derived at startup from the maximum R2 archive window present; `checkpoint_n` from HF commit history; the EMA is replayed from the last ~216 R2 archives. No local state file required — loss of disk means no data loss.
 
 **Drand round (placeholder).** The `current_round` field in `/state` is currently a window counter, not a real drand beacon round. Miner and validator stay mutually consistent but external auditability via drand is limited until v2.2.
 
 **Serving the axon.** The `--external-ip` / `--external-port` flags cause the validator to call `bt.Axon.serve` at startup. If the hotkey is not registered or stake is too low for `validator_permit`, this call will fail with a logged error. Miners then cannot discover the validator from the metagraph and need `--validator-url`.
 
-## 10. Troubleshooting
+## 11. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|

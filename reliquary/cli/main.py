@@ -152,84 +152,108 @@ def mine(
 
 @app.command()
 def validate(
+    train: bool = typer.Option(
+        True,
+        "--train/--no-train",
+        help=(
+            "Run full trainer mode (default). "
+            "Pass --no-train for weight-only mode: reads R2 archives, "
+            "computes EMA, submits weights. No GPU, no HF, no HTTP server."
+        ),
+    ),
     use_drand: bool = typer.Option(True, help="Use drand for randomness"),
     network: str = typer.Option("finney", help="Bittensor network"),
     netuid: int = typer.Option(81, help="Subnet UID"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
     hotkey: str = typer.Option("default", help="Hotkey name"),
-    checkpoint: str = typer.Option(DEFAULT_BASE_MODEL, help="HF repo id or local path of the model to load"),
-    environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name"),
-    http_host: str = typer.Option("0.0.0.0", help="HTTP bind address"),
-    http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port"),
+    checkpoint: str = typer.Option(DEFAULT_BASE_MODEL, help="HF repo id or local path of the model to load (trainer mode only)"),
+    environment: str = typer.Option(ENVIRONMENT_NAME, help="Environment name (trainer mode only)"),
+    http_host: str = typer.Option("0.0.0.0", help="HTTP bind address (trainer mode only)"),
+    http_port: int = typer.Option(VALIDATOR_HTTP_PORT, help="HTTP listen port (trainer mode only)"),
     external_ip: str = typer.Option(
         "",
         help=(
             "Public IP this validator is reachable at. Published on-chain via "
             "serve_axon so miners can discover it through the metagraph. "
-            "Leave empty to skip publishing (miners then need --validator-url)."
+            "Leave empty to skip publishing (miners then need --validator-url). "
+            "Trainer mode only."
         ),
     ),
     external_port: int = typer.Option(
         0,
-        help="Public port to advertise on-chain; defaults to --http-port when 0.",
+        help="Public port to advertise on-chain; defaults to --http-port when 0. Trainer mode only.",
     ),
     hf_repo_id: str = typer.Option(
         DEFAULT_HF_REPO_ID,
-        help="HuggingFace repo ID to publish checkpoints to (must be writable with HF_TOKEN).",
+        help="HuggingFace repo ID to publish checkpoints to (must be writable with HF_TOKEN). Trainer mode only.",
     ),
     log_level: str = typer.Option("INFO", help="Log level"),
 ):
-    """Run Reliquary validator."""
+    """Run Reliquary validator (trainer mode by default; --no-train for weight-only)."""
     setup_logging(log_level)
     logger = logging.getLogger("reliquary.cli")
 
     os.environ["BT_NETWORK"] = network
     os.environ["NETUID"] = str(netuid)
 
-    logger.info(
-        "Starting Reliquary validator (network=%s, netuid=%d, env=%s, http=%s:%d)",
-        network, netuid, environment, http_host, http_port,
-    )
+    if train:
+        logger.info(
+            "Starting Reliquary validator [trainer] (network=%s, netuid=%d, env=%s, http=%s:%d)",
+            network, netuid, environment, http_host, http_port,
+        )
+    else:
+        logger.info(
+            "Starting Reliquary validator [weight-only] (network=%s, netuid=%d)",
+            network, netuid,
+        )
 
     async def _run():
         import bittensor as bt
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        from reliquary.constants import ATTN_IMPLEMENTATION
-        from reliquary.environment import load_environment
         from reliquary.infrastructure.chain import get_subtensor
-        from reliquary.validator.service import ValidationService
 
         wallet = bt.Wallet(name=wallet_name, hotkey=hotkey)
         subtensor = await get_subtensor()
 
-        logger.info("Loading model from %s...", checkpoint)
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        if train:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        model = AutoModelForCausalLM.from_pretrained(
-            checkpoint,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=ATTN_IMPLEMENTATION,
-        ).to("cuda:0").eval()
+            from reliquary.constants import ATTN_IMPLEMENTATION
+            from reliquary.environment import load_environment
+            from reliquary.validator.service import ValidationService
 
-        env = load_environment(environment)
-        service = ValidationService(
-            wallet,
-            model,
-            tokenizer,
-            env,
-            netuid,
-            use_drand=use_drand,
-            http_host=http_host,
-            http_port=http_port,
-            external_ip=external_ip or None,
-            external_port=(external_port or http_port) if external_ip else None,
-            hf_repo_id=hf_repo_id,
-        )
-        await service.run(subtensor)
+            logger.info("Loading model from %s...", checkpoint)
+            tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+            if tokenizer.pad_token_id is None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+
+            model = AutoModelForCausalLM.from_pretrained(
+                checkpoint,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=ATTN_IMPLEMENTATION,
+            ).to("cuda:0").eval()
+
+            env = load_environment(environment)
+            service = ValidationService(
+                wallet,
+                model,
+                tokenizer,
+                env,
+                netuid,
+                use_drand=use_drand,
+                http_host=http_host,
+                http_port=http_port,
+                external_ip=external_ip or None,
+                external_port=(external_port or http_port) if external_ip else None,
+                hf_repo_id=hf_repo_id,
+            )
+            await service.run(subtensor)
+        else:
+            from reliquary.validator.weight_only import WeightOnlyValidator
+
+            validator = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+            await validator.run(subtensor)
 
     asyncio.run(_run())
 

@@ -121,8 +121,6 @@ def _run_ema_windows(hotkey_counts_per_window: list[dict[str, int]]) -> defaultd
     """Simulate _update_ema over multiple windows; return final EMA dict."""
     from unittest.mock import MagicMock
     from reliquary.validator.service import ValidationService
-    from reliquary.validator.state_persistence import ValidatorState
-    import tempfile, os
 
     class _W:
         class _Hk:
@@ -131,24 +129,22 @@ def _run_ema_windows(hotkey_counts_per_window: list[dict[str, int]]) -> defaultd
             def sign(d): return b"sig"
         hotkey = _Hk()
 
-    with tempfile.TemporaryDirectory() as tmp:
-        svc = ValidationService(
-            wallet=_W(), model=MagicMock(), tokenizer=MagicMock(),
-            env=MagicMock(), netuid=99,
-        )
-        svc._state = ValidatorState(os.path.join(tmp, "s.json"))
-        svc._miner_scores_ema = defaultdict(float)
+    svc = ValidationService(
+        wallet=_W(), model=MagicMock(), tokenizer=MagicMock(),
+        env=MagicMock(), netuid=99,
+    )
+    svc._miner_scores_ema = defaultdict(float)
 
-        for counts in hotkey_counts_per_window:
-            batch = []
-            for hk, n in counts.items():
-                for _ in range(n):
-                    sub = MagicMock()
-                    sub.hotkey = hk
-                    batch.append(sub)
-            svc._update_ema(batch)
+    for counts in hotkey_counts_per_window:
+        batch = []
+        for hk, n in counts.items():
+            for _ in range(n):
+                sub = MagicMock()
+                sub.hotkey = hk
+                batch.append(sub)
+        svc._update_ema(batch)
 
-        return svc._miner_scores_ema
+    return svc._miner_scores_ema
 
 
 def test_weights_for_full_batch():

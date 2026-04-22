@@ -2,6 +2,15 @@
 
 Operational guide for running a validator on Bittensor subnet 81. For conceptual background see [docs/concepts.md](concepts.md). For a full bootstrap walkthrough see [docs/deployment.md](deployment.md).
 
+## Validator modes
+
+There are two validator modes:
+
+- **Trainer mode** (`reliquary validate --train`, the default) — runs the full state machine: accepts miner submissions, trains the model, publishes checkpoints to HF, archives rollout datasets to R2.
+- **Weight-only mode** (`reliquary validate --no-train`) — no GPU, no HTTP server, no HF writes. Reads R2 archives, replays the EMA, and submits weights on-chain every `WEIGHT_SUBMISSION_INTERVAL = 360` blocks. Any number of weight-only validators reading the same R2 bucket arrive at identical weights automatically (deterministic replay).
+
+The rest of this guide focuses on trainer mode. See [docs/deployment.md](deployment.md#7-running-a-weight-only-validator) for weight-only mode setup.
+
 ## What a validator does (v2.1)
 
 Windows are event-driven: a window seals the instant `B_BATCH = 8` valid distinct-prompt submissions land. There is no fixed per-window timer — only the `WINDOW_TIMEOUT_SECONDS = 600` safety net fires if fewer than 8 submissions arrive in time.
@@ -16,7 +25,7 @@ The validator runs a four-phase state machine per window:
 
 4. **`READY`** — manifest is live; `checkpoint_n` increments only on a successful HF publish. The service immediately transitions back to `OPEN` for the next window.
 
-Validator state (`window_n`, `checkpoint_n`, EMA scores) is persisted to `reliquary/state/checkpoint.json` and survives restarts.
+Validator state is stateless on disk. At startup, `window_n` is derived from the maximum R2 archive window; `checkpoint_n` from HF commit history; EMA scores are replayed from the last ~216 R2 archives. No local state file is required — a restart on a new machine loses no data.
 
 Every `WEIGHT_SUBMISSION_INTERVAL = 360` blocks (`ROLLING_WINDOWS = 72` windows at 5 blocks/window), the validator submits EMA-based weights on-chain. See [docs/concepts.md](concepts.md#ema-scoring) for the EMA calculation. Unused slots burn to `UID_BURN = 0`.
 
@@ -106,11 +115,12 @@ The signature covers `checkpoint_n || revision` encoded as `f"{checkpoint_n}|{re
 
 ### R2 archive format
 
-One gzipped JSON file per window at `reliquary/dataset/<validator_hotkey>/window-<N>.json.gz`:
+One gzipped JSON file per window at `reliquary/dataset/window-<N>.json.gz` (flat path, no hotkey prefix). The `validator_hotkey` field inside the JSON body records provenance:
 
 ```json
 {
   "window_start": 42,
+  "validator_hotkey": "5xxx...",
   "randomness": "...",
   "environment": "gsm8k",
   "batch": [
@@ -258,7 +268,7 @@ nvidia-smi
 # Tail validator logs.
 tail -f ~/validator.log
 
-# Check R2 archive uploads.
+# Check R2 archive uploads (flat layout, no hotkey prefix).
 aws s3 ls s3://reliquary/dataset/ \
     --endpoint-url https://<account>.r2.cloudflarestorage.com | tail -5
 ```
@@ -273,5 +283,5 @@ aws s3 ls s3://reliquary/dataset/ \
 - **Weights not submitted**: `set_weights` requires `validator_permit` and a non-trivial emission window. Check logs for `set_weights` attempts; failures are logged with the chain error string.
 - **Batches consistently under-full**: check per-rejection-reason counts in the logs. During bootstrap the wider zone and shorter cooldown mitigate this. If no batch seals before 600 s, the partial batch seals automatically.
 - **Window stuck in `TRAINING` / `PUBLISHING`**: check GPU availability (`nvidia-smi`) and HF/R2 connectivity. The state machine does not advance until the step completes.
-- **CooldownMap empty after restart with no R2**: if R2 is unavailable at startup the map starts empty. Miners may temporarily get `PROMPT_IN_COOLDOWN` gaps once the map repopulates over subsequent windows.
+- **CooldownMap empty after restart with no R2**: if R2 is unavailable at startup the map starts empty. Miners may temporarily get `PROMPT_IN_COOLDOWN` gaps once the map repopulates over subsequent windows. Similarly, `window_n` and EMA start at 0 if R2 is unreachable; weight submissions will be sparse until state rebuilds.
 - **Optimizer instability after restart**: expected for `LR_WARMUP_WINDOWS = 10` windows. AdamW momentum and the scheduler step count are not persisted; they reset on every restart.

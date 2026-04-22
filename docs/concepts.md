@@ -75,7 +75,7 @@ The EMA fixes this: after each window, every hotkey's score is updated as:
 score_new = α × (slots_won / B_BATCH) + (1 − α) × score_old
 ```
 
-where `α = EMA_ALPHA = 2 / (72 + 1) ≈ 0.027`. With `ROLLING_WINDOWS = 72`, this gives a ~25-window half-life. A miner that stops contributing loses half its score in ~25 windows. The EMA is persisted to `reliquary/state/checkpoint.json` and survives validator restarts.
+where `α = EMA_ALPHA = 2 / (72 + 1) ≈ 0.027`. With `ROLLING_WINDOWS = 72`, this gives a ~25-window half-life. A miner that stops contributing loses half its score in ~25 windows. The EMA is replayed from R2 archives at startup (no local state file) — loss of local disk does not lose scoring history.
 
 At each `set_weights` call the validator submits the current EMA values directly. The sum of all EMA scores is the smoothed fill rate; `burn = max(0, 1 − sum)` goes to `UID_BURN = 0`.
 
@@ -108,7 +108,7 @@ Suppose the network emits `E` TAO per epoch. You win an average of `s` batch slo
 (s / 8) / (sum of all miners' EMA scores)
 ```
 
-A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the epoch's filled-slot emissions. Actual numbers depend on miner count, fill rate, and network-wide emission parameters.
+A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the epoch's filled-slot emissions.
 
 ### What disqualifies a submission
 
@@ -144,11 +144,12 @@ A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the 
 
 ## Known limitations (v2.1)
 
-- **Single validator.** Only one validator is active per window. Multi-validator consensus (signed checkpoint agreement) is v2.2.
+- **Single trainer.** v2.1 assumes a single trainer writing to R2. Multiple trainers in the same bucket would collide on archive keys (`reliquary/dataset/window-<N>.json.gz`). Multi-trainer consensus is v2.2 work.
 - **Placeholder drand round.** `current_round` in `/state` is a window counter, not a real drand beacon round. Miner and validator stay consistent with each other but external auditability via drand is reduced. Real drand wiring is v2.2.
 - **Optimizer and scheduler state not persisted.** A validator restart resets AdamW momentum and the LR scheduler step count to zero. Training regresses for `LR_WARMUP_WINDOWS = 10` windows before stabilizing. Minimize restarts.
 - **No automatic HF checkpoint garbage collection.** Every publish creates a new HF commit. Old revisions accumulate. Plan manual or cron-based cleanup.
 - **No automatic R2 retention.** Every window archives ~1 MB compressed. Add a bucket lifecycle rule for archives older than your retention window.
+- **HF bootstrap auth.** `_bootstrap_state_from_external` calls `HfApi().list_repo_commits` to count published checkpoints. For private repos, `HF_TOKEN` must be set at startup. Public repos are readable without authentication but the call still hits the HF API rate limit (~500 req/hour for unauthenticated). Set `HF_TOKEN` anyway to avoid rate-limit failures on restart.
 
 ---
 

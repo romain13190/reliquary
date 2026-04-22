@@ -20,11 +20,10 @@ def _archive_bytes(window_start: int, prompt_ids: list[int]) -> bytes:
 
 @pytest.mark.asyncio
 async def test_downloads_last_n_windows():
-    hotkey = "5FHk"
     archives_on_r2 = {
-        f"reliquary/dataset/{hotkey}/window-100.json.gz": _archive_bytes(100, [1, 2]),
-        f"reliquary/dataset/{hotkey}/window-101.json.gz": _archive_bytes(101, [3]),
-        f"reliquary/dataset/{hotkey}/window-102.json.gz": _archive_bytes(102, [4]),
+        "reliquary/dataset/window-100.json.gz": _archive_bytes(100, [1, 2]),
+        "reliquary/dataset/window-101.json.gz": _archive_bytes(101, [3]),
+        "reliquary/dataset/window-102.json.gz": _archive_bytes(102, [4]),
     }
 
     async def fake_get_object(Bucket, Key):
@@ -42,7 +41,7 @@ async def test_downloads_last_n_windows():
 
     with patch("reliquary.infrastructure.storage.get_s3_client", return_value=mock_ctx):
         result = await list_recent_datasets(
-            hotkey=hotkey, current_window=103, n=3,
+            current_window=103, n=3,
         )
     assert len(result) == 3
     assert [a["window_start"] for a in result] == [100, 101, 102]
@@ -55,9 +54,9 @@ async def test_skips_missing_windows():
     from botocore.exceptions import ClientError
 
     archives_on_r2 = {
-        "reliquary/dataset/hk/window-100.json.gz": _archive_bytes(100, [1]),
+        "reliquary/dataset/window-100.json.gz": _archive_bytes(100, [1]),
         # window-101 is missing — simulate NoSuchKey
-        "reliquary/dataset/hk/window-102.json.gz": _archive_bytes(102, [2]),
+        "reliquary/dataset/window-102.json.gz": _archive_bytes(102, [2]),
     }
 
     async def fake_get_object(Bucket, Key):
@@ -78,21 +77,20 @@ async def test_skips_missing_windows():
 
     with patch("reliquary.infrastructure.storage.get_s3_client", return_value=mock_ctx):
         result = await list_recent_datasets(
-            hotkey="hk", current_window=103, n=3,
+            current_window=103, n=3,
         )
     assert [a["window_start"] for a in result] == [100, 102]
 
 
 @pytest.mark.asyncio
 async def test_zero_n_returns_empty():
-    result = await list_recent_datasets(hotkey="hk", current_window=100, n=0)
+    result = await list_recent_datasets(current_window=100, n=0)
     assert result == []
 
 
 @pytest.mark.asyncio
 async def test_current_window_smaller_than_n_caps_at_zero():
     """If current_window=5, n=50, we should only try windows [0, 5), not negative."""
-    archives_on_r2 = {}
 
     async def fake_get_object(Bucket, Key):
         from botocore.exceptions import ClientError
@@ -107,7 +105,5 @@ async def test_current_window_smaller_than_n_caps_at_zero():
     mock_ctx.__aexit__.return_value = None
 
     with patch("reliquary.infrastructure.storage.get_s3_client", return_value=mock_ctx):
-        result = await list_recent_datasets(hotkey="hk", current_window=5, n=50)
+        result = await list_recent_datasets(current_window=5, n=50)
     assert result == []
-
-
