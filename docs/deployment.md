@@ -122,7 +122,7 @@ Full CLI flag reference:
 |---|---|---|
 | `--checkpoint` | `Qwen/Qwen3-4B-Instruct-2507` | HF repo id or local path for the initial model load |
 | `--hf-repo-id` | `aivolutionedge/reliquary-sn` | HF repo to push trained checkpoints to |
-| `--environment` | `gsm8k` | Reward environment. Must match miners. |
+| `--environment` | `math` | Reward environment. Must match miners. |
 | `--http-host` | `0.0.0.0` | Bind address |
 | `--http-port` | `8888` | Listen port |
 | `--external-ip` | *(empty)* | Public IP advertised on-chain via axon |
@@ -155,7 +155,7 @@ reliquary mine \
     --netuid 81 \
     --network finney \
     --checkpoint Qwen/Qwen3-4B-Instruct-2507 \
-    --environment gsm8k
+    --environment math
 ```
 
 `--checkpoint` is the fallback if the validator has no published checkpoint yet. Once the validator publishes, the miner auto-detects the latest HF revision via `/state` and downloads it.
@@ -171,7 +171,7 @@ Full CLI flag reference:
 | Flag | Default | Notes |
 |---|---|---|
 | `--checkpoint` | *(required)* | Fallback model if validator has no checkpoint yet |
-| `--environment` | `gsm8k` | Must match the validator |
+| `--environment` | `math` | Must match the validator |
 | `--validator-url` | *(auto-discovered)* | Override for local testing or when metagraph discovery fails |
 | `--use-drand` / `--no-use-drand` | `--use-drand` | Disable only for offline testing |
 

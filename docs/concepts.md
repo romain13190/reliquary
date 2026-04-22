@@ -10,13 +10,7 @@ The catch: DAPO's filter is reactive. The system generates a rollout group, meas
 
 Reliquary turns this filter problem into a **prediction market**. Every training window, independent GPU miners bet their own compute on which prompt sits at the policy's learning frontier (high σ). The generate-then-discard cost is pushed outside the validator — miners who pick poorly burn their own rollouts; miners who pick well earn batch slots and emission. As the policy matures and the frontier narrows, the market becomes *more* valuable, not less — exactly the regime where DAPO's centralized filter pays the highest tax.
 
-**Expected outcome.** Match or exceed DAPO's 50%-training-step efficiency, with a widening edge as training progresses. Two structural levers push that way:
-
-1. **Ex-ante beats post-hoc.** A predictor that commits only to likely-in-zone prompts dominates a reactive discard-on-measurement filter on compute per gradient-rich group.
-
-2. **Stricter filter, same validator budget.** DAPO's Dynamic Sampling only discards the extremes (`k = 0` and `k = 8` correct out of 8) because a stricter filter would amplify its reactive-discard tax. Reliquary's `σ ≥ 0.43` also drops `k = 1` and `k = 7`, keeping only groups with `k ∈ {2, 3, 4, 5, 6}` — strictly tighter gradient density per training step than DAPO. The tightening is affordable because miners, not the validator, absorb the rejected-rollout cost. Bootstrap mode (`σ ≥ 0.33`) relaxes back to approximately DAPO's extremes-only criterion while the miner population is still warming up.
-
-Both levers compound as the policy strengthens. The claim is directional, not benchmarked.
+**Expected outcome.** Match or exceed DAPO's 50%-training-step efficiency, with a widening edge as training progresses. The structural argument is that an ex-ante predictor — miners committing compute only to prompts they believe are in-zone — dominates a reactive discard-on-measurement filter on compute per gradient-rich group. The claim is directional, not benchmarked.
 
 Two structural guarantees come with the market:
 
@@ -35,7 +29,7 @@ One full training window, step by step.
 Miners poll `GET /state` continuously. The response (`GrpoBatchState`) carries `state`, `window_n`, `checkpoint_n`, `checkpoint_repo_id`, `checkpoint_revision`, and `cooldown_prompts`. If `checkpoint_n` has advanced since the last poll, the miner downloads the new HF revision before doing anything else.
 
 **2. Miner picks a prompt.**
-The miner selects a `prompt_idx` from the environment (GSM8K, ~7 473 problems) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. This is a baseline: smarter miner-side selection — predicting which prompts will pass the zone filter for the current checkpoint — is expected and directly rewarded by FIFO (fewer `OUT_OF_ZONE` rejects → earlier `signed_round`). See [mining.md §Prompt selection strategy](mining.md#prompt-selection-strategy).
+The miner selects a `prompt_idx` from the environment (Hendrycks MATH, `qwedsacf/competition_math` mirror, ~12 500 problems, 5 difficulty levels, 7 subjects) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set. This is a baseline: smarter miner-side selection — predicting which prompts will pass the zone filter for the current checkpoint — is expected and directly rewarded by FIFO (fewer `OUT_OF_ZONE` rejects → earlier `signed_round`). See [mining.md §Prompt selection strategy](mining.md#prompt-selection-strategy).
 
 **3. Miner generates M=8 rollouts.**
 The miner runs exactly `M_ROLLOUTS = 8` completions at the protocol-fixed temperature `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. No cherry-picking — all eight go in the submission regardless of their rewards.
@@ -74,7 +68,7 @@ Because each rollout's sketch is bound to the specific token sequence and the mo
 
 `σ` is the population standard deviation of the eight rollout rewards in a group. A group with `σ < 0.43` carries essentially no gradient signal for GRPO: either every rollout succeeds (all advantages ≈ 0) or every rollout fails (same). Dropping these groups saves compute without losing learning.
 
-Binary equivalence note: for GSM8K's binary `{0, 1}` rewards, `σ = sqrt(p(1−p))` where `p = k/8`. `σ(p=2/8) ≈ 0.433`, so the `σ ≥ 0.43` gate is equivalent to "between 2 and 6 correct out of 8". The σ formulation is preferred because it is reward-scale-agnostic — the same threshold works for continuous partial-credit environments without any validator changes.
+Binary equivalence note: MATH rewards are binary `{0, 1}` (the validator extracts the final `\boxed{...}` answer and compares after conservative LaTeX normalization — `\dfrac` → `\frac`, strip `\left`/`\right`, drop `\text{}`, collapse whitespace). With binary rewards, `σ = sqrt(p(1−p))` where `p = k/8`. `σ(p=2/8) ≈ 0.433`, so the `σ ≥ 0.43` gate is equivalent to "between 2 and 6 correct out of 8". The σ formulation is preferred because it is reward-scale-agnostic — the same threshold works for continuous partial-credit environments without any validator changes.
 
 Bootstrap phase (`BOOTSTRAP_WINDOWS = 100` windows from `SUBNET_START_BLOCK`): threshold relaxes to `σ ≥ 0.33` (binary equivalent: k ∈ [1, 7]) to keep batches filling while miner population and env coverage are thin.
 

@@ -122,7 +122,7 @@ One gzipped JSON file per window at `reliquary/dataset/window-<N>.json.gz` (flat
   "window_start": 42,
   "validator_hotkey": "5xxx...",
   "randomness": "...",
-  "environment": "gsm8k",
+  "environment": "math",
   "batch": [
     {
       "hotkey": "5xxx...",
@@ -215,7 +215,7 @@ CLI flags:
 |---|---|---|
 | `--checkpoint` | `Qwen/Qwen3-4B-Instruct-2507` | HF repo id or local path for initial model load |
 | `--hf-repo-id` | `aivolutionedge/reliquary-sn` | HF repo to push trained checkpoints to |
-| `--environment` | `gsm8k` | Must match what miners are running |
+| `--environment` | `math` | Must match what miners are running |
 | `--http-host` | `0.0.0.0` | Bind address |
 | `--http-port` | `8888` | Listen port; must be reachable by miners |
 | `--external-ip` | *(empty)* | Public IP to advertise on-chain; leave empty if using `--validator-url` on miners |
@@ -225,11 +225,11 @@ CLI flags:
 ## What you should see
 
 ```
-... | Starting Reliquary validator (network=finney, netuid=81, env=gsm8k, http=0.0.0.0:8888)
+... | Starting Reliquary validator (network=finney, netuid=81, env=math, http=0.0.0.0:8888)
 ... | Loading model from Qwen/Qwen3-4B-Instruct-2507...
 ... | Validator HTTP server listening on 0.0.0.0:8888
 ... | Rebuilt cooldown from 0 archive windows (current=0, map size=0)
-... | Validator started (v2.1): env=gsm8k, netuid=81, http=0.0.0.0:8888
+... | Validator started (v2.1): env=math, netuid=81, http=0.0.0.0:8888
 ... | accepted prompt=4821 hotkey=5xxx...
 ... | Window 1 sealed (B valid received)
 ... | State → TRAINING (window=1)

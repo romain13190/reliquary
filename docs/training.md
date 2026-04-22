@@ -38,7 +38,7 @@ See `reliquary/constants.py`:
 
 Only groups that pass the zone filter reach `train_step`. The validator computes the population standard deviation σ of the 8 rollout rewards. Groups with `σ < 0.43` (steady state) or `σ < 0.33` (bootstrap, first `BOOTSTRAP_WINDOWS = 100` windows) are rejected before training with `OUT_OF_ZONE`. Groups with σ = 0 produce all-zero advantages and are skipped inside `train_step` as degenerate.
 
-Binary equivalence: for GSM8K's `{0, 1}` rewards, σ = sqrt(p(1-p)) where p = k/8. `σ ≥ 0.43` is equivalent to k ∈ [2, 6] correct out of 8.
+Binary equivalence: MATH rewards are binary `{0, 1}` (answer extracted from `\boxed{...}` and compared after conservative LaTeX normalization). With binary rewards, σ = sqrt(p(1-p)) where p = k/8. `σ ≥ 0.43` is equivalent to k ∈ [2, 6] correct out of 8.
 
 ## Known gaps (v2.1)
 

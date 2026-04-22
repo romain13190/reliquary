@@ -26,7 +26,7 @@ Every miner runs a continuous poll-submit loop:
    - If `state != "open"`, the validator is in `TRAINING` or `PUBLISHING`. Sleep briefly (1 s) and re-poll. Do not submit while the window is not open.
    - If `checkpoint_n` advanced since the last poll, download the new HF revision and reload weights.
 
-2. **Picks a prompt.** Selects a `prompt_idx` from the GSM8K environment (~7 473 problems) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set.
+2. **Picks a prompt.** Selects a `prompt_idx` from the Hendrycks MATH environment (`qwedsacf/competition_math` mirror, ~12 500 problems, 5 difficulty levels, 7 subjects) that is not in `cooldown_prompts`. The reference engine uses uniform-random sampling with rejection against the cooldown set.
 
 3. **Generates M=8 rollouts.** Runs exactly 8 completions at the protocol-fixed `T_PROTO = 0.9`, `top_p = 1.0`, `top_k = 0`. No cherry-picking — all eight go in the submission.
 
@@ -67,7 +67,7 @@ The goal is to locate the *learning frontier* — prompts where the current poli
 
 The validator computes the population standard deviation σ of your 8 rollout rewards. `σ ≥ 0.43` passes; `σ < 0.43` is rejected with `OUT_OF_ZONE`. During bootstrap (first `BOOTSTRAP_WINDOWS = 100` windows) the threshold is `σ ≥ 0.33`.
 
-For binary GSM8K rewards `{0, 1}` this is mathematically equivalent to having between 2 and 6 correct out of 8. The σ formulation works for continuous reward environments too, without any validator changes. See [docs/concepts.md](concepts.md#zone-filter-σ--043----only-train-on-learnable-prompts) for the full explanation.
+For MATH's binary `{0, 1}` rewards (answer extracted from `\boxed{...}` and compared after conservative LaTeX normalization) this is mathematically equivalent to having between 2 and 6 correct out of 8. The σ formulation works for continuous reward environments too, without any validator changes. See [docs/concepts.md](concepts.md#zone-filter-σ--043----only-train-on-learnable-prompts) for the full explanation.
 
 You cannot cherry-pick an easy prompt (8/8 correct → σ ≈ 0) or fail on a hard prompt (0/8 correct → σ ≈ 0). Both extremes are worthless for GRPO training.
 
@@ -177,7 +177,7 @@ Additional flags:
 
 | Flag | Default | When to use it |
 |---|---|---|
-| `--environment` | `gsm8k` | Pinned by the protocol; do not change unless the subnet announces a migration. |
+| `--environment` | `math` | Pinned by the protocol; do not change unless the subnet announces a migration. |
 | `--use-drand` / `--no-use-drand` | `--use-drand` | Turn off only for offline testing. Mainnet always uses drand. |
 | `--validator-url` | *(auto-discovered)* | **Required during the subnet-launch phase** (see note above) and for local testing, e.g. `http://127.0.0.1:8888`. Once the owner validator (`5CXzFHfeiJ4Xkiirq4ej1MrRVCd789wEJXhpf2ZKRW6MNFJF`) holds `validator_permit`, leave empty and the miner will discover it from the metagraph. |
 
@@ -193,7 +193,7 @@ Environment variables:
 On a healthy startup:
 
 ```
-... | Starting Reliquary miner (network=finney, netuid=81, env=gsm8k)
+... | Starting Reliquary miner (network=finney, netuid=81, env=math)
 ... | Validator at http://x.x.x.x:8888 is on checkpoint 7 (your-org/reliquary-sn@abc123def...)
 ... | Downloading to seed the miner model.
 ... | Loading models from /home/.../.cache/huggingface/...
