@@ -263,3 +263,28 @@ async def test_resume_from_load_failure_aborts():
         )
         with pytest.raises(RuntimeError, match="corrupt checkpoint"):
             await svc._apply_resume_from()
+
+
+def test_weight_submission_gate_is_block_based():
+    """set_weights must fire every WEIGHT_SUBMISSION_INTERVAL on-chain blocks,
+    not every N windows. v2.1 windows are event-driven so a window-count gate
+    (old behaviour) drifts by factor ~20× vs the protocol-intended cadence.
+    """
+    from reliquary.constants import WEIGHT_SUBMISSION_INTERVAL
+
+    svc = _make_service()
+    # Boot anchor: simulate the startup write in run().
+    svc._last_weight_block = 1_000_000
+
+    # One block elapsed → not yet.
+    cb = 1_000_000 + 1
+    assert (cb - svc._last_weight_block) < WEIGHT_SUBMISSION_INTERVAL
+
+    # Exactly WEIGHT_SUBMISSION_INTERVAL blocks elapsed → submit fires.
+    cb = 1_000_000 + WEIGHT_SUBMISSION_INTERVAL
+    assert (cb - svc._last_weight_block) >= WEIGHT_SUBMISSION_INTERVAL
+
+    # Another full interval → still fires (regular cadence).
+    svc._last_weight_block = cb
+    cb2 = cb + WEIGHT_SUBMISSION_INTERVAL
+    assert (cb2 - svc._last_weight_block) >= WEIGHT_SUBMISSION_INTERVAL

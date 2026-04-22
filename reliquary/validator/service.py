@@ -159,6 +159,10 @@ class ValidationService:
 
         self._last_processed_window: int = -1
         self._windows_in_interval: int = 0
+        # Last on-chain block at which we successfully submitted weights.
+        # The next submit fires when current_block - this >= WEIGHT_SUBMISSION_INTERVAL.
+        # Bootstrapped to the current block at startup so we don't submit on boot.
+        self._last_weight_block: int = 0
         self._cooldown_map = CooldownMap(
             cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
         )
@@ -416,6 +420,15 @@ class ValidationService:
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
         await self._rebuild_cooldown_from_history()
+        # Anchor the weight-submission cadence at the current chain block so
+        # a restart doesn't trigger a submit on the first iteration.
+        try:
+            self._last_weight_block = await chain.get_current_block(subtensor)
+        except Exception:
+            logger.exception(
+                "Could not read current block at boot; _last_weight_block stays 0 "
+                "(will submit on the first iteration)"
+            )
         logger.info(
             "Validator started (v2.1): env=%s, netuid=%d, http=%s:%d",
             self.env.name, self.netuid, self.server.host, self.server.port,
@@ -442,10 +455,17 @@ class ValidationService:
 
                     await self._train_and_publish()
 
-                    # Weight cadence: every ROLLING_WINDOWS sealed windows.
-                    if self._window_n % ROLLING_WINDOWS == 0:
+                    # Weight cadence: every WEIGHT_SUBMISSION_INTERVAL on-chain
+                    # blocks. We cannot key off window count because v2.1 windows
+                    # are event-driven — a full window can take 20+ min = 100+
+                    # blocks, so "every 72 windows" would fire every ~24 h instead
+                    # of the protocol-intended ~72 min.
+                    current_block = await chain.get_current_block(subtensor)
+                    if current_block - self._last_weight_block >= WEIGHT_SUBMISSION_INTERVAL:
                         submitted = await self._submit_weights(subtensor)
-                        if not submitted:
+                        if submitted:
+                            self._last_weight_block = current_block
+                        else:
                             logger.warning(
                                 "set_weights did not succeed — EMA unchanged for next retry"
                             )
