@@ -81,9 +81,17 @@ def log_training_step(metrics: dict, step: int | None) -> None:
 
 def finish() -> None:
     """Close the wandb run. No-op if disabled. Fail-soft."""
+    global _run, _enabled
     if not _enabled:
         return
-    # Active path added in later task.
+    try:
+        import wandb
+        wandb.finish()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("wandb: finish failed (%s)", e)
+    finally:
+        _run = None
+        _enabled = False
 
 
 def _reset_for_tests() -> None:

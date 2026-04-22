@@ -183,3 +183,26 @@ def test_log_training_step_fail_soft_on_log_exception(monkeypatch, caplog):
 
     warnings = [rec for rec in caplog.records if "log failed" in rec.message]
     assert len(warnings) == 1  # second failure is suppressed
+
+
+def test_finish_calls_wandb_finish_when_active(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+    telemetry.finish()
+
+    fake_wandb.finish.assert_called_once()
+    assert telemetry.is_active() is False  # state cleared
+
+
+def test_finish_fail_soft_on_exception(monkeypatch):
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    fake_wandb.finish.side_effect = RuntimeError("boom")
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+    telemetry.finish()  # must not raise
+    assert telemetry.is_active() is False
