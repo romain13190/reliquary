@@ -239,3 +239,14 @@ LR_COSINE_MAX_WINDOWS = 10_000
 # Default base model (HF repo id). Served as the reference for KL and the
 # cold-start checkpoint.
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+
+# ────────────────  WANDB TELEMETRY (opt-in, validator-only)  ────────────────
+
+# Wandb project name used by validator-side telemetry. Operators can
+# override with the WANDB_PROJECT env var.
+WANDB_PROJECT = "reliquary-validator"
+
+# Bumping this constant (or setting RELIQUARY_WANDB_VERSION) starts a
+# fresh wandb run. Same value across restarts → wandb resumes the
+# existing run (resume="allow").
+WANDB_TRAINING_VERSION = "v1"

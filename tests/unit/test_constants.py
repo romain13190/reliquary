@@ -26,3 +26,8 @@ def test_v2_cooldown_values():
 def test_v2_bootstrap_sigma_lower_than_steady():
     # Bootstrap accepts groups with lower σ (σ ≥ 0.33) vs steady (σ ≥ 0.43)
     assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
+
+
+def test_wandb_constants_present():
+    assert C.WANDB_PROJECT == "reliquary-validator"
+    assert C.WANDB_TRAINING_VERSION == "v1"
