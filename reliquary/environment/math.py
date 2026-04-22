@@ -51,3 +51,39 @@ def _strip_boxed_wrapper(s: str) -> str:
         if s.startswith(prefix) and s.endswith("}"):
             return s[len(prefix) : -1]
     return s
+
+
+# ---------------------------------------------------------------------------
+# Answer normalization — conservative LaTeX simplification for comparison
+# ---------------------------------------------------------------------------
+
+_TEXT_RE = re.compile(r"\\text\{([^}]*)\}")
+_MBOX_RE = re.compile(r"\\mbox\{([^}]*)\}")
+
+
+def _normalize_answer(s: str) -> str:
+    """Conservative LaTeX normalization for equality comparison.
+
+    Intentionally string-level only (no CAS): the rules below cover the
+    transforms that actually occur in Hendrycks MATH ground truths without
+    changing the meaning of the expression.
+    """
+    if s is None:
+        return ""
+    # Drop LaTeX spacing macros first so downstream rules see clean text.
+    for macro in (r"\!", r"\,", r"\ ", r"\;", r"\:"):
+        s = s.replace(macro, "")
+    # Drop \left / \right size modifiers — they're presentational.
+    s = s.replace(r"\left", "").replace(r"\right", "")
+    # Canonicalize fraction macros.
+    s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    # Strip \text{...} and \mbox{...} wrappers (keep inner content).
+    s = _TEXT_RE.sub(r"\1", s)
+    s = _MBOX_RE.sub(r"\1", s)
+    # Strip math-mode delimiters.
+    s = s.replace(r"\$", "").replace("$", "")
+    # Strip trailing period / whitespace.
+    s = s.strip().rstrip(".").strip()
+    # Collapse whitespace (MATH answers should be whitespace-insensitive).
+    s = re.sub(r"\s+", "", s)
+    return s
