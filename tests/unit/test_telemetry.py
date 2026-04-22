@@ -164,3 +164,22 @@ def test_log_training_step_accepts_none_step(monkeypatch):
     telemetry.log_training_step({"x": 1}, step=None)
 
     fake_wandb.log.assert_called_once_with({"x": 1}, step=None)
+
+
+def test_log_training_step_fail_soft_on_log_exception(monkeypatch, caplog):
+    """If wandb.log raises, the call returns silently (first warning
+    only) — the validator must keep training."""
+    import logging as _logging
+    monkeypatch.setenv("WANDB_API_KEY", "fake-key")
+    fake_wandb = MagicMock()
+    fake_wandb.log.side_effect = RuntimeError("network down")
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+
+    telemetry.init(hotkey_ss58="5abc" + "0" * 44, config={})
+
+    caplog.set_level(_logging.WARNING, logger="reliquary.validator.telemetry")
+    telemetry.log_training_step({"x": 1}, step=1)  # must not raise
+    telemetry.log_training_step({"x": 2}, step=2)  # must not raise
+
+    warnings = [rec for rec in caplog.records if "log failed" in rec.message]
+    assert len(warnings) == 1  # second failure is suppressed
