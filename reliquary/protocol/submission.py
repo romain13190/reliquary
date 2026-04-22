@@ -72,7 +72,10 @@ class BatchSubmissionRequest(BaseModel):
     signed_round: int = Field(..., ge=0)
     merkle_root: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
     rollouts: list[RolloutSubmission]
-    checkpoint_hash: str = Field(..., min_length=1)
+    # Empty string is allowed as a bootstrap sentinel: before the validator
+    # publishes its first checkpoint (checkpoint_n=0, revision=None) miners
+    # have no hash to cite. The batcher disables the gate in that case.
+    checkpoint_hash: str = Field(..., min_length=0)
 
     @field_validator("rollouts")
     @classmethod
