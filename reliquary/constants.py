@@ -197,7 +197,7 @@ SUBNET_START_BLOCK = 0
 # Safety-net timeout: a window auto-seals after this many seconds even
 # if fewer than B valid submissions have landed. The unused slots burn.
 # Set generously — this is a backstop, not the cadence.
-WINDOW_TIMEOUT_SECONDS = 600
+WINDOW_TIMEOUT_SECONDS = 1800
 
 # Local JSON path for validator state (window_n counter + checkpoint_n).
 # Resolved relative to the CWD if not absolute.
