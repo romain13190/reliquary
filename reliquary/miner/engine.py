@@ -20,6 +20,8 @@ from reliquary.constants import (
     MAX_NEW_TOKENS_PROTOCOL_CAP,
     M_ROLLOUTS,
     T_PROTO,
+    TOP_K_PROTO,
+    TOP_P_PROTO,
     UPLOAD_BUFFER,
     WINDOW_LENGTH,
 )
@@ -359,7 +361,18 @@ class MiningEngine:
         return self.hf_model
 
     def _generate_m_rollouts(self, problem, randomness) -> list[dict]:
-        """Generate M_ROLLOUTS completions at T_PROTO. No cherry-picking."""
+        """Generate M_ROLLOUTS completions at T_PROTO in one batched call.
+
+        One .generate() with batch shape (M_ROLLOUTS, prompt_len) is ~5-7×
+        faster on GPU than M_ROLLOUTS serial calls — the matmul tiling
+        utilizes far more of the GPU's compute. Each row samples
+        independently (do_sample=True), so GRPO-group semantics are
+        preserved. Each output row is truncated at its first post-prompt
+        EOS so trailing batch-padding (which HF pads with pad_token_id =
+        eos_token_id) is not carried downstream — otherwise the validator's
+        GRAIL forward pass would see extra EOS tokens the miner didn't
+        "generate" in the usual sense.
+        """
         import torch
 
         prompt_tokens = self.tokenizer.encode(
@@ -367,22 +380,32 @@ class MiningEngine:
         )
         prompt_length = len(prompt_tokens)
 
+        with torch.no_grad():
+            input_tensor = torch.tensor(
+                [prompt_tokens] * M_ROLLOUTS,
+                device=getattr(self.vllm_model, "device", "cpu"),
+            )
+            outputs = self.vllm_model.generate(
+                input_tensor,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=True,
+                temperature=T_PROTO,
+                top_p=TOP_P_PROTO,
+                top_k=TOP_K_PROTO,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+        eos = self.tokenizer.eos_token_id
         rollouts = []
-        for _ in range(M_ROLLOUTS):
-            with torch.no_grad():
-                input_tensor = torch.tensor(
-                    [prompt_tokens],
-                    device=getattr(self.vllm_model, "device", "cpu"),
-                )
-                outputs = self.vllm_model.generate(
-                    input_tensor,
-                    max_new_tokens=self.max_new_tokens,
-                    do_sample=True,
-                    temperature=T_PROTO,
-                )
-            all_tokens = outputs[0].tolist()
+        for i in range(M_ROLLOUTS):
+            seq = outputs[i].tolist()
+            gen = seq[prompt_length:]
+            try:
+                first_eos = gen.index(eos)
+                gen = gen[: first_eos + 1]
+            except ValueError:
+                pass
             rollouts.append({
-                "tokens": all_tokens,
+                "tokens": prompt_tokens + gen,
                 "prompt_length": prompt_length,
             })
         return rollouts
