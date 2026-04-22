@@ -46,3 +46,84 @@ def test_parse_rejects_empty_path():
     from reliquary.validator.resume import parse_resume_source
     with pytest.raises(ValueError, match="path is empty"):
         parse_resume_source("path:")
+
+
+from unittest.mock import MagicMock
+
+
+def test_resolve_sha_downloads_and_extracts_n():
+    """SHA mode: snapshot_download is called with the right args, and the
+    checkpoint_n is parsed from the commit title."""
+    from reliquary.validator.resume import (
+        ShaSource, resolve_resume_source,
+    )
+
+    calls = {}
+
+    def fake_download(repo_id, revision, **kwargs):
+        calls["repo_id"] = repo_id
+        calls["revision"] = revision
+        return "/tmp/fake-hf-cache/snapshots/" + revision
+
+    def fake_commit_title(repo_id, revision):
+        calls["title_query"] = (repo_id, revision)
+        return "checkpoint 7"
+
+    local_path, checkpoint_n = resolve_resume_source(
+        source=ShaSource(sha="a" * 40),
+        hf_repo_id="myorg/repo",
+        download_fn=fake_download,
+        commit_title_fn=fake_commit_title,
+    )
+    assert checkpoint_n == 7
+    assert local_path == "/tmp/fake-hf-cache/snapshots/" + "a" * 40
+    assert calls["repo_id"] == "myorg/repo"
+    assert calls["revision"] == "a" * 40
+
+
+def test_resolve_sha_rejects_unparseable_title():
+    """If the commit title isn't 'checkpoint N', refuse (don't silently
+    pick a wrong N)."""
+    from reliquary.validator.resume import (
+        ShaSource, resolve_resume_source,
+    )
+
+    with pytest.raises(ValueError, match="could not parse"):
+        resolve_resume_source(
+            source=ShaSource(sha="b" * 40),
+            hf_repo_id="myorg/repo",
+            download_fn=lambda **kw: "/x",
+            commit_title_fn=lambda **kw: "some random commit",
+        )
+
+
+def test_resolve_path_uses_dir_as_is(tmp_path):
+    """path mode: the provided directory is returned verbatim; checkpoint_n
+    is extracted from ``ckpt_<N>`` in the trailing component."""
+    from reliquary.validator.resume import (
+        PathSource, resolve_resume_source,
+    )
+
+    target = tmp_path / "ckpt_12"
+    target.mkdir()
+    local_path, checkpoint_n = resolve_resume_source(
+        source=PathSource(path=str(target)),
+        hf_repo_id="unused",
+    )
+    assert local_path == str(target)
+    assert checkpoint_n == 12
+
+
+def test_resolve_path_rejects_unparseable_dir(tmp_path):
+    """path mode without ``ckpt_N`` → ValueError. Operators must name the
+    directory so the checkpoint number is unambiguous."""
+    from reliquary.validator.resume import (
+        PathSource, resolve_resume_source,
+    )
+    target = tmp_path / "random_name"
+    target.mkdir()
+    with pytest.raises(ValueError, match="could not derive checkpoint_n"):
+        resolve_resume_source(
+            source=PathSource(path=str(target)),
+            hf_repo_id="unused",
+        )

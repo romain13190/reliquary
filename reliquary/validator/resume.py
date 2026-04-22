@@ -51,3 +51,51 @@ def parse_resume_source(raw: str) -> ShaSource | PathSource:
         f"resume source {raw!r}: unknown scheme {scheme!r} "
         "(expected 'sha' or 'path')"
     )
+
+
+import re as _re
+from pathlib import Path
+from typing import Callable, Optional
+
+
+_CKPT_TITLE = _re.compile(r"^checkpoint\s+(\d+)\s*$", _re.IGNORECASE)
+_CKPT_DIRNAME = _re.compile(r"^ckpt_(\d+)$")
+
+
+def resolve_resume_source(
+    source: ShaSource | PathSource,
+    hf_repo_id: str,
+    *,
+    download_fn: Optional[Callable[..., str]] = None,
+    commit_title_fn: Optional[Callable[..., str]] = None,
+) -> tuple[str, int]:
+    """Resolve a parsed source to ``(local_path, checkpoint_n)``.
+
+    ``download_fn`` / ``commit_title_fn`` are injected for testing; the
+    real callers pass the HuggingFace Hub equivalents.
+    """
+    if isinstance(source, PathSource):
+        dirname = Path(source.path).name
+        m = _CKPT_DIRNAME.match(dirname)
+        if not m:
+            raise ValueError(
+                f"resume path {source.path!r}: could not derive "
+                "checkpoint_n from trailing component — expected 'ckpt_<N>'"
+            )
+        return source.path, int(m.group(1))
+
+    # SHA path.
+    if download_fn is None or commit_title_fn is None:
+        raise RuntimeError(
+            "resolve_resume_source(sha): download_fn and commit_title_fn "
+            "are required for SHA mode"
+        )
+    title = commit_title_fn(repo_id=hf_repo_id, revision=source.sha)
+    m = _CKPT_TITLE.match(title or "")
+    if not m:
+        raise ValueError(
+            f"resume sha:{source.sha}: could not parse checkpoint_n from "
+            f"commit title {title!r} (expected 'checkpoint N')"
+        )
+    local_path = download_fn(repo_id=hf_repo_id, revision=source.sha)
+    return local_path, int(m.group(1))
