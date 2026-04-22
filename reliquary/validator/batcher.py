@@ -30,7 +30,7 @@ from reliquary.validator.batch_selection import select_batch
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.verifier import (
     is_in_zone,
-    rewards_to_k,
+    rewards_std,
     verify_reward_claim,
 )
 
@@ -52,7 +52,7 @@ class ValidSubmission:
     signed_round: int
     merkle_root_bytes: bytes
     merkle_root: bytes = field(init=False)  # alias for select_batch Protocol
-    k: int = 0
+    sigma: float = 0.0
     rollouts: list[RolloutSubmission] = field(default_factory=list)
     completion_texts: list[str] = field(default_factory=list)
     arrived_at: float = 0.0
@@ -166,8 +166,8 @@ class GrpoWindowBatcher:
             if not verify_reward_claim(self.env, problem, text, rollout.reward):
                 return self._reject(RejectReason.REWARD_MISMATCH)
 
-        k = rewards_to_k([r.reward for r in request.rollouts])
-        if not is_in_zone(k, bootstrap=self.bootstrap):
+        sigma = rewards_std([r.reward for r in request.rollouts])
+        if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return self._reject(RejectReason.OUT_OF_ZONE)
 
         for rollout in request.rollouts:
@@ -187,7 +187,7 @@ class GrpoWindowBatcher:
                 prompt_idx=request.prompt_idx,
                 signed_round=request.signed_round,
                 merkle_root_bytes=bytes.fromhex(request.merkle_root),
-                k=k,
+                sigma=sigma,
                 rollouts=list(request.rollouts),
                 completion_texts=completion_texts,
                 arrived_at=self._time_fn(),

@@ -36,13 +36,16 @@ def _rollout(r=1.0):
 
 
 def _valid_submission(prompt_idx, k=4, hotkey="hk"):
+    import math
     rollouts = [_rollout(r=1.0 if i < k else 0.0) for i in range(8)]
+    p = k / 8
+    sigma = math.sqrt(p * (1 - p))
     return ValidSubmission(
         hotkey=hotkey,
         prompt_idx=prompt_idx,
         signed_round=100,
         merkle_root_bytes=b"\x00" * 32,
-        k=k,
+        sigma=sigma,
         rollouts=rollouts,
         completion_texts=[f"text_{i}" for i in range(8)],
     )
@@ -81,11 +84,13 @@ async def test_archive_includes_prompt_and_rollout_content():
     assert archive["environment"] == "fake"
     assert len(archive["batch"]) == 2
 
+    import math
     entry0 = archive["batch"][0]
     assert entry0["prompt_idx"] == 7
     assert entry0["prompt"] == "question 7"
     assert entry0["ground_truth"] == "answer 7"
-    assert entry0["k"] == 4
+    expected_sigma = math.sqrt((4 / 8) * (1 - 4 / 8))  # Bernoulli(p=0.5) → 0.5
+    assert abs(entry0["sigma"] - expected_sigma) < 1e-9
     assert len(entry0["rollouts"]) == 8
     assert entry0["rollouts"][0]["tokens"] == [1, 2, 3, 4, 5]
     assert entry0["rollouts"][0]["completion_text"] == "text_0"

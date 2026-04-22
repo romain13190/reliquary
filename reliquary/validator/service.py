@@ -274,7 +274,7 @@ class ValidationService:
                 "hotkey": s.hotkey,
                 "prompt_idx": s.prompt_idx,
                 "signed_round": s.signed_round,
-                "k": s.k,
+                "sigma": s.sigma,
                 "prompt": problem.get("prompt", ""),
                 "ground_truth": problem.get("ground_truth", ""),
                 "rollouts": rollouts_payload,

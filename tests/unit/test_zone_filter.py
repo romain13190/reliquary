@@ -1,59 +1,65 @@
-"""Zone filter: k ∈ [ZONE_K_MIN, ZONE_K_MAX] (binary in/out, no scoring)."""
+"""Zone filter: σ ≥ SIGMA_MIN (std-based, reward-scale-agnostic)."""
 
-from reliquary.constants import (
-    BOOTSTRAP_ZONE_K_MAX, BOOTSTRAP_ZONE_K_MIN,
-    M_ROLLOUTS, ZONE_K_MAX, ZONE_K_MIN,
-)
-from reliquary.validator.verifier import is_in_zone, rewards_to_k
+import math
+
+from reliquary.validator.verifier import is_in_zone, rewards_std
 
 
-def test_k_below_min_rejected():
-    assert is_in_zone(k=ZONE_K_MIN - 1) is False
+def test_sigma_zero_rejected():
+    """Degenerate std=0 is always rejected."""
+    assert is_in_zone(0.0) is False
 
 
-def test_k_min_accepted():
-    assert is_in_zone(k=ZONE_K_MIN) is True
+def test_sigma_below_min_rejected():
+    """0.3 < 0.43 → rejected."""
+    assert is_in_zone(0.3) is False
 
 
-def test_k_max_accepted():
-    assert is_in_zone(k=ZONE_K_MAX) is True
+def test_sigma_at_min_accepted():
+    """σ = 0.43 passes the steady-state gate."""
+    assert is_in_zone(0.43) is True
 
 
-def test_k_above_max_rejected():
-    assert is_in_zone(k=ZONE_K_MAX + 1) is False
+def test_sigma_above_min_accepted():
+    """σ = 0.5 passes the steady-state gate."""
+    assert is_in_zone(0.5) is True
 
 
-def test_k_all_zeros_rejected():
-    assert is_in_zone(k=0) is False
+def test_bootstrap_threshold_lower():
+    """0.35 is rejected in steady state but accepted in bootstrap."""
+    assert is_in_zone(0.35, bootstrap=False) is False
+    assert is_in_zone(0.35, bootstrap=True) is True
 
 
-def test_k_all_ones_rejected():
-    assert is_in_zone(k=M_ROLLOUTS) is False
+def test_bootstrap_still_rejects_zero_sigma():
+    """Bootstrap mode doesn't save pathological zero-std groups."""
+    assert is_in_zone(0.0, bootstrap=True) is False
 
 
-def test_bootstrap_mode_wider_zone():
-    assert is_in_zone(k=1, bootstrap=True) is True
-    assert is_in_zone(k=1, bootstrap=False) is False
-    assert is_in_zone(k=7, bootstrap=True) is True
-    assert is_in_zone(k=7, bootstrap=False) is False
+def test_rewards_std_binary_matches_expected():
+    """For binary rewards with k successes out of M=8, σ = √(p(1-p)) with p=k/M."""
+    M = 8
+    for k in range(M + 1):
+        rewards = [1.0] * k + [0.0] * (M - k)
+        p = k / M
+        expected = math.sqrt(p * (1 - p))
+        assert abs(rewards_std(rewards) - expected) < 1e-9, (
+            f"k={k}: expected σ={expected:.6f}, got {rewards_std(rewards):.6f}"
+        )
 
 
-def test_bootstrap_still_rejects_k_0_and_M():
-    assert is_in_zone(k=0, bootstrap=True) is False
-    assert is_in_zone(k=M_ROLLOUTS, bootstrap=True) is False
+def test_rewards_std_empty_returns_zero():
+    assert rewards_std([]) == 0.0
 
 
-def test_rewards_to_k_binary():
-    assert rewards_to_k([1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]) == 4
+def test_rewards_std_single_returns_zero():
+    assert rewards_std([1.0]) == 0.0
 
 
-def test_rewards_to_k_with_tolerance():
-    assert rewards_to_k([0.999999, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]) == 1
-
-
-def test_rewards_to_k_all_zero():
-    assert rewards_to_k([0.0] * M_ROLLOUTS) == 0
-
-
-def test_rewards_to_k_all_one():
-    assert rewards_to_k([1.0] * M_ROLLOUTS) == M_ROLLOUTS
+def test_rewards_std_continuous():
+    """[0.7, 0.5, 0.3, 0.1] — population std = sqrt(variance)."""
+    rewards = [0.7, 0.5, 0.3, 0.1]
+    mean = sum(rewards) / len(rewards)                          # 0.4
+    variance = sum((r - mean) ** 2 for r in rewards) / len(rewards)
+    expected = math.sqrt(variance)
+    assert abs(rewards_std(rewards) - expected) < 1e-9

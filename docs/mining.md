@@ -76,15 +76,21 @@ index is open.
 
 ### Zone filter
 
-The validator counts how many of your 8 rollouts have `reward = 1`
-(correct). Call that `k`. Submissions with `k ∈ [2, 6]` pass the zone
-filter; submissions with `k < 2` or `k > 6` are rejected with
-`OUT_OF_ZONE`. During bootstrap (first `BOOTSTRAP_WINDOWS` windows) the
-zone is wider: `k ∈ [1, 7]`.
+The validator computes the population standard deviation σ of your 8
+rollout rewards. Submissions with `σ ≥ 0.43` pass the zone filter;
+submissions with `σ < 0.43` are rejected with `OUT_OF_ZONE`. During
+bootstrap (first `BOOTSTRAP_WINDOWS` windows) the threshold is lower:
+`σ ≥ 0.33`.
+
+For binary GSM8K rewards `{0, 1}` this is mathematically identical to
+the intuitive "2-to-6 correct out of 8" rule — σ of a Bernoulli(p=2/8)
+is ≈ 0.433. The σ formulation is preferred because it is reward-scale-
+agnostic and works correctly for continuous partial-credit environments
+(MATH, AIME, etc.) without any changes to the validator.
 
 This means you cannot cherry-pick an easy prompt to get 8/8 corrects, nor
-fail on a hard prompt with 0/8. Both extremes are worthless for GRPO
-training and earn nothing.
+fail on a hard prompt with 0/8. Both extremes produce σ ≈ 0 and are
+worthless for GRPO training.
 
 ### Rejection reasons
 
@@ -93,7 +99,7 @@ training and earn nothing.
 | `WRONG_CHECKPOINT` | `checkpoint_hash` in your submission doesn't match the active window | Re-poll `/window/state`, update to the latest `checkpoint_hash`, and retry |
 | `PROMPT_IN_COOLDOWN` | `prompt_idx` is in the active cooldown set | Retry with a different `prompt_idx` |
 | `STALE_ROUND` | `signed_round` is too old or from the future | Ensure your drand client is synced |
-| `OUT_OF_ZONE` | `k` (correct count) outside `[2, 6]` | Choose a different prompt; this one is too easy or too hard for you right now |
+| `OUT_OF_ZONE` | reward std σ below threshold (0.43 steady / 0.33 bootstrap) | Choose a different prompt; this one is too easy or too hard for you right now |
 | `REWARD_MISMATCH` | Your local rewards don't match `env.compute_reward` | Check checkpoint and env version alignment |
 | `GRAIL_FAIL` | Sketch doesn't match the validator's forward pass | Wrong checkpoint or CUDA environment mismatch |
 

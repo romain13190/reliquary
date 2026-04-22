@@ -57,8 +57,9 @@ Submissions are accepted or rejected in this exact order:
    `CooldownMap` (`PROMPT_IN_COOLDOWN` if it does).
 7. **Reward match** — validator recomputes `env.compute_reward` for each
    rollout; claim must match exactly (`REWARD_MISMATCH` if not).
-8. **Zone filter** — `k` (number of correct rollouts) must satisfy
-   `k ∈ [2, 6]` (`OUT_OF_ZONE` if not). During bootstrap: `k ∈ [1, 7]`.
+8. **Zone filter** — population std σ of the group's rewards must satisfy
+   `σ ≥ 0.43` (`OUT_OF_ZONE` if not). During bootstrap: `σ ≥ 0.33`.
+   For binary GSM8K rewards this is equivalent to 2–6 correct out of 8.
 9. **GRAIL sketch** — validator re-runs the bit-identical forward pass and
    compares sketch commitments (`GRAIL_FAIL` if they diverge).
 
@@ -75,7 +76,8 @@ is consistent even after a hard restart.
 
 - **Normal mode**: batched `prompt_idx` values enter a 50-window cooldown.
 - **Bootstrap mode**: first `BOOTSTRAP_WINDOWS` windows use a 10-window
-  cooldown and wider zone `[1, 7]` to fill the initial batches faster.
+  cooldown and lower σ threshold (0.33 vs 0.43) to fill the initial
+  batches faster while miner population and env coverage are thin.
 
 ### `/window/state` endpoint
 
@@ -261,7 +263,7 @@ CLI flags:
 ... | Validator HTTP server listening on 0.0.0.0:8888
 ... | Validator started: env=gsm8k, netuid=81, http=0.0.0.0:8888, rolling_windows=72
 ... | Window 42 open — checkpoint_n=7 cooldown_size=142
-... | Accepted submission: hotkey=5xxx… prompt_idx=4821 k=4 round=9182736
+... | Accepted submission: hotkey=5xxx… prompt_idx=4821 sigma=0.500 round=9182736
 ... | seal_event fired — 8 distinct valid submissions received (window=42)
 ... | State → TRAINING (window=42)
 ... | train_step (stub) called with batch of 8 submissions — weights not modified

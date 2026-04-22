@@ -154,11 +154,13 @@ DATASET_SPLIT = "train"
 
 # ────────────────  GRPO MARKET (v2)  ────────────────
 
-# Apprenable zone: a group with k successes ∈ [ZONE_K_MIN, ZONE_K_MAX]
-# inclusive is eligible for the training batch. Outside this range means
-# the group has ~no GRPO signal (too easy or too hard) and is rejected.
-ZONE_K_MIN = 2
-ZONE_K_MAX = 6
+# Minimum reward-std for a group to pass the zone filter.
+# For binary Bernoulli rewards this is equivalent to the old
+# k ∈ [2, 6] gate (σ of Bernoulli(p=2/8) ≈ 0.433). For continuous
+# rewards it filters groups whose rollouts clustered too tight to
+# carry meaningful GRPO signal.
+SIGMA_MIN = 0.43
+BOOTSTRAP_SIGMA_MIN = 0.33    # matches old k ∈ [1, 7]
 
 # Number of rollouts per submission (= size of each GRPO group).
 M_ROLLOUTS = 8
@@ -185,8 +187,6 @@ BATCH_PROMPT_COOLDOWN_WINDOWS = 50
 # relaxed thresholds to keep the batch filling while miner pop + env
 # coverage are thin.
 BOOTSTRAP_WINDOWS = 100
-BOOTSTRAP_ZONE_K_MIN = 1
-BOOTSTRAP_ZONE_K_MAX = 7
 
 # First on-chain block at which this subnet deployed v2. Used to
 # determine bootstrap eligibility. Set at the coordinated cutover.

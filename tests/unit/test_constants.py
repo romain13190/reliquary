@@ -3,10 +3,10 @@
 from reliquary import constants as C
 
 
-def test_v2_zone_bounds():
-    assert C.ZONE_K_MIN == 2
-    assert C.ZONE_K_MAX == 6
-    assert C.ZONE_K_MIN < C.ZONE_K_MAX
+def test_v2_sigma_bounds():
+    assert C.SIGMA_MIN == 0.43
+    assert C.BOOTSTRAP_SIGMA_MIN == 0.33
+    assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN
 
 
 def test_v2_group_sizes():
@@ -23,7 +23,6 @@ def test_v2_cooldown_values():
     assert C.BOOTSTRAP_WINDOWS == 100
 
 
-def test_v2_bootstrap_zone_is_wider_than_steady():
-    # k ∈ [1, 7] during bootstrap vs [2, 6] steady
-    assert C.BOOTSTRAP_ZONE_K_MIN < C.ZONE_K_MIN
-    assert C.BOOTSTRAP_ZONE_K_MAX > C.ZONE_K_MAX
+def test_v2_bootstrap_sigma_lower_than_steady():
+    # Bootstrap accepts groups with lower σ (σ ≥ 0.33) vs steady (σ ≥ 0.43)
+    assert C.BOOTSTRAP_SIGMA_MIN < C.SIGMA_MIN

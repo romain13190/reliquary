@@ -133,34 +133,34 @@ def verify_reward_claim(
     return abs(float(actual) - float(claimed)) <= tolerance
 
 
-def rewards_to_k(rewards: list[float], *, success_threshold: float = 0.5) -> int:
-    """Count rewards that are successes (> success_threshold).
+def rewards_std(rewards: list[float]) -> float:
+    """Population standard deviation of a rollout group's rewards.
 
-    GSM8K returns binary {0.0, 1.0}; the threshold tolerates float round-trip
-    noise and future continuous envs where "success" is >= some level.
+    Returns 0.0 for empty or single-element lists (degenerate — no
+    information). The population formula (divide by n, not n-1) is
+    used because we want the std of THIS specific sample, not an
+    estimator of the underlying distribution's std.
     """
-    return sum(1 for r in rewards if r > success_threshold)
+    n = len(rewards)
+    if n < 2:
+        return 0.0
+    mean = sum(rewards) / n
+    variance = sum((r - mean) ** 2 for r in rewards) / n
+    return variance ** 0.5
 
 
-def is_in_zone(k: int, *, bootstrap: bool = False) -> bool:
-    """True iff k lies strictly inside the apprenable zone.
+def is_in_zone(sigma: float, *, bootstrap: bool = False) -> bool:
+    """True iff *sigma* exceeds the minimum threshold for training signal.
 
-    Steady state: ``ZONE_K_MIN <= k <= ZONE_K_MAX`` (default [2, 6]).
-    Bootstrap mode: ``BOOTSTRAP_ZONE_K_MIN <= k <= BOOTSTRAP_ZONE_K_MAX``
-    (default [1, 7]) — wider to keep the batch filling while miner
-    population and env coverage are thin.
+    Steady state: σ ≥ SIGMA_MIN (0.43).
+    Bootstrap: σ ≥ BOOTSTRAP_SIGMA_MIN (0.33).
 
-    ``k=0`` (trivially hard) and ``k=M_ROLLOUTS`` (trivially easy) are
-    always rejected regardless of bootstrap flag — these have zero
-    GRPO signal by definition.
+    A group with σ below this is dropped because its rollouts cluster
+    too tightly for the normalised advantage (r - μ) / σ to carry a
+    usable gradient signal.
     """
-    from reliquary.constants import (
-        BOOTSTRAP_ZONE_K_MAX, BOOTSTRAP_ZONE_K_MIN,
-        M_ROLLOUTS, ZONE_K_MAX, ZONE_K_MIN,
-    )
+    from reliquary.constants import BOOTSTRAP_SIGMA_MIN, SIGMA_MIN
 
-    if k <= 0 or k >= M_ROLLOUTS:
-        return False
-    if bootstrap:
-        return BOOTSTRAP_ZONE_K_MIN <= k <= BOOTSTRAP_ZONE_K_MAX
-    return ZONE_K_MIN <= k <= ZONE_K_MAX
+    if sigma < 1e-8:
+        return False   # degenerate
+    return sigma >= (BOOTSTRAP_SIGMA_MIN if bootstrap else SIGMA_MIN)
