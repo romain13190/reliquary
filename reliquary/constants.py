@@ -215,9 +215,13 @@ EMA_ALPHA = 2.0 / (72 + 1)  # ≈ 0.0274
 
 # ────────────────  GRPO TRAINING (v2.1)  ────────────────
 
-# Learning rate for AdamW. Small — RL fine-tuning on pretrained LLMs is
-# sensitive; too high = collapse. 5e-7 is a conservative baseline for 4B.
-LEARNING_RATE = 5e-7
+# Learning rate for AdamW. RL fine-tuning on pretrained LLMs is sensitive;
+# too high = collapse. Empirical drift measurement (scripts/measure_sketch_drift.py)
+# showed 5e-7 produced a sketch delta of ~600 (≈10 % of the 6000 sketch
+# tolerance) over 50 training steps — effectively indistinguishable from the
+# base model, which also means stale-model cheaters pass GRAIL. Matched
+# DAPO / R1-Zero-scale literature (1e-6 to 5e-6) by bumping to 5e-6.
+LEARNING_RATE = 5e-6
 
 # PPO clip range. Standard in GRPO/RLHF literature.
 PPO_CLIP_EPSILON = 0.2
