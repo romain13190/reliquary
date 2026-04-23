@@ -258,13 +258,24 @@ class ValidationService:
         )
         # Load weights — this replaces the base model loaded at __init__.
         self.model = self._load_model_fn(local_path)
+        # Extract the canonical revision string to publish to miners.
+        # IMPORTANT: strip the scheme prefix — miners call HF with this value
+        # as the ``revision=`` kwarg, and HF rejects ``sha:<hex>`` / ``path:<dir>``
+        # strings outright. They must see a bare 40-char hex (for sha) or a
+        # bare local path identifier (for path, though that's a test-only mode
+        # and miners won't successfully pull it anyway).
+        from reliquary.validator.resume import ShaSource
+        if isinstance(source, ShaSource):
+            revision_str = source.sha
+        else:
+            revision_str = source.path
         # Reconstruct manifest so miners see the resumed checkpoint via /state.
-        sig_payload = f"{checkpoint_n}|{self._resume_from}".encode()
+        sig_payload = f"{checkpoint_n}|{revision_str}".encode()
         sig_bytes = self.wallet.hotkey.sign(sig_payload)
         entry = ManifestEntry(
             checkpoint_n=checkpoint_n,
             repo_id=self._checkpoint_store.repo_id,
-            revision=self._resume_from,
+            revision=revision_str,
             signature="ed25519:" + sig_bytes.hex(),
         )
         self._checkpoint_store._current = entry
