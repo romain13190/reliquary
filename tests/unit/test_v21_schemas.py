@@ -70,3 +70,10 @@ def test_batch_submission_with_checkpoint_hash_parses():
         checkpoint_hash="sha256:abc",
     )
     assert req.checkpoint_hash == "sha256:abc"
+
+
+def test_behavioural_reject_reasons_exist():
+    """Logprob + Distribution validator ports add two new reject codes."""
+    from reliquary.protocol.submission import RejectReason
+    assert RejectReason.LOGPROB_MISMATCH.value == "logprob_mismatch"
+    assert RejectReason.DISTRIBUTION_SUSPICIOUS.value == "distribution_suspicious"
