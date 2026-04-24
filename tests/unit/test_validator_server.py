@@ -22,6 +22,12 @@ class FakeEnv:
     def compute_reward(self, p, c): return 1.0 if "CORRECT" in c else 0.0
 
 
+def _always_true_proof(commit, model, randomness):
+    import torch
+    from reliquary.validator.verifier import ProofResult
+    return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
+
+
 def _batcher(window_start=500, cooldown_map=None):
     batcher = GrpoWindowBatcher(
         window_start=window_start,
@@ -29,7 +35,7 @@ def _batcher(window_start=500, cooldown_map=None):
         env=FakeEnv(),
         model=None,
         cooldown_map=cooldown_map,
-        verify_commitment_proofs_fn=lambda c, m, r: (True, 1, 1),
+        verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
         verify_proof_version_fn=lambda c: True,
         completion_text_fn=lambda r: r.commit.get("completion_text_for_test", ""),

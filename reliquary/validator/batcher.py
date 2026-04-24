@@ -76,7 +76,7 @@ class GrpoWindowBatcher:
         cooldown_map: CooldownMap | None = None,
         bootstrap: bool = False,
         completion_text_fn: Callable[[RolloutSubmission], str],
-        verify_commitment_proofs_fn: Callable[..., tuple[bool, int, int]] | None = None,
+        verify_commitment_proofs_fn: Callable[..., Any] | None = None,
         verify_signature_fn: Callable[[dict, str], bool] | None = None,
         verify_proof_version_fn: Callable[[dict], bool] | None = None,
         time_fn: Callable[[], float] | None = None,
@@ -175,11 +175,12 @@ class GrpoWindowBatcher:
                 return self._reject(RejectReason.GRAIL_FAIL)
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return self._reject(RejectReason.BAD_SIGNATURE)
-            passed, _, _ = self._verify_commitment(
+            proof = self._verify_commitment(
                 rollout.commit, self.model, self.randomness
             )
-            if not passed:
+            if not proof.all_passed:
                 return self._reject(RejectReason.GRAIL_FAIL)
+            # proof.logits will be used by the behavioural validators below.
 
         self._valid.append(
             ValidSubmission(

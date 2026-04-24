@@ -18,6 +18,12 @@ from reliquary.protocol.submission import (
 )
 
 
+def _always_true_proof(commit, model, randomness):
+    import torch
+    from reliquary.validator.verifier import ProofResult
+    return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
+
+
 @dataclass
 class _FakeEnv:
     @property
@@ -111,7 +117,7 @@ def _patch_open_grpo_window(svc):
             cooldown_map=cooldown_map,
             bootstrap=bootstrap,
             # Stub out torch-dependent verifiers.
-            verify_commitment_proofs_fn=lambda c, m, r: (True, 1, 1),
+            verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
             verify_proof_version_fn=lambda c: c.get("proof_version") == "v5",
             # Decode via the commit dict like existing smoke test does.

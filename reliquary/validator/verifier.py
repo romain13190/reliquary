@@ -5,7 +5,10 @@ exposes the per-commit checks that touch the model or the signature scheme.
 """
 
 import logging
+from dataclasses import dataclass
 from typing import Any
+
+import torch
 
 from reliquary.constants import (
     CHALLENGE_K,
@@ -15,6 +18,22 @@ from reliquary.constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ProofResult:
+    """Return value of verify_commitment_proofs.
+
+    The ``logits`` field is the cached per-token logits tensor from the
+    validator's forward pass at LAYER_INDEX. Downstream behavioural
+    validators (logprob / distribution) read it to avoid re-running the
+    forward pass.
+    """
+
+    all_passed: bool
+    passed: int
+    checked: int
+    logits: torch.Tensor  # shape: [seq_len, vocab_size], on CPU
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -33,14 +52,13 @@ def verify_commitment_proofs(
     commit: dict,
     model: Any,
     window_randomness: str,
-) -> tuple[bool, int, int]:
+) -> ProofResult:
     """Hard check: verify GRAIL sketch commitments against model forward pass.
 
-    Returns:
-        (all_passed, passed_count, checked_count)
+    Returns a ``ProofResult`` whose ``logits`` field carries the full-vocab
+    logits tensor from the validator's forward pass. Downstream behavioural
+    validators (logprob / distribution) read it without re-forwarding.
     """
-    import torch
-
     from reliquary.protocol.crypto import indices_from_root
     from reliquary.protocol.grail_verifier import GRAILVerifier
     from reliquary.shared.forward import forward_single_layer
@@ -58,7 +76,10 @@ def verify_commitment_proofs(
             "Commitment count mismatch: %d commitments for %d tokens",
             len(commitments), seq_len,
         )
-        return False, 0, 0
+        return ProofResult(
+            all_passed=False, passed=0, checked=0,
+            logits=torch.empty(0),
+        )
 
     # SECURITY: Reject sequences that would cause GPU OOM.
     if seq_len > MAX_TOKENS_PER_ROLLOUT:
@@ -66,7 +87,10 @@ def verify_commitment_proofs(
             "Token sequence too long: %d tokens (max %d)",
             seq_len, MAX_TOKENS_PER_ROLLOUT,
         )
-        return False, 0, 0
+        return ProofResult(
+            all_passed=False, passed=0, checked=0,
+            logits=torch.empty(0),
+        )
 
     # SECURITY: Always use the validator's independently-computed randomness.
     # Never trust the miner's claimed beacon — a miner who controls the
@@ -84,9 +108,12 @@ def verify_commitment_proofs(
 
     input_ids = torch.tensor([tokens], device=next(model.parameters()).device)
     with torch.no_grad():
-        hidden_states, _ = forward_single_layer(model, input_ids, None, LAYER_INDEX)
+        hidden_states, logits_batch = forward_single_layer(
+            model, input_ids, None, LAYER_INDEX
+        )
 
     hidden_states = hidden_states[0]  # Remove batch dim: [seq_len, hidden_dim]
+    logits = logits_batch[0].detach().to("cpu")
 
     passed = 0
     checked = 0
@@ -105,7 +132,9 @@ def verify_commitment_proofs(
     # SECURITY: All expected challenge positions must be checked and pass.
     # A miner cannot benefit from having fewer positions verified.
     all_passed = passed == checked and checked >= expected_challenges
-    return all_passed, passed, checked
+    return ProofResult(
+        all_passed=all_passed, passed=passed, checked=checked, logits=logits,
+    )
 
 
 def verify_reward_claim(

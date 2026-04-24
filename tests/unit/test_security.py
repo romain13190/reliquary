@@ -55,7 +55,7 @@ class TestMinerCannotControlRandomness:
         seq_len = 64
         tokens = list(range(seq_len))
         fake_hidden = torch.randn(1, seq_len, HIDDEN_DIM)
-        mock_fwd.return_value = (fake_hidden, None)
+        mock_fwd.return_value = (fake_hidden, torch.zeros(1, seq_len, 10))
 
         commitments = [{"sketch": 0}] * seq_len
         commit = {
@@ -112,19 +112,22 @@ class TestCommitmentCountMustMatchTokens:
         from reliquary.validator.verifier import verify_commitment_proofs
 
         commit = {"tokens": list(range(100)), "commitments": [{"sketch": 0}] * 10}
-        assert verify_commitment_proofs(commit, _make_mock_model(), "aabb") == (False, 0, 0)
+        res = verify_commitment_proofs(commit, _make_mock_model(), "aabb")
+        assert res.all_passed is False and res.passed == 0 and res.checked == 0
 
     def test_more_commitments_rejected(self):
         from reliquary.validator.verifier import verify_commitment_proofs
 
         commit = {"tokens": list(range(10)), "commitments": [{"sketch": 0}] * 100}
-        assert verify_commitment_proofs(commit, _make_mock_model(), "aabb") == (False, 0, 0)
+        res = verify_commitment_proofs(commit, _make_mock_model(), "aabb")
+        assert res.all_passed is False and res.passed == 0 and res.checked == 0
 
     def test_empty_commitments_rejected(self):
         from reliquary.validator.verifier import verify_commitment_proofs
 
         commit = {"tokens": list(range(50)), "commitments": []}
-        assert verify_commitment_proofs(commit, _make_mock_model(), "aabb") == (False, 0, 0)
+        res = verify_commitment_proofs(commit, _make_mock_model(), "aabb")
+        assert res.all_passed is False and res.passed == 0 and res.checked == 0
 
     @patch("reliquary.shared.forward.forward_single_layer")
     @patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM)
@@ -133,7 +136,7 @@ class TestCommitmentCountMustMatchTokens:
         from reliquary.validator.verifier import verify_commitment_proofs
 
         seq_len = 64
-        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), None)
+        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), torch.zeros(1, seq_len, 10))
         commit = {"tokens": list(range(seq_len)), "commitments": [{"sketch": 0}] * seq_len}
         verify_commitment_proofs(commit, _make_mock_model(), "aabb")
         mock_fwd.assert_called_once()
@@ -155,17 +158,17 @@ class TestMinimumChallengesEnforced:
         from reliquary.validator.verifier import verify_commitment_proofs
 
         seq_len = 64
-        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), None)
+        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), torch.zeros(1, seq_len, 10))
         commit = {"tokens": list(range(seq_len)), "commitments": [{"sketch": 0}] * seq_len}
 
         with patch("reliquary.protocol.crypto.indices_from_root", return_value=[0, 1]), \
              patch("reliquary.protocol.grail_verifier.GRAILVerifier.verify_commitment", return_value=(True, {})):
-            result, passed, checked = verify_commitment_proofs(
+            res = verify_commitment_proofs(
                 commit, _make_mock_model(), VALIDATOR_RANDOMNESS
             )
-            assert checked == 2
-            assert passed == 2
-            assert result is False  # 2 < min(32, 64) = 32
+            assert res.checked == 2
+            assert res.passed == 2
+            assert res.all_passed is False  # 2 < min(32, 64) = 32
 
     @patch("reliquary.shared.forward.forward_single_layer")
     @patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM)
@@ -173,17 +176,17 @@ class TestMinimumChallengesEnforced:
         from reliquary.validator.verifier import verify_commitment_proofs
 
         seq_len = 64
-        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), None)
+        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), torch.zeros(1, seq_len, 10))
         commit = {"tokens": list(range(seq_len)), "commitments": [{"sketch": 0}] * seq_len}
         expected = min(CHALLENGE_K, seq_len)
 
         with patch("reliquary.protocol.crypto.indices_from_root", return_value=list(range(expected))), \
              patch("reliquary.protocol.grail_verifier.GRAILVerifier.verify_commitment", return_value=(True, {})):
-            result, passed, checked = verify_commitment_proofs(
+            res = verify_commitment_proofs(
                 commit, _make_mock_model(), VALIDATOR_RANDOMNESS
             )
-            assert checked == expected
-            assert result is True
+            assert res.checked == expected
+            assert res.all_passed is True
 
     @patch("reliquary.shared.forward.forward_single_layer")
     @patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM)
@@ -191,7 +194,7 @@ class TestMinimumChallengesEnforced:
         from reliquary.validator.verifier import verify_commitment_proofs
 
         seq_len = 64
-        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), None)
+        mock_fwd.return_value = (torch.randn(1, seq_len, HIDDEN_DIM), torch.zeros(1, seq_len, 10))
         commit = {"tokens": list(range(seq_len)), "commitments": [{"sketch": 0}] * seq_len}
         expected = min(CHALLENGE_K, seq_len)
 
@@ -203,11 +206,11 @@ class TestMinimumChallengesEnforced:
 
         with patch("reliquary.protocol.crypto.indices_from_root", return_value=list(range(expected))), \
              patch("reliquary.protocol.grail_verifier.GRAILVerifier.verify_commitment", side_effect=verify_side):
-            result, passed, checked = verify_commitment_proofs(
+            res = verify_commitment_proofs(
                 commit, _make_mock_model(), VALIDATOR_RANDOMNESS
             )
-            assert result is False
-            assert passed == expected - 1
+            assert res.all_passed is False
+            assert res.passed == expected - 1
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -435,13 +438,13 @@ class TestSketchForgeryResistance:
         commitments[idx] = {"sketch": (commitments[idx]["sketch"] + PRIME_Q // 2) % PRIME_Q}
 
         commit = {"tokens": tokens, "commitments": commitments}
-        with patch("reliquary.shared.forward.forward_single_layer", return_value=(hidden, None)), \
+        with patch("reliquary.shared.forward.forward_single_layer", return_value=(hidden, torch.zeros(1, seq_len, 10))), \
              patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM):
-            result, passed, checked = verify_commitment_proofs(
+            res = verify_commitment_proofs(
                 commit, _make_mock_model(), randomness
             )
-        assert not result
-        assert passed < checked
+        assert not res.all_passed
+        assert res.passed < res.checked
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -492,11 +495,11 @@ class TestTokenSequenceLengthCheck:
 
         tokens = list(range(MAX_TOKENS_PER_ROLLOUT + 1))
         commit = {"tokens": tokens, "commitments": [{"sketch": 0}] * len(tokens)}
-        result, passed, checked = verify_commitment_proofs(
+        res = verify_commitment_proofs(
             commit, _make_mock_model(), "aabb"
         )
-        assert result is False
-        assert checked == 0
+        assert res.all_passed is False
+        assert res.checked == 0
 
     def test_accepts_valid_length(self):
         from reliquary.validator.verifier import verify_commitment_proofs
@@ -505,9 +508,9 @@ class TestTokenSequenceLengthCheck:
         commit = {"tokens": list(range(seq_len)), "commitments": [{"sketch": 0}] * seq_len}
         # Will fail on proof verification but should not short-circuit on length
         with patch("reliquary.shared.forward.forward_single_layer",
-                   return_value=(torch.randn(1, seq_len, HIDDEN_DIM), None)), \
+                   return_value=(torch.randn(1, seq_len, HIDDEN_DIM), torch.zeros(1, seq_len, 10))), \
              patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM):
-            result, passed, checked = verify_commitment_proofs(
+            res = verify_commitment_proofs(
                 commit, _make_mock_model(), "aabb"
             )
-            assert checked > 0  # Got past the length check
+            assert res.checked > 0  # Got past the length check

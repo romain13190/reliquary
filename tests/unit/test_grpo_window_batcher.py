@@ -26,11 +26,15 @@ class FakeEnv:
 
 
 def _always_true_grail(commit, model, randomness):
-    return True, 1, 1
+    import torch
+    from reliquary.validator.verifier import ProofResult
+    return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
 
 
 def _always_false_grail(commit, model, randomness):
-    return False, 0, 1
+    import torch
+    from reliquary.validator.verifier import ProofResult
+    return ProofResult(all_passed=False, passed=0, checked=1, logits=torch.empty(0))
 
 
 def _always_true_sig(commit, hotkey):
