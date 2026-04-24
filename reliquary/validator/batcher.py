@@ -29,8 +29,10 @@ from reliquary.protocol.submission import (
 from reliquary.validator.batch_selection import select_batch
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.verifier import (
+    evaluate_token_distribution,
     is_in_zone,
     rewards_std,
+    verify_logprobs_claim,
     verify_reward_claim,
 )
 
@@ -180,7 +182,46 @@ class GrpoWindowBatcher:
             )
             if not proof.all_passed:
                 return self._reject(RejectReason.GRAIL_FAIL)
-            # proof.logits will be used by the behavioural validators below.
+
+            # Behavioural checks (use cached logits from the GRAIL forward pass).
+            # Skip gracefully if the logits tensor is empty (legacy stubs in tests).
+            if proof.logits.numel() == 0:
+                continue
+
+            rollout_dict = rollout.commit.get("rollout", {}) or {}
+            prompt_len = int(rollout_dict.get("prompt_length", 0))
+            completion_len = int(rollout_dict.get("completion_length", 0))
+            claimed_lp = rollout_dict.get("token_logprobs", []) or []
+
+            lp_ok, lp_dev = verify_logprobs_claim(
+                tokens=rollout.commit["tokens"],
+                prompt_length=prompt_len,
+                completion_length=completion_len,
+                claimed_logprobs=claimed_lp,
+                logits=proof.logits,
+                challenge_randomness=self.randomness,
+            )
+            if not lp_ok:
+                logger.info(
+                    "reject reason=logprob_mismatch hotkey=%s median_dev=%.4f",
+                    request.miner_hotkey, lp_dev,
+                )
+                return self._reject(RejectReason.LOGPROB_MISMATCH)
+
+            from reliquary.constants import T_PROTO
+            dist_ok, dist_metrics = evaluate_token_distribution(
+                tokens=rollout.commit["tokens"],
+                prompt_length=prompt_len,
+                completion_length=completion_len,
+                logits=proof.logits,
+                temperature=T_PROTO,
+            )
+            if dist_ok is False:
+                logger.info(
+                    "reject reason=distribution_suspicious hotkey=%s %s",
+                    request.miner_hotkey, dist_metrics,
+                )
+                return self._reject(RejectReason.DISTRIBUTION_SUSPICIOUS)
 
         self._valid.append(
             ValidSubmission(
