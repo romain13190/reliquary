@@ -264,3 +264,69 @@ def verify_logprobs_claim(
 
     median_dev = float(median(devs))
     return median_dev <= LOGPROB_IS_EPS, median_dev
+
+
+def evaluate_token_distribution(
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    logits: torch.Tensor,
+    temperature: float,
+) -> tuple[bool | None, dict]:
+    """Soft check: detect suspicious chosen-token probability distributions.
+
+    For each completion step ``t``, apply ``temperature`` to
+    ``logits[t - 1]``, softmax, and read the probability the validator's
+    model would have assigned to the token the miner actually emitted
+    at position ``t``. Collect those probabilities and compute summary
+    stats.
+
+    Returns ``(is_valid, metrics)``:
+      - ``True``   — distribution is consistent with sampling from the
+                     validator's model at ``temperature``
+      - ``False``  — suspicious (median or q10 collapsed below threshold
+                     → miner likely sampled from a different model)
+      - ``None``   — insufficient steps (< SAMPLING_MIN_STEPS) — caller
+                     defaults to accept (not enough signal)
+
+    ``metrics`` carries ``mean``, ``median``, ``q10``, ``low_frac``,
+    ``high_frac`` regardless of the decision (empty dict only when
+    there's insufficient data).
+    """
+    import numpy as np
+
+    from reliquary.constants import (
+        SAMPLING_HIGH_P,
+        SAMPLING_LOW_P,
+        SAMPLING_LOW_Q10_MAX,
+        SAMPLING_MEDIAN_LOW_MAX,
+        SAMPLING_MIN_STEPS,
+    )
+
+    if completion_length < SAMPLING_MIN_STEPS:
+        return None, {}
+
+    probs: list[float] = []
+    for t in range(prompt_length, prompt_length + completion_length):
+        if t == 0 or t - 1 >= logits.size(0) or t >= len(tokens):
+            continue
+        step = (logits[t - 1].float() / float(temperature)).softmax(dim=-1)
+        probs.append(float(step[tokens[t]].item()))
+
+    if len(probs) < SAMPLING_MIN_STEPS:
+        return None, {}
+
+    x = np.asarray(probs, dtype=np.float64)
+    metrics = {
+        "mean":      float(x.mean()),
+        "median":    float(np.median(x)),
+        "q10":       float(np.quantile(x, 0.10)),
+        "low_frac":  float((x <= SAMPLING_LOW_P).mean()),
+        "high_frac": float((x >= SAMPLING_HIGH_P).mean()),
+    }
+
+    suspicious = (
+        metrics["median"] < SAMPLING_MEDIAN_LOW_MAX
+        or metrics["q10"] < SAMPLING_LOW_Q10_MAX
+    )
+    return (not suspicious), metrics

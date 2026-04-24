@@ -177,3 +177,91 @@ def test_verify_logprobs_claim_completion_only_layout():
         challenge_randomness="d" * 64,
     )
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Task 6 — evaluate_token_distribution (chosen-token probability stats)
+# ---------------------------------------------------------------------------
+
+
+def test_evaluate_token_distribution_honest_passes():
+    """Honest miner sampling from our (peaked) distribution: the chosen
+    token has high probability under the validator's model →
+    median > SAMPLING_MEDIAN_LOW_MAX and q10 > SAMPLING_LOW_Q10_MAX.
+
+    Mimics a realistic LLM where the sampled token is typically in the
+    top of the distribution. (The thresholds were calibrated on that
+    regime — uniform distributions over a large vocab would look
+    'suspicious' to them, by design.)
+    """
+    from reliquary.validator import verifier
+
+    vocab = 100
+    seq_len = 50
+    prompt_len = 5
+    # Every position t picks a designated "chosen" token and gives it
+    # high logit (5.0) while the rest are at -1. Softmax at T=0.9 yields
+    # p(chosen) ≈ 0.99 → median and q10 both ≈ 0.99.
+    logits = torch.full((seq_len, vocab), -1.0)
+    tokens = [i % vocab for i in range(seq_len)]
+    for t in range(1, seq_len):
+        logits[t - 1, tokens[t]] = 5.0
+
+    ok, metrics = verifier.evaluate_token_distribution(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=seq_len - prompt_len,
+        logits=logits,
+        temperature=0.9,
+    )
+    assert ok is True
+    assert metrics["median"] > 0.30
+
+
+def test_evaluate_token_distribution_cheater_fails():
+    """Cheater: chose tokens that are very low-probability under the
+    validator's model → median and q10 both collapse below thresholds.
+    """
+    from reliquary.validator import verifier
+
+    vocab = 100
+    seq_len = 50
+    prompt_len = 5
+    # Logits favour token 0 massively; every other token has ~0 probability.
+    logits = torch.full((seq_len, vocab), -10.0)
+    logits[:, 0] = 10.0
+    # Miner "chose" tokens 50-94 — all very low-probability under this model.
+    tokens = [0] * prompt_len + list(range(50, 95))
+
+    ok, metrics = verifier.evaluate_token_distribution(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=seq_len - prompt_len,
+        logits=logits,
+        temperature=0.9,
+    )
+    assert ok is False
+    assert metrics["median"] < 0.30
+    assert metrics["q10"] < 0.025
+
+
+def test_evaluate_token_distribution_too_short_skips():
+    """Completion shorter than SAMPLING_MIN_STEPS returns (None, {}) —
+    not enough data to decide, caller defaults to accept."""
+    from reliquary.validator import verifier
+
+    vocab = 10
+    seq_len = 20  # completion only 15, < SAMPLING_MIN_STEPS (30)
+    logits = torch.zeros(seq_len, vocab)
+    tokens = [0] * seq_len
+
+    ok, _ = verifier.evaluate_token_distribution(
+        tokens=tokens,
+        prompt_length=5,
+        completion_length=15,
+        logits=logits,
+        temperature=0.9,
+    )
+    assert ok is None
+
+
