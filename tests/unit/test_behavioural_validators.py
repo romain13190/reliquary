@@ -72,3 +72,108 @@ def test_verify_commitment_proofs_returns_logits(monkeypatch):
     assert result.logits.shape == (seq_len, vocab_size)
     assert hasattr(result, "all_passed")
     assert result.all_passed is True
+
+
+# ---------------------------------------------------------------------------
+# Task 5 — verify_logprobs_claim (IS-median deviation check)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_logprobs_claim_honest_passes():
+    """When miner_logprobs match validator-recomputed logprobs, the median
+    IS-deviation is ~0 and the check passes.
+    """
+    from reliquary.validator import verifier
+    import math
+
+    vocab = 50
+    seq_len = 40
+    logits = torch.zeros(seq_len, vocab)  # flat → each token lp = -log(vocab)
+    uniform_lp = -math.log(vocab)
+
+    tokens = list(range(seq_len))
+    prompt_len = 5
+    # Full-sequence layout (length == len(tokens)).
+    claimed = [0.0] * prompt_len + [uniform_lp] * (seq_len - prompt_len)
+
+    ok, median_dev = verifier.verify_logprobs_claim(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=seq_len - prompt_len,
+        claimed_logprobs=claimed,
+        logits=logits,
+        challenge_randomness="b" * 64,
+    )
+    assert ok is True, f"honest pair must pass, got median_dev={median_dev}"
+
+
+def test_verify_logprobs_claim_cheater_fails():
+    """When miner lies about logprobs, median IS-deviation exceeds 0.10."""
+    from reliquary.validator import verifier
+
+    vocab = 50
+    seq_len = 40
+    logits = torch.zeros(seq_len, vocab)
+
+    tokens = list(range(seq_len))
+    prompt_len = 5
+    # Miner claims implausibly good logprobs (-0.5 vs true ~-3.9)
+    # → dev = exp(|−0.5 − (−3.9)|) − 1 ≈ exp(3.4) − 1 ≈ 28.
+    claimed = [0.0] * prompt_len + [-0.5] * (seq_len - prompt_len)
+
+    ok, median_dev = verifier.verify_logprobs_claim(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=seq_len - prompt_len,
+        claimed_logprobs=claimed,
+        logits=logits,
+        challenge_randomness="b" * 64,
+    )
+    assert ok is False
+    assert median_dev > 0.10
+
+
+def test_verify_logprobs_claim_too_short_rejects():
+    """Completion shorter than CHALLENGE_K cannot be challenged → reject."""
+    from reliquary.validator import verifier
+
+    vocab = 50
+    seq_len = 20  # completion only 15, < CHALLENGE_K (32)
+    logits = torch.zeros(seq_len, vocab)
+    tokens = list(range(seq_len))
+
+    ok, _ = verifier.verify_logprobs_claim(
+        tokens=tokens,
+        prompt_length=5,
+        completion_length=15,
+        claimed_logprobs=[0.0] * seq_len,
+        logits=logits,
+        challenge_randomness="c" * 64,
+    )
+    assert ok is False
+
+
+def test_verify_logprobs_claim_completion_only_layout():
+    """Miner's token_logprobs payload has length == completion_length
+    (no prompt padding). The helper must accept both shapes."""
+    from reliquary.validator import verifier
+    import math
+
+    vocab = 50
+    seq_len = 40
+    logits = torch.zeros(seq_len, vocab)
+    uniform_lp = -math.log(vocab)
+
+    tokens = list(range(seq_len))
+    prompt_len = 5
+    claimed = [uniform_lp] * (seq_len - prompt_len)  # completion-only
+
+    ok, _ = verifier.verify_logprobs_claim(
+        tokens=tokens,
+        prompt_length=prompt_len,
+        completion_length=seq_len - prompt_len,
+        claimed_logprobs=claimed,
+        logits=logits,
+        challenge_randomness="d" * 64,
+    )
+    assert ok is True

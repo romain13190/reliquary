@@ -193,3 +193,74 @@ def is_in_zone(sigma: float, *, bootstrap: bool = False) -> bool:
     if sigma < 1e-8:
         return False   # degenerate
     return sigma >= (BOOTSTRAP_SIGMA_MIN if bootstrap else SIGMA_MIN)
+
+
+def verify_logprobs_claim(
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    claimed_logprobs: list[float],
+    logits: torch.Tensor,
+    challenge_randomness: str,
+) -> tuple[bool, float]:
+    """Hard check: validate miner-claimed per-token logprobs against the
+    validator's re-computation on K=CHALLENGE_K challenged positions.
+
+    For each challenge position ``i``, compute the validator's logprob of
+    ``tokens[i]`` from ``log_softmax(logits[i - 1])``, then
+    ``dev_i = exp(|model_lp - miner_lp|) - 1``. The **median** deviation
+    across the K positions is compared against ``LOGPROB_IS_EPS``.
+
+    Median (not mean) is robust to the bf16 outliers honest miners see
+    on cross-GPU runs. Threshold 0.10 was calibrated at 0 % FP on ~430k
+    honest trials in the original GRAIL repo.
+
+    ``claimed_logprobs`` accepts two layouts:
+    - Full-sequence (length == len(tokens)): prompt positions are
+      ignored, completion positions read directly by absolute index.
+    - Completion-only (length == completion_length): position-j entry
+      corresponds to absolute index ``prompt_length + j``.
+
+    Returns ``(is_valid, median_dev)``. ``median_dev`` is ``inf`` when
+    the check cannot be executed (completion too short, malformed
+    payload, out-of-range index).
+    """
+    import math
+    from statistics import median
+
+    from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS
+    from reliquary.protocol.crypto import indices_from_root_in_range
+
+    if completion_length < CHALLENGE_K:
+        return False, float("inf")
+
+    if len(claimed_logprobs) == len(tokens):
+        def miner_lp_at(abs_idx: int) -> float:
+            return float(claimed_logprobs[abs_idx])
+    elif len(claimed_logprobs) == completion_length:
+        def miner_lp_at(abs_idx: int) -> float:
+            return float(claimed_logprobs[abs_idx - prompt_length])
+    else:
+        return False, float("inf")
+
+    challenge_idxs = indices_from_root_in_range(
+        tokens,
+        challenge_randomness,
+        prompt_length,
+        prompt_length + completion_length,
+        CHALLENGE_K,
+    )
+    if len(challenge_idxs) != CHALLENGE_K:
+        return False, float("inf")
+
+    devs: list[float] = []
+    for abs_idx in challenge_idxs:
+        pos = abs_idx - 1
+        if pos < 0 or pos >= logits.size(0):
+            return False, float("inf")
+        dist = torch.log_softmax(logits[pos].float(), dim=-1)
+        model_lp = float(dist[tokens[abs_idx]].item())
+        devs.append(math.exp(abs(model_lp - miner_lp_at(abs_idx))) - 1.0)
+
+    median_dev = float(median(devs))
+    return median_dev <= LOGPROB_IS_EPS, median_dev
