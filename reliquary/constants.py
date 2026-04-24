@@ -254,3 +254,24 @@ WANDB_PROJECT = "reliquary-validator"
 # fresh wandb run. Same value across restarts → wandb resumes the
 # existing run (resume="allow").
 WANDB_TRAINING_VERSION = "v1"
+
+# ────────────────  BEHAVIOURAL VALIDATORS  ────────────────
+# Thresholds calibrated in the original grail repo against ~430k honest
+# cross-GPU / cross-attn / cross-batch trials with 0 % false-positive
+# rate. Do not re-tune without the same empirical setup.
+
+# LogprobValidator: max allowed median importance-sampling deviation
+# across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
+# Honest miners max-out around 0.066 on worst pairs; 0.10 gives 50 %
+# headroom. Equivalent PPO-ratio bound is (1 + LOGPROB_IS_EPS).
+LOGPROB_IS_EPS = 0.10
+
+# DistributionValidator: chosen-token probability thresholds. A "chosen
+# token" is the token the miner sampled at step t; its probability under
+# the validator's model (at the protocol temperature) is
+# p_t = softmax(logits_{t-1} / T)[token_t].
+SAMPLING_MIN_STEPS = 30         # completion must be at least this long
+SAMPLING_LOW_P = 0.10           # prob <= this → "low" chosen token
+SAMPLING_HIGH_P = 0.90           # prob >= this → "high" chosen token
+SAMPLING_MEDIAN_LOW_MAX = 0.30  # median chosen prob must be above
+SAMPLING_LOW_Q10_MAX = 0.025    # 10th-percentile must be above
