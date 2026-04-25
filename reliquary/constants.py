@@ -36,8 +36,10 @@ PROOF_NUM_BUCKETS = 8
 PROOF_COEFF_RANGE = 127
 
 # Sketch tolerance at position 0. Covers cross-GPU drift.
-# Empirical max diff across ~300M positions = 3979. Base of 6000 gives ~50% headroom.
-PROOF_SKETCH_TOLERANCE_BASE = 6000
+# Empirical max diff across ~300M positions = 3979. 3000 sits below the
+# cross-GPU floor: it relies on the LogprobValidator to catch divergence
+# rather than blanket-tolerating any drift up to 6000.
+PROOF_SKETCH_TOLERANCE_BASE = 3000
 
 # Sketch tolerance sqrt growth factor per position.
 # tolerance(P) = base + growth * sqrt(P).
@@ -262,9 +264,10 @@ WANDB_TRAINING_VERSION = "v1"
 
 # LogprobValidator: max allowed median importance-sampling deviation
 # across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
-# Honest miners max-out around 0.066 on worst pairs; 0.10 gives 50 %
-# headroom. Equivalent PPO-ratio bound is (1 + LOGPROB_IS_EPS).
-LOGPROB_IS_EPS = 0.10
+# Honest miners observed at ~0.00013 median dev in live testnet runs;
+# the smallest cheater drift (1-step stale checkpoint) already produces
+# ~0.01+. Tightened from 0.10 → 0.01 with ~77× margin over honest peak.
+LOGPROB_IS_EPS = 0.01
 
 # DistributionValidator: chosen-token probability thresholds. A "chosen
 # token" is the token the miner sampled at step t; its probability under

@@ -89,8 +89,8 @@ class TestAdaptiveSketchTolerance:
 
     def test_position_8192(self):
         t = adaptive_sketch_tolerance(8192, 8192)
-        # base(6000) + 5.0 * sqrt(8192) = 6000 + 452.5 ≈ 6452
-        assert t == 6452
+        # base + 5.0 * sqrt(8192) = base + 452.5
+        assert t == PROOF_SKETCH_TOLERANCE_BASE + 452
 
 
 class TestGRAILVerifier:
