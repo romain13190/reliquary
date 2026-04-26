@@ -396,22 +396,45 @@ class ValidationService:
 
     async def _archive_window(self, batcher, batch) -> None:
         window_opened_at = getattr(batcher, "window_opened_at", None)
+        eos_id = (
+            getattr(self.tokenizer, "eos_token_id", None)
+            if self.tokenizer is not None else None
+        )
+
+        def _resp_time(arrived_at: float) -> float | None:
+            if window_opened_at is None or not arrived_at:
+                return None
+            return arrived_at - window_opened_at
+
+        def _rollout_payload(s, with_text: bool):
+            out = []
+            texts = s.completion_texts if with_text else [None] * len(s.rollouts)
+            for r, text in zip(s.rollouts, texts):
+                tokens = list(r.tokens)
+                rollout_dict = (r.commit or {}).get("rollout", {}) or {}
+                prompt_length = int(rollout_dict.get("prompt_length", 0))
+                completion_length = int(rollout_dict.get(
+                    "completion_length", max(0, len(tokens) - prompt_length),
+                ))
+                eos_terminated = (
+                    bool(tokens) and eos_id is not None and tokens[-1] == eos_id
+                )
+                entry = {
+                    "tokens": tokens,
+                    "reward": r.reward,
+                    "completion_length": completion_length,
+                    "eos_terminated": eos_terminated,
+                }
+                if with_text:
+                    entry["completion_text"] = text
+                out.append(entry)
+            return out
+
+        batched_keys = {(s.hotkey, s.prompt_idx, s.signed_round) for s in batch}
+
         batch_entries = []
         for s in batch:
             problem = self.env.get_problem(s.prompt_idx)
-            rollouts_payload = [
-                {
-                    "tokens": r.tokens,
-                    "completion_text": text,
-                    "reward": r.reward,
-                }
-                for r, text in zip(s.rollouts, s.completion_texts)
-            ]
-            response_time = (
-                s.arrived_at - window_opened_at
-                if window_opened_at is not None and s.arrived_at
-                else None
-            )
             batch_entries.append({
                 "hotkey": s.hotkey,
                 "prompt_idx": s.prompt_idx,
@@ -419,8 +442,33 @@ class ValidationService:
                 "sigma": s.sigma,
                 "prompt": problem.get("prompt", ""),
                 "ground_truth": problem.get("ground_truth", ""),
-                "rollouts": rollouts_payload,
-                "response_time": response_time,
+                "rollouts": _rollout_payload(s, with_text=True),
+                "response_time": _resp_time(s.arrived_at),
+                "merkle_root": s.merkle_root_bytes.hex(),
+                "claimed_checkpoint_hash": s.claimed_checkpoint_hash,
+                "sketch_diff_max": s.sketch_diff_max,
+                "lp_dev_max": s.lp_dev_max,
+                "dist_q10_min": s.dist_q10_min,
+            })
+
+        # All validated submissions that didn't make the final batch — metadata
+        # only (no rollouts/text, no prompt) so miners can see their participation
+        # without ballooning the dataset size.
+        runners_up = []
+        for s in batcher.valid_submissions():
+            key = (s.hotkey, s.prompt_idx, s.signed_round)
+            if key in batched_keys:
+                continue
+            runners_up.append({
+                "hotkey": s.hotkey,
+                "prompt_idx": s.prompt_idx,
+                "signed_round": s.signed_round,
+                "sigma": s.sigma,
+                "response_time": _resp_time(s.arrived_at),
+                "merkle_root": s.merkle_root_bytes.hex(),
+                "sketch_diff_max": s.sketch_diff_max,
+                "lp_dev_max": s.lp_dev_max,
+                "dist_q10_min": s.dist_q10_min,
             })
 
         archive = {
@@ -429,6 +477,8 @@ class ValidationService:
             "randomness": batcher.randomness,
             "environment": self.env.name,
             "batch": batch_entries,
+            "runners_up": runners_up,
+            "reject_summary": dict(getattr(batcher, "reject_counts", {})),
         }
         await storage.upload_window_dataset(batcher.window_start, archive)
 

@@ -58,6 +58,14 @@ class ValidSubmission:
     rollouts: list[RolloutSubmission] = field(default_factory=list)
     completion_texts: list[str] = field(default_factory=list)
     arrived_at: float = 0.0
+    # Filter telemetry (worst-case across this submission's rollouts).
+    # Captured for post-hoc threshold calibration without re-running tests.
+    sketch_diff_max: int | None = None
+    lp_dev_max: float | None = None
+    dist_q10_min: float | None = None
+    # Miner-claimed checkpoint hash at submit time — useful for post-hoc
+    # forensic analysis of who lied about their checkpoint.
+    claimed_checkpoint_hash: str = ""
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -119,6 +127,10 @@ class GrpoWindowBatcher:
         self._lock = threading.Lock()
         self._valid: list[ValidSubmission] = []
         self.randomness: str = ""
+        # Accumulated reject reasons this window (RejectReason.value → count).
+        # Persisted in the R2 archive so miners can see which filter is
+        # rejecting the most submissions in any given round.
+        self.reject_counts: dict[str, int] = {}
 
         # v2.1: seal_event fires the moment the B-th distinct non-cooldown
         # valid submission lands. Service awaits this to close the window.
@@ -176,6 +188,11 @@ class GrpoWindowBatcher:
         if not is_in_zone(sigma, bootstrap=self.bootstrap):
             return self._reject(RejectReason.OUT_OF_ZONE)
 
+        # Per-submission worst-case filter telemetry (across all rollouts).
+        sketch_diff_max = 0
+        lp_dev_max: float | None = None
+        dist_q10_min: float | None = None
+
         for rollout in request.rollouts:
             if not self._verify_proof_version(rollout.commit):
                 return self._reject(RejectReason.GRAIL_FAIL)
@@ -184,6 +201,8 @@ class GrpoWindowBatcher:
             proof = self._verify_commitment(
                 rollout.commit, self.model, self.randomness
             )
+            if proof.sketch_diff_max > sketch_diff_max:
+                sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
                 return self._reject(RejectReason.GRAIL_FAIL)
 
@@ -205,6 +224,9 @@ class GrpoWindowBatcher:
                 logits=proof.logits,
                 challenge_randomness=self.randomness,
             )
+            if lp_dev is not None and lp_dev != float("inf"):
+                if lp_dev_max is None or lp_dev > lp_dev_max:
+                    lp_dev_max = float(lp_dev)
             if not lp_ok:
                 logger.info(
                     "reject reason=logprob_mismatch hotkey=%s median_dev=%.4f",
@@ -220,6 +242,10 @@ class GrpoWindowBatcher:
                 logits=proof.logits,
                 temperature=T_PROTO,
             )
+            if dist_metrics and "q10" in dist_metrics:
+                q10 = float(dist_metrics["q10"])
+                if dist_q10_min is None or q10 < dist_q10_min:
+                    dist_q10_min = q10
             if dist_ok is False:
                 logger.info(
                     "reject reason=distribution_suspicious hotkey=%s %s",
@@ -237,6 +263,10 @@ class GrpoWindowBatcher:
                 rollouts=list(request.rollouts),
                 completion_texts=completion_texts,
                 arrived_at=self._time_fn(),
+                sketch_diff_max=sketch_diff_max,
+                lp_dev_max=lp_dev_max,
+                dist_q10_min=dist_q10_min,
+                claimed_checkpoint_hash=request.checkpoint_hash,
             )
         )
 
@@ -259,8 +289,8 @@ class GrpoWindowBatcher:
             return False
         return (self.current_round - signed_round) <= STALE_ROUND_LAG_MAX
 
-    @staticmethod
-    def _reject(reason: RejectReason) -> BatchSubmissionResponse:
+    def _reject(self, reason: RejectReason) -> BatchSubmissionResponse:
+        self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1
         return BatchSubmissionResponse(accepted=False, reason=reason)
 
     # ----------------------------- accessors -----------------------------

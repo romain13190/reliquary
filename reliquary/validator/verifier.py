@@ -28,12 +28,18 @@ class ProofResult:
     validator's forward pass at LAYER_INDEX. Downstream behavioural
     validators (logprob / distribution) read it to avoid re-running the
     forward pass.
+
+    ``sketch_diff_max`` is the worst per-position |miner_sketch -
+    validator_sketch| across the K challenge positions (mod PRIME_Q),
+    surfaced for post-hoc threshold calibration even when the proof
+    passed the current tolerance.
     """
 
     all_passed: bool
     passed: int
     checked: int
     logits: torch.Tensor  # shape: [seq_len, vocab_size], on CPU
+    sketch_diff_max: int = 0
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -117,15 +123,19 @@ def verify_commitment_proofs(
 
     passed = 0
     checked = 0
+    sketch_diff_max = 0
     for idx in challenge_indices:
         if idx >= seq_len:
             continue
         checked += 1
         miner_commit = commitments[idx]
         validator_hidden = hidden_states[idx]
-        valid, _ = verifier.verify_commitment(
+        valid, diag = verifier.verify_commitment(
             validator_hidden, miner_commit, r_vec, seq_len, idx
         )
+        sketch_diff = int((diag or {}).get("sketch_diff", 0))
+        if sketch_diff > sketch_diff_max:
+            sketch_diff_max = sketch_diff
         if valid:
             passed += 1
 
@@ -134,6 +144,7 @@ def verify_commitment_proofs(
     all_passed = passed == checked and checked >= expected_challenges
     return ProofResult(
         all_passed=all_passed, passed=passed, checked=checked, logits=logits,
+        sketch_diff_max=sketch_diff_max,
     )
 
 
