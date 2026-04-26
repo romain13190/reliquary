@@ -109,7 +109,7 @@ See [docs/concepts.md](concepts.md#economic-model) for the full economic model.
 |---|---|
 | OS | Linux (tested on Ubuntu 22.04 / 24.04) |
 | Python | 3.11 or newer |
-| GPU | 1× or 2× NVIDIA GPU, ≥ 24 GB VRAM each. Reference config: 2× GPU (generation on GPU 0, proof on GPU 1). Single GPU works if it holds two model copies. |
+| GPU | 1× or 2× NVIDIA GPU, ≥ 24 GB VRAM each. Reference config: 2× GPU (generation on GPU 0, proof on GPU 1). Single GPU works if it holds two model copies. **Test phase: use an NVIDIA H200** — see "Hardware homogeneity" note below. |
 | CUDA | 12.x with `flash-attn`-compatible drivers |
 | RAM | 32 GB minimum |
 | Disk | 50 GB (model weights and HF cache) |
@@ -117,6 +117,23 @@ See [docs/concepts.md](concepts.md#economic-model) for the full economic model.
 | Bittensor wallet | Created and registered on netuid 81 |
 
 No R2 or S3 credentials are needed on the miner — only the validator uploads the window dataset.
+
+### Hardware homogeneity (test phase)
+
+The subnet is still in its test phase. We ran a 10-run, 30-step cheater-curve
+sweep (`scripts/cheater_curve_threshold.py`) and tightened
+`PROOF_SKETCH_TOLERANCE_BASE` to **1000** based on observed signal-vs-noise:
+this catches an off-policy miner (one running a checkpoint older than the
+validator's) starting from the very first weight update, with 0 % false
+positives **on identical hardware**. Cross-GPU honest noise has not yet been
+measured.
+
+Until that calibration is published, miners are recommended to run the same
+card as the validator — currently an **NVIDIA H200**. Running a different
+card (H100, A100, etc.) may produce sketch divergence above the tolerance
+even on a perfectly honest checkpoint, leading to `GRAIL_FAIL` rejections
+through no fault of the miner. We will widen the tolerance or publish a
+per-GPU calibration once we have honest cross-GPU data.
 
 ## Install
 

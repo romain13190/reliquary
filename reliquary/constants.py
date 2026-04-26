@@ -35,11 +35,14 @@ PROOF_NUM_BUCKETS = 8
 # Bounded coefficient range for sketch robustness: r in [-127, 127].
 PROOF_COEFF_RANGE = 127
 
-# Sketch tolerance at position 0. Covers cross-GPU drift.
-# Empirical max diff across ~300M positions = 3979. 3000 sits below the
-# cross-GPU floor: it relies on the LogprobValidator to catch divergence
-# rather than blanket-tolerating any drift up to 6000.
-PROOF_SKETCH_TOLERANCE_BASE = 3000
+# Sketch tolerance at position 0. Calibrated against a 10×30 cheater-curve
+# sweep (scripts/cheater_curve_threshold.py) where a frozen base miner
+# faces a freshly-trained validator: 1000 catches a 1-step-stale cheater
+# with 75 % probability and 95 %+ from step 10 onwards, with 0 % false
+# positives same-GPU. Subnet currently in test phase — miners are advised
+# to use the same card as the validator (H200) until cross-GPU honest
+# noise is measured. See docs/mining.md.
+PROOF_SKETCH_TOLERANCE_BASE = 1000
 
 # Sketch tolerance sqrt growth factor per position.
 # tolerance(P) = base + growth * sqrt(P).
