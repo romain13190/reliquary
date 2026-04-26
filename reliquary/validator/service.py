@@ -395,6 +395,7 @@ class ValidationService:
         self._set_state(WindowState.READY)
 
     async def _archive_window(self, batcher, batch) -> None:
+        window_opened_at = getattr(batcher, "window_opened_at", None)
         batch_entries = []
         for s in batch:
             problem = self.env.get_problem(s.prompt_idx)
@@ -406,6 +407,11 @@ class ValidationService:
                 }
                 for r, text in zip(s.rollouts, s.completion_texts)
             ]
+            response_time = (
+                s.arrived_at - window_opened_at
+                if window_opened_at is not None and s.arrived_at
+                else None
+            )
             batch_entries.append({
                 "hotkey": s.hotkey,
                 "prompt_idx": s.prompt_idx,
@@ -414,6 +420,7 @@ class ValidationService:
                 "prompt": problem.get("prompt", ""),
                 "ground_truth": problem.get("ground_truth", ""),
                 "rollouts": rollouts_payload,
+                "response_time": response_time,
             })
 
         archive = {

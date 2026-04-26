@@ -92,6 +92,10 @@ class GrpoWindowBatcher:
         self.bootstrap = bootstrap
         self._completion_text = completion_text_fn
         self._time_fn = time_fn or time.monotonic
+        # Reference for per-submission response_time. Set at construction so
+        # ``arrived_at - window_opened_at`` is the seconds the miner took
+        # from window-open to accepted submission.
+        self.window_opened_at: float = self._time_fn()
 
         self._cooldown = (
             cooldown_map if cooldown_map is not None

@@ -63,9 +63,12 @@ async def test_archive_includes_prompt_and_rollout_content():
     batcher = MagicMock()
     batcher.window_start = 42
     batcher.randomness = "0xdeadbeef"
+    batcher.window_opened_at = 100.0
 
     batch = [_valid_submission(prompt_idx=7, k=4, hotkey="hk1"),
              _valid_submission(prompt_idx=13, k=5, hotkey="hk2")]
+    batch[0].arrived_at = 102.5  # 2.5 s after window open
+    batch[1].arrived_at = 107.0  # 7.0 s after window open
 
     captured = {}
 
@@ -99,3 +102,7 @@ async def test_archive_includes_prompt_and_rollout_content():
     # cooldown rebuild backward-compat: still has window_start and batch[*].prompt_idx
     assert {"window_start", "batch"}.issubset(archive.keys())
     assert all("prompt_idx" in e for e in archive["batch"])
+
+    # response_time: seconds between window-open and submission-accepted.
+    assert entry0["response_time"] == pytest.approx(2.5)
+    assert archive["batch"][1]["response_time"] == pytest.approx(7.0)
