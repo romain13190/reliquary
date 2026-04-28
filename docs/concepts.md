@@ -164,7 +164,6 @@ A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the 
 ## Known limitations (v2.1)
 
 - **Single trainer.** v2.1 assumes a single trainer writing to R2. Multiple trainers in the same bucket would collide on archive keys (`reliquary/dataset/window-<N>.json.gz`). Multi-trainer consensus is v2.2 work.
-- **Placeholder drand round.** `current_round` in `/state` is a window counter, not a real drand beacon round. Miner and validator stay consistent with each other but external auditability via drand is reduced. Real drand wiring is v2.2.
 - **Optimizer and scheduler state not persisted.** A validator restart resets AdamW momentum and the LR scheduler step count to zero. Training regresses for `LR_WARMUP_WINDOWS = 10` windows before stabilizing. Minimize restarts.
 - **No automatic HF checkpoint garbage collection.** Every publish creates a new HF commit. Old revisions accumulate. Plan manual or cron-based cleanup.
 - **No automatic R2 retention.** Every window archives ~1 MB compressed. Add a bucket lifecycle rule for archives older than your retention window.

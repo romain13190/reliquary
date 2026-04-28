@@ -90,11 +90,19 @@ class GrpoWindowBatcher:
         verify_signature_fn: Callable[[dict, str], bool] | None = None,
         verify_proof_version_fn: Callable[[dict], bool] | None = None,
         time_fn: Callable[[], float] | None = None,
+        now_round_fn: Callable[[], int] | None = None,
     ) -> None:
         import time
 
         self.window_start = window_start
-        self.current_round = current_round
+        # If ``now_round_fn`` is supplied, ``current_round`` becomes a live
+        # property that re-evaluates the drand round on every access — this
+        # is what the production validator uses so the anti-replay window
+        # (STALE_ROUND_LAG_MAX rounds) stays a sliding 30-second window
+        # over the full WINDOW_TIMEOUT_SECONDS lifetime, instead of being
+        # frozen at window open. Tests pass a static int for determinism.
+        self._current_round_static = current_round
+        self._now_round_fn = now_round_fn
         self.env = env
         self.model = model
         self.bootstrap = bootstrap
@@ -141,6 +149,12 @@ class GrpoWindowBatcher:
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
+
+    @property
+    def current_round(self) -> int:
+        if self._now_round_fn is not None:
+            return self._now_round_fn()
+        return self._current_round_static
 
     @property
     def seal_event(self) -> asyncio.Event:

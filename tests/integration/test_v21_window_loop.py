@@ -108,7 +108,7 @@ def _patch_open_grpo_window(svc):
 
     real_open = svc_mod.open_grpo_window
 
-    def _mock_open(window_start, current_round, env, model, *, cooldown_map, tokenizer, bootstrap=False):
+    def _mock_open(window_start, current_round, env, model, *, cooldown_map, tokenizer, bootstrap=False, now_round_fn=None):
         return GrpoWindowBatcher(
             window_start=window_start,
             current_round=current_round,
@@ -116,6 +116,7 @@ def _patch_open_grpo_window(svc):
             model=model,
             cooldown_map=cooldown_map,
             bootstrap=bootstrap,
+            now_round_fn=now_round_fn,
             # Stub out torch-dependent verifiers.
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,

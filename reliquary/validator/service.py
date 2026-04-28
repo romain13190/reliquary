@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from typing import Any
+from typing import Any, Callable
 
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
@@ -65,12 +65,17 @@ def open_grpo_window(
     cooldown_map: CooldownMap,
     tokenizer,
     bootstrap: bool = False,
+    now_round_fn: Callable[[], int] | None = None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
     ``cooldown_map`` is the validator's long-lived CooldownMap, shared
     across windows. Each window's sealed batch updates it via
     ``GrpoWindowBatcher.seal_batch``.
+
+    ``now_round_fn`` lets the validator inject a live drand-round getter so
+    the anti-replay check uses wall-clock drand state instead of a value
+    frozen at window open.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -84,6 +89,7 @@ def open_grpo_window(
         cooldown_map=cooldown_map,
         bootstrap=bootstrap,
         completion_text_fn=_completion_text,
+        now_round_fn=now_round_fn,
     )
 
 
@@ -219,11 +225,7 @@ class ValidationService:
     def _set_state(self, s: WindowState) -> None:
         self._current_window_state = s
         # Also notify the server so /state returns the right value.
-        try:
-            self.server.set_current_state(s)
-        except AttributeError:
-            # Task 9 adds this method; be tolerant during development.
-            pass
+        self.server.set_current_state(s)
 
     async def _apply_resume_from(self) -> None:
         """If --resume-from was set, load the model from that source and
@@ -280,10 +282,7 @@ class ValidationService:
         )
         self._checkpoint_store._current = entry
         self._checkpoint_n = checkpoint_n
-        try:
-            self.server.set_current_checkpoint(entry)
-        except AttributeError:
-            pass
+        self.server.set_current_checkpoint(entry)
         logger.info(
             "Resumed from %s: checkpoint_n=%d",
             self._resume_from, checkpoint_n,
@@ -305,10 +304,11 @@ class ValidationService:
         )
         self._active_batcher = open_grpo_window(
             window_start=self._window_n,
-            current_round=self._window_n,  # placeholder; drand wiring later
+            current_round=0,  # unused — superseded by now_round_fn below
             env=self.env, model=self.model,
             cooldown_map=self._cooldown_map, tokenizer=self.tokenizer,
             bootstrap=bootstrap,
+            now_round_fn=self._compute_current_drand_round,
         )
         cp = self._checkpoint_store.current_manifest()
         self._active_batcher.current_checkpoint_hash = (
@@ -369,10 +369,7 @@ class ValidationService:
                         checkpoint_n=next_n, model=self.model,
                     )
                     self._checkpoint_n = next_n
-                    try:
-                        self.server.set_current_checkpoint(entry)
-                    except AttributeError:
-                        pass
+                    self.server.set_current_checkpoint(entry)
                     logger.info(
                         "Published checkpoint %d to %s@%s",
                         entry.checkpoint_n, entry.repo_id, entry.revision[:12],
@@ -702,6 +699,22 @@ class ValidationService:
                 block_hash, beacon["randomness"], drand_round=beacon["round"],
             )
         return chain.compute_window_randomness(block_hash)
+
+    def _compute_current_drand_round(self) -> int:
+        """Live drand round at the time of call. Used by the batcher's
+        anti-replay check to slide the accepted-round window with wall
+        clock — a window that lasts WINDOW_TIMEOUT_SECONDS would otherwise
+        outlive STALE_ROUND_LAG_MAX × period seconds and reject every
+        submission past that point.
+
+        With ``use_drand=False`` (test/mock mode) we return ``window_n``
+        so legacy deterministic tests keep working.
+        """
+        if not self.use_drand:
+            return self._window_n
+        import time as _time
+        from reliquary.infrastructure.drand import get_round_at_time
+        return get_round_at_time(int(_time.time()))
 
     async def _submit_weights(self, subtensor) -> bool:
         """Submit weights from the current EMA snapshot. EMA is NOT cleared
