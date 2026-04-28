@@ -175,7 +175,3 @@ A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the 
 
 - [docs/mining.md](mining.md) — operator guide for miners
 - [docs/validating.md](validating.md) — operator guide for validators
-- [docs/deployment.md](deployment.md) — bootstrap a new validator end-to-end
-- [docs/training.md](training.md) — GRPO loss internals
-- [docs/superpowers/specs/2026-04-20-grpo-market-design.md](superpowers/specs/2026-04-20-grpo-market-design.md) — original v2 spec
-- [docs/superpowers/specs/2026-04-21-batch-driven-windows-design.md](superpowers/specs/2026-04-21-batch-driven-windows-design.md) — v2.1 state machine spec
