@@ -2,7 +2,7 @@
 # Mount ONLY the hotkey file + coldkeypub; never mount the coldkey itself.
 services:
   reliquary-trainer:
-    image: ghcr.io/romain13190/reliquary-validator:latest
+    image: ghcr.io/reliquadotai/reliquary-validator:latest
     container_name: reliquary-trainer
     restart: unless-stopped
     env_file: .env

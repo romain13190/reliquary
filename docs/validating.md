@@ -22,7 +22,7 @@ You need:
 - R2 read credentials (the trainer publishes window archives to R2; you read them).
 
 ```bash
-git clone https://github.com/romain13190/reliquary.git
+git clone https://github.com/reliquadotai/reliquary.git
 cd reliquary/docker
 cp .env.example.weight-only .env
 # Edit .env with your values (see "What goes in .env" below)
@@ -78,7 +78,7 @@ You need:
 - R2 **write** credentials.
 
 ```bash
-git clone https://github.com/romain13190/reliquary.git
+git clone https://github.com/reliquadotai/reliquary.git
 cd reliquary/docker
 cp .env.example.trainer .env
 # Edit .env (see below)
