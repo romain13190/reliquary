@@ -86,6 +86,7 @@ class GrpoWindowBatcher:
         cooldown_map: CooldownMap | None = None,
         bootstrap: bool = False,
         completion_text_fn: Callable[[RolloutSubmission], str],
+        canonical_prompt_tokens_fn: Callable[[int], list[int]] | None = None,
         verify_commitment_proofs_fn: Callable[..., Any] | None = None,
         verify_signature_fn: Callable[[dict, str], bool] | None = None,
         verify_proof_version_fn: Callable[[dict], bool] | None = None,
@@ -107,6 +108,11 @@ class GrpoWindowBatcher:
         self.model = model
         self.bootstrap = bootstrap
         self._completion_text = completion_text_fn
+        # Returns the canonical prompt tokens for a given prompt_idx — used to
+        # bind the miner's claimed prompt_idx to the actual tokens they ran the
+        # forward pass on. ``None`` disables the binding check (test convenience
+        # for stubs that don't carry a tokenizer).
+        self._canonical_prompt_tokens = canonical_prompt_tokens_fn
         self._time_fn = time_fn or time.monotonic
         # Reference for per-submission response_time. Set at construction so
         # ``arrived_at - window_opened_at`` is the seconds the miner took
@@ -207,7 +213,29 @@ class GrpoWindowBatcher:
         lp_dev_max: float | None = None
         dist_q10_min: float | None = None
 
+        # Bind ``prompt_idx`` to the actual prompt tokens the miner ran their
+        # forward pass on. Without this, a miner can submit completions
+        # generated under a modified prompt (CoT prefix, alternate chat
+        # template, few-shot examples) while claiming the canonical
+        # ``prompt_idx``: the reward check still passes if the underlying
+        # question is intact, but training sees a distribution shift. Compute
+        # the canonical tokens once per submission and reject any rollout
+        # whose ``tokens[:prompt_length]`` diverges before doing GRAIL compute.
+        canonical_prompt_tokens: list[int] | None = None
+        if self._canonical_prompt_tokens is not None:
+            canonical_prompt_tokens = list(
+                self._canonical_prompt_tokens(request.prompt_idx)
+            )
+
         for rollout in request.rollouts:
+            if canonical_prompt_tokens is not None:
+                rollout_meta = rollout.commit.get("rollout", {}) or {}
+                miner_prompt_len = int(rollout_meta.get("prompt_length", 0))
+                miner_prompt_tokens = list(rollout.commit.get("tokens", []))[
+                    :miner_prompt_len
+                ]
+                if miner_prompt_tokens != canonical_prompt_tokens:
+                    return self._reject(RejectReason.PROMPT_MISMATCH)
             if not self._verify_proof_version(rollout.commit):
                 return self._reject(RejectReason.GRAIL_FAIL)
             if not self._verify_signature(rollout.commit, request.miner_hotkey):

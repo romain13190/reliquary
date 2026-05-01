@@ -351,3 +351,105 @@ def test_seal_event_not_set_with_fewer_than_b():
         )
         b.accept_submission(req)
     assert not b.seal_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Prompt-binding (canonical_prompt_tokens_fn)
+# ---------------------------------------------------------------------------
+#
+# A miner can pass every other check while having generated under a modified
+# prompt (CoT prefix, alternate chat template, few-shot examples) by:
+#   1. Running their forward pass on prompt_modified
+#   2. Sending the resulting completions + GRAIL sketch to the validator
+#   3. Claiming the canonical prompt_idx
+# GRAIL alone won't catch this because the validator re-runs forward on the
+# *miner-supplied tokens* — both produce the same sketch.
+#
+# canonical_prompt_tokens_fn closes the gap: the validator computes the
+# canonical prompt tokens for the claimed prompt_idx from its own env +
+# tokenizer, and rejects any submission whose tokens[:prompt_length] diverges.
+
+
+def _request_with_prompt_tokens(
+    *, prompt_idx: int, prompt_tokens: list[int],
+    completion_tokens: list[int] | None = None,
+    rewards: list[float] | None = None, hotkey: str = "hk",
+):
+    """Like ``_request`` but sets ``commit['rollout']['prompt_length']`` and
+    builds ``commit['tokens']`` = prompt + completion explicitly so the
+    validator's prompt-binding check has something to inspect."""
+    if completion_tokens is None:
+        completion_tokens = [99]
+    if rewards is None:
+        rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    rollouts = []
+    for r in rewards:
+        text = "CORRECT" if r > 0.5 else "wrong"
+        full_tokens = list(prompt_tokens) + list(completion_tokens)
+        rollouts.append(
+            RolloutSubmission(
+                tokens=full_tokens, reward=r,
+                commit={
+                    "proof_version": "v5",
+                    "tokens": full_tokens,
+                    "rollout": {
+                        "prompt_length": len(prompt_tokens),
+                        "completion_length": len(completion_tokens),
+                    },
+                    "completion_text_for_test": text,
+                },
+            )
+        )
+    return BatchSubmissionRequest(
+        miner_hotkey=hotkey, prompt_idx=prompt_idx,
+        window_start=500, signed_round=1000,
+        merkle_root="00" * 32, rollouts=rollouts,
+        checkpoint_hash="",  # gate disabled for these tests
+    )
+
+
+def test_prompt_mismatch_rejected_when_canonical_differs():
+    """Miner runs forward pass on a CoT-prefixed prompt but claims the
+    canonical prompt_idx → validator detects the prompt_tokens don't match
+    its env's canonical version → PROMPT_MISMATCH before any GRAIL compute."""
+    canonical = [10, 11, 12]            # what the env says prompt 42 is
+    miner_used = [99, 10, 11, 12]       # CoT prefix + canonical question
+
+    b = _make_batcher(
+        canonical_prompt_tokens_fn=lambda idx: canonical if idx == 42 else [],
+    )
+    req = _request_with_prompt_tokens(
+        prompt_idx=42, prompt_tokens=miner_used, completion_tokens=[200, 201],
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_MISMATCH
+
+
+def test_prompt_match_accepted_when_canonical_equals():
+    """Honest miner: prompt_tokens match the env's canonical version → check
+    is a no-op, submission proceeds through the rest of the pipeline."""
+    canonical = [10, 11, 12]
+    b = _make_batcher(
+        canonical_prompt_tokens_fn=lambda idx: canonical if idx == 42 else [],
+    )
+    req = _request_with_prompt_tokens(
+        prompt_idx=42, prompt_tokens=canonical, completion_tokens=[200, 201],
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
+def test_no_canonical_fn_disables_check():
+    """When ``canonical_prompt_tokens_fn`` is None (test stubs), the binding
+    check is skipped — preserves backward compatibility for existing tests
+    that don't carry a real tokenizer."""
+    b = _make_batcher()  # no canonical_prompt_tokens_fn passed
+    # Use an arbitrary prompt_tokens; without a canonical, nothing to compare.
+    req = _request_with_prompt_tokens(
+        prompt_idx=42, prompt_tokens=[7, 8, 9],
+    )
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED

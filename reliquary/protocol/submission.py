@@ -31,6 +31,7 @@ class RejectReason(str, Enum):
     ACCEPTED = "accepted"
     BAD_SIGNATURE = "bad_signature"
     BAD_PROMPT_IDX = "bad_prompt_idx"
+    PROMPT_MISMATCH = "prompt_mismatch"
     DISTRIBUTION_SUSPICIOUS = "distribution_suspicious"
     STALE_ROUND = "stale_round"
     PROMPT_IN_COOLDOWN = "prompt_in_cooldown"

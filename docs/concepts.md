@@ -137,6 +137,7 @@ A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the 
 | `WINDOW_MISMATCH` | `window_start` in request does not match current window | Refresh `/state` and retry |
 | `WRONG_CHECKPOINT` | `checkpoint_hash` is stale | Re-poll `/state`, update revision, retry |
 | `BAD_PROMPT_IDX` | `prompt_idx >= len(env)` | Use a valid index from the environment |
+| `PROMPT_MISMATCH` | `tokens[:prompt_length]` does not match the canonical tokenization of `env.get_problem(prompt_idx).prompt` (CoT prefix, alternate chat template, custom system prompt, etc.) | Use the env's exact prompt string and the pinned tokenizer; do not modify the prompt before generation |
 | `STALE_ROUND` | `signed_round` more than 10 behind current or from the future | Ensure drand client is synced |
 | `PROMPT_IN_COOLDOWN` | Prompt is in the active 50-window cooldown set | Pick a different `prompt_idx` |
 | `REWARD_MISMATCH` | Claimed reward does not match validator's `env.compute_reward` | Check env and model version alignment |

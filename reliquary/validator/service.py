@@ -81,6 +81,10 @@ def open_grpo_window(
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
         return tokenizer.decode(rollout.tokens[prompt_len:])
 
+    def _canonical_prompt_tokens(prompt_idx: int) -> list[int]:
+        problem = env.get_problem(prompt_idx)
+        return list(tokenizer.encode(problem["prompt"], add_special_tokens=False))
+
     return GrpoWindowBatcher(
         window_start=window_start,
         current_round=current_round,
@@ -89,6 +93,7 @@ def open_grpo_window(
         cooldown_map=cooldown_map,
         bootstrap=bootstrap,
         completion_text_fn=_completion_text,
+        canonical_prompt_tokens_fn=_canonical_prompt_tokens,
         now_round_fn=now_round_fn,
     )
 
