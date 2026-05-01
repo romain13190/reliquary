@@ -35,6 +35,7 @@ class RejectReason(str, Enum):
     DISTRIBUTION_SUSPICIOUS = "distribution_suspicious"
     STALE_ROUND = "stale_round"
     PROMPT_IN_COOLDOWN = "prompt_in_cooldown"
+    SUPERSEDED = "superseded"
     GRAIL_FAIL = "grail_fail"
     LOGPROB_MISMATCH = "logprob_mismatch"
     REWARD_MISMATCH = "reward_mismatch"

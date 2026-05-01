@@ -140,6 +140,7 @@ A miner consistently winning 2 slots per window gets roughly `2/8 = 25%` of the 
 | `PROMPT_MISMATCH` | `tokens[:prompt_length]` does not match the canonical tokenization of `env.get_problem(prompt_idx).prompt` (CoT prefix, alternate chat template, custom system prompt, etc.) | Use the env's exact prompt string and the pinned tokenizer; do not modify the prompt before generation |
 | `STALE_ROUND` | `signed_round` more than 10 behind current or from the future | Ensure drand client is synced |
 | `PROMPT_IN_COOLDOWN` | Prompt is in the active 50-window cooldown set | Pick a different `prompt_idx` |
+| `SUPERSEDED` | Another submission for this prompt already has a `signed_round` ≤ this one — it can't beat the incumbent at `select_batch` | Sign and submit earlier next window, or pick a different `prompt_idx` |
 | `REWARD_MISMATCH` | Claimed reward does not match validator's `env.compute_reward` | Check env and model version alignment |
 | `OUT_OF_ZONE` | `σ < 0.43` (or `σ < 0.33` during bootstrap) | Pick a different prompt |
 | `WRONG_ROLLOUT_COUNT` | Submission does not have exactly `M_ROLLOUTS = 8` rollouts | Always submit exactly 8 |

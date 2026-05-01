@@ -453,3 +453,115 @@ def test_no_canonical_fn_disables_check():
     resp = b.accept_submission(req)
     assert resp.accepted is True
     assert resp.reason == RejectReason.ACCEPTED
+
+
+# ---------------------------------------------------------------------------
+# FIFO short-circuit (SUPERSEDED)
+# ---------------------------------------------------------------------------
+#
+# select_batch picks the submission with the smallest signed_round per
+# prompt_idx. Once we've accepted a submission with signed_round=R for
+# prompt 42, any future submission for prompt 42 with signed_round >= R
+# can't beat it — reject early to skip the (~3s GPU) GRAIL forward pass.
+# A submission with signed_round < R legitimately races ahead and falls
+# through to the full pipeline.
+
+
+def test_superseded_rejects_higher_signed_round_same_prompt():
+    """Second arrival for the same prompt with a *later* signed_round can't
+    beat the incumbent → reject before reward/GRAIL compute."""
+    b = _make_batcher()
+    first = _request_v21(
+        prompt_idx=42, signed_round=995, hotkey="A", checkpoint_hash="",
+    )
+    second = _request_v21(
+        prompt_idx=42, signed_round=998, hotkey="B", checkpoint_hash="",
+    )
+    r1 = b.accept_submission(first)
+    r2 = b.accept_submission(second)
+    assert r1.accepted is True
+    assert r2.accepted is False
+    assert r2.reason == RejectReason.SUPERSEDED
+    # Only the incumbent is in _valid — the SUPERSEDED reject didn't pollute it.
+    assert len(b._valid) == 1
+    assert b._valid[0].hotkey == "A"
+
+
+def test_superseded_rejects_equal_signed_round_same_prompt():
+    """Same signed_round can't strictly beat the incumbent (tiebreak is
+    deterministic but still a tie at the round level) → reject early.
+    This also handles the same-miner-spamming-same-prompt DoS case."""
+    b = _make_batcher()
+    first = _request_v21(
+        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
+    )
+    second = _request_v21(
+        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
+    )
+    assert b.accept_submission(first).accepted is True
+    r2 = b.accept_submission(second)
+    assert r2.accepted is False
+    assert r2.reason == RejectReason.SUPERSEDED
+
+
+def test_lower_signed_round_falls_through_and_wins_at_seal():
+    """A late-arriving submission with strictly smaller signed_round
+    legitimately races ahead — it must run through the full pipeline,
+    not be rejected. select_batch will then pick it over the incumbent."""
+    b = _make_batcher()
+    incumbent = _request_v21(
+        prompt_idx=42, signed_round=998, hotkey="B", checkpoint_hash="",
+    )
+    challenger = _request_v21(
+        prompt_idx=42, signed_round=995, hotkey="A", checkpoint_hash="",
+    )
+    assert b.accept_submission(incumbent).accepted is True
+    r2 = b.accept_submission(challenger)
+    assert r2.accepted is True
+    assert r2.reason == RejectReason.ACCEPTED
+    # Both are in _valid; select_batch resolves by signed_round.
+    assert len(b._valid) == 2
+    from reliquary.validator.batch_selection import select_batch
+    batch = select_batch(
+        b._valid, b=B_BATCH, current_window=b.window_start, cooldown_map=b._cooldown,
+    )
+    assert len(batch) == 1
+    assert batch[0].hotkey == "A"  # smaller signed_round won
+
+
+def test_different_prompts_tracked_independently():
+    """SUPERSEDED is per-prompt — accepting prompt 42 must not block prompt 43."""
+    b = _make_batcher()
+    r_a = b.accept_submission(_request_v21(
+        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
+    ))
+    r_b = b.accept_submission(_request_v21(
+        prompt_idx=43, signed_round=1000, hotkey="A", checkpoint_hash="",
+    ))
+    assert r_a.accepted is True
+    assert r_b.accepted is True
+    assert len(b._valid) == 2
+    assert b._best_round_per_prompt == {42: 1000, 43: 1000}
+
+
+def test_supersede_only_records_after_full_success():
+    """If a submission gets rejected mid-pipeline (e.g. GRAIL fail), it must
+    NOT update _best_round_per_prompt — otherwise an honest later submission
+    with a higher signed_round would be wrongly rejected as SUPERSEDED."""
+    # Use an always-failing GRAIL so the submission is rejected post-cheap-checks.
+    b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
+    first_fails = _request_v21(
+        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
+    )
+    r1 = b.accept_submission(first_fails)
+    assert r1.accepted is False
+    assert r1.reason == RejectReason.GRAIL_FAIL
+    # No incumbent recorded for prompt 42.
+    assert 42 not in b._best_round_per_prompt
+    # A subsequent honest submission for prompt 42 with a later signed_round
+    # must NOT be wrongly rejected as SUPERSEDED.
+    b._verify_commitment = _always_true_grail
+    r2 = b.accept_submission(_request_v21(
+        prompt_idx=42, signed_round=998, hotkey="B", checkpoint_hash="",
+    ))
+    assert r2.accepted is True

@@ -140,6 +140,13 @@ class GrpoWindowBatcher:
 
         self._lock = threading.Lock()
         self._valid: list[ValidSubmission] = []
+        # Per-prompt tracker for the lowest signed_round seen so far. Drives
+        # early rejection of any submission whose signed_round can't beat the
+        # incumbent — the FIFO winner per prompt is whichever has the smallest
+        # signed_round, so a new arrival with signed_round >= incumbent has
+        # zero chance of making the batch and we skip its GRAIL forward pass.
+        # Updated only after a submission passes the full pipeline.
+        self._best_round_per_prompt: dict[int, int] = {}
         self.randomness: str = ""
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
@@ -195,6 +202,16 @@ class GrpoWindowBatcher:
             return self._reject(RejectReason.STALE_ROUND)
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return self._reject(RejectReason.PROMPT_IN_COOLDOWN)
+        # FIFO short-circuit: select_batch picks the submission with the
+        # smallest signed_round per prompt_idx. A new arrival whose round
+        # is >= the incumbent's can't beat it, so reject before the heavy
+        # checks (reward / GRAIL). Smaller signed_round still falls through
+        # to the full pipeline and may replace the incumbent on success
+        # (keeps FIFO-by-signed_round semantics intact). Same-prompt-same-
+        # miner duplicate spam falls into the >= branch and is also blocked.
+        incumbent_round = self._best_round_per_prompt.get(request.prompt_idx)
+        if incumbent_round is not None and request.signed_round >= incumbent_round:
+            return self._reject(RejectReason.SUPERSEDED)
 
         problem = self.env.get_problem(request.prompt_idx)
         completion_texts = []
@@ -294,6 +311,13 @@ class GrpoWindowBatcher:
                     request.miner_hotkey, dist_metrics,
                 )
                 return self._reject(RejectReason.DISTRIBUTION_SUSPICIOUS)
+
+        # All checks passed — record the new (or improved) FIFO incumbent for
+        # this prompt so future submissions with signed_round >= this one are
+        # rejected early. A submission with a strictly smaller signed_round
+        # (rare; would require a stale beacon) still wins via select_batch
+        # because it sorts by signed_round across all entries in self._valid.
+        self._best_round_per_prompt[request.prompt_idx] = request.signed_round
 
         self._valid.append(
             ValidSubmission(
