@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from reliquary.constants import B_BATCH, M_ROLLOUTS
+from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RejectReason,
@@ -45,6 +45,40 @@ def _always_true_proof_version(commit):
     return True
 
 
+def _make_commit(
+    *,
+    tokens: list[int] | None = None,
+    prompt_length: int = 4,
+    success: bool = False,
+    total_reward: float = 0.0,
+) -> dict:
+    """Build a minimal commit that passes CommitModel.model_validate.
+
+    Default produces a ``CHALLENGE_K + 4`` token sequence: 4 prompt tokens,
+    ``CHALLENGE_K`` completion tokens (the minimum the proof needs).
+    """
+    if tokens is None:
+        tokens = list(range(CHALLENGE_K + prompt_length))
+    seq_len = len(tokens)
+    completion_length = seq_len - prompt_length
+    return {
+        "tokens": tokens,
+        "commitments": [{"sketch": 0} for _ in range(seq_len)],
+        "proof_version": "v5",
+        "model": {"name": "test-model", "layer_index": 6},
+        "signature": "ab" * 32,
+        "beacon": {"randomness": "cd" * 16},
+        "rollout": {
+            "prompt_length": prompt_length,
+            "completion_length": completion_length,
+            "success": success,
+            "total_reward": total_reward,
+            "advantage": 0.0,
+            "token_logprobs": [0.0] * seq_len,
+        },
+    }
+
+
 def _request(
     prompt_idx=42, signed_round=1000, window_start=500,
     rewards=None, hotkey="hk",
@@ -52,17 +86,13 @@ def _request(
     if rewards is None:
         rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
     rollouts = []
-    for i, r in enumerate(rewards):
-        text = "CORRECT" if r > 0.5 else "wrong"
+    for r in rewards:
+        commit = _make_commit(success=r > 0.5, total_reward=r)
         rollouts.append(
             RolloutSubmission(
-                tokens=[1, 2, 3, 4, 5],
+                tokens=commit["tokens"],
                 reward=r,
-                commit={
-                    "proof_version": "v5",
-                    "tokens": [1, 2, 3, 4, 5],
-                    "completion_text_for_test": text,
-                },
+                commit=commit,
             )
         )
     return BatchSubmissionRequest(
@@ -85,8 +115,8 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
         verify_commitment_proofs_fn=_always_true_grail,
         verify_signature_fn=_always_true_sig,
         verify_proof_version_fn=_always_true_proof_version,
-        completion_text_fn=lambda rollout: rollout.commit.get(
-            "completion_text_for_test", ""
+        completion_text_fn=lambda rollout: (
+            "CORRECT" if rollout.reward > 0.5 else "wrong"
         ),
     )
     kwargs.update(overrides)
@@ -150,18 +180,20 @@ def test_reject_grail_fail():
 
 
 def test_reject_reward_mismatch():
-    b = _make_batcher()
+    # Override completion_text_fn to always return "wrong", creating a reward mismatch
+    # when claim is 1.0
+    b = _make_batcher(completion_text_fn=lambda rollout: "wrong")
     rollouts = []
     for i in range(M_ROLLOUTS):
+        commit = _make_commit(success=False, total_reward=0.0)
+        # Claim high reward for first 4, but completion_text_fn will return "wrong"
+        # which computes to 0.0 reward, triggering REWARD_MISMATCH
+        claimed_reward = 1.0 if i < 4 else 0.0
         rollouts.append(
             RolloutSubmission(
-                tokens=[1, 2, 3],
-                reward=1.0 if i < 4 else 0.0,
-                commit={
-                    "proof_version": "v5",
-                    "tokens": [1, 2, 3],
-                    "completion_text_for_test": "wrong",
-                },
+                tokens=commit["tokens"],
+                reward=claimed_reward,
+                commit=commit,
             )
         )
     req = BatchSubmissionRequest(
@@ -259,15 +291,12 @@ def _request_v21(prompt_idx=42, signed_round=1000, window_start=500,
     if rewards is None:
         rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
     rollouts = []
-    for i, r in enumerate(rewards):
-        text = "CORRECT" if r > 0.5 else "wrong"
+    for r in rewards:
+        commit = _make_commit(success=r > 0.5, total_reward=r)
         rollouts.append(
             RolloutSubmission(
-                tokens=[1, 2, 3, 4, 5], reward=r,
-                commit={
-                    "proof_version": "v5", "tokens": [1, 2, 3, 4, 5],
-                    "completion_text_for_test": text,
-                },
+                tokens=commit["tokens"], reward=r,
+                commit=commit,
             )
         )
     return BatchSubmissionRequest(
