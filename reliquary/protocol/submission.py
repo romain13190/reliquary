@@ -166,7 +166,9 @@ class CommitModel(BaseModel):
     @field_validator("commitments")
     @classmethod
     def _commitments_len_matches_tokens(cls, v, info):
-        tokens = info.data.get("tokens", [])
+        if "tokens" not in info.data:
+            return v   # tokens itself failed validation; let that error stand alone
+        tokens = info.data["tokens"]
         if len(v) != len(tokens):
             raise ValueError(
                 f"commitments length {len(v)} must equal tokens length {len(tokens)}"
@@ -176,7 +178,9 @@ class CommitModel(BaseModel):
     @field_validator("rollout")
     @classmethod
     def _lengths_consistent(cls, v, info):
-        tokens = info.data.get("tokens", [])
+        if "tokens" not in info.data:
+            return v   # tokens itself failed validation; let that error stand alone
+        tokens = info.data["tokens"]
         if v.prompt_length + v.completion_length != len(tokens):
             raise ValueError(
                 f"prompt_length({v.prompt_length}) + "

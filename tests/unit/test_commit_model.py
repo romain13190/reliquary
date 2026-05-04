@@ -97,3 +97,17 @@ def test_beacon_randomness_must_be_hex():
     payload["beacon"]["randomness"] = "not-hex-zzz"
     with pytest.raises(ValidationError, match="randomness"):
         CommitModel.model_validate(payload)
+
+
+def test_short_tokens_does_not_cascade_misleading_errors():
+    """When ``tokens`` fails its own length check, the cross-field validators
+    must NOT report misleading "length 0" errors that mask the real cause.
+    """
+    payload = _valid_commit(seq_len=20, prompt_len=4)  # 20 < CHALLENGE_K
+    with pytest.raises(ValidationError) as exc_info:
+        CommitModel.model_validate(payload)
+    # The real error mentions tokens length being too short.
+    # The misleading cascade would say "tokens length 0" — must not appear.
+    error_str = str(exc_info.value)
+    assert "tokens length 0" not in error_str
+    assert "len(tokens)=0" not in error_str
