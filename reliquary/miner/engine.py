@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import time
 from typing import TYPE_CHECKING
 
@@ -150,9 +149,7 @@ class MiningEngine:
         *,
         vllm_gpu: int = 0,
         proof_gpu: int = 1,
-        max_new_tokens: int = int(
-            os.environ.get("RELIQUARY_MAX_NEW_TOKENS", MAX_NEW_TOKENS_PROTOCOL_CAP)
-        ),
+        max_new_tokens: int = MAX_NEW_TOKENS_PROTOCOL_CAP,
         validator_url_override: str | None = None,
     ) -> None:
         self.vllm_model = vllm_model
