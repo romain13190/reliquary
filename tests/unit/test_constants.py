@@ -31,3 +31,9 @@ def test_v2_bootstrap_sigma_lower_than_steady():
 def test_wandb_constants_present():
     assert C.WANDB_PROJECT == "reliquary-validator"
     assert C.WANDB_TRAINING_VERSION == "v1"
+
+
+def test_min_eos_probability_constant_present():
+    from reliquary.constants import MIN_EOS_PROBABILITY
+    assert 0.0 < MIN_EOS_PROBABILITY < 1.0
+    assert MIN_EOS_PROBABILITY == 0.02

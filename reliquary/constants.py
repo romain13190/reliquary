@@ -265,6 +265,12 @@ WANDB_TRAINING_VERSION = "v1"
 # cross-GPU / cross-attn / cross-batch trials with 0 % false-positive
 # rate. Do not re-tune without the same empirical setup.
 
+# Minimum probability the model must have assigned to EOS at the position
+# that produced it. Below this threshold, the rollout is presumed to be
+# artificially truncated (a miner truncating mid-reasoning to lock in a
+# favourable partial output). Calibrated by upstream grail at 0% honest FP.
+MIN_EOS_PROBABILITY = 0.02
+
 # LogprobValidator: max allowed median importance-sampling deviation
 # across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
 # Honest miners observed at ~0.00013 median dev in live testnet runs;
