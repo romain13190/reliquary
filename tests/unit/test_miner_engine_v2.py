@@ -36,17 +36,18 @@ def test_pick_prompt_all_cooldown_raises():
         pick_prompt_idx(env, cooldown_prompts=cooldown, rng=rng)
 
 
-def test_engine_default_max_new_tokens_is_protocol_cap(monkeypatch):
+def test_engine_default_max_new_tokens_is_protocol_cap():
     """The env-var override is removed; max_new_tokens is the protocol cap."""
+    import inspect
     from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
     from reliquary.miner.engine import MiningEngine
 
-    monkeypatch.setenv("RELIQUARY_MAX_NEW_TOKENS", "512")
-    # Constructing MiningEngine should NOT pick up the env var.
-    # We stub all heavy deps; the goal is just to read the default value.
-    eng = MiningEngine.__new__(MiningEngine)  # avoid full __init__
-    # Trigger the default-value branch: instantiating with no arg.
-    import inspect
     sig = inspect.signature(MiningEngine.__init__)
     default = sig.parameters["max_new_tokens"].default
     assert default == MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    # Belt and suspenders: source must not reference the env var anywhere
+    # in the engine module — catches a regression that re-introduces the
+    # `int(os.environ.get("RELIQUARY_MAX_NEW_TOKENS", ...))` default.
+    src = inspect.getsource(MiningEngine.__init__)
+    assert "RELIQUARY_MAX_NEW_TOKENS" not in src

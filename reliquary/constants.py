@@ -87,9 +87,6 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
-# Maximum token sequence length in a single rollout (prompt + completion).
-MAX_TOKENS_PER_ROLLOUT = MAX_NEW_TOKENS_PROTOCOL_CAP + 4096
-
 # ────────────────  GRPO BATCHING  ────────────────
 
 # Default HTTP port the validator listens on for miner submissions.

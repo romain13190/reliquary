@@ -521,13 +521,15 @@ class TestTokenSequenceLengthCheck:
 
     def test_rejects_oversized_sequence(self):
         from reliquary.protocol.tokens import verify_tokens
-        from reliquary.constants import MAX_TOKENS_PER_ROLLOUT
+        from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 
-        tokens = list(range(MAX_TOKENS_PER_ROLLOUT + 1))
+        # Maximum token sequence length: prompt (4096) + completion (8192)
+        max_tokens_per_rollout = MAX_NEW_TOKENS_PROTOCOL_CAP + 4096
+        tokens = list(range(max_tokens_per_rollout + 1))
 
         class _OverflowConfig:
-            vocab_size = MAX_TOKENS_PER_ROLLOUT + 10
-            max_position_embeddings = MAX_TOKENS_PER_ROLLOUT
+            vocab_size = max_tokens_per_rollout + 10
+            max_position_embeddings = max_tokens_per_rollout
 
         assert verify_tokens(tokens, _OverflowConfig()) is False
 
