@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from reliquary.constants import B_BATCH, M_ROLLOUTS
+from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -41,17 +41,47 @@ class _FakeWallet:
     hotkey = _Hk()
 
 
+def _make_commit(
+    *,
+    tokens: list[int] | None = None,
+    prompt_length: int = 4,
+    success: bool = False,
+    total_reward: float = 0.0,
+) -> dict:
+    """Build a minimal commit that passes CommitModel.model_validate."""
+    if tokens is None:
+        tokens = list(range(CHALLENGE_K + prompt_length))
+    seq_len = len(tokens)
+    completion_length = seq_len - prompt_length
+    return {
+        "tokens": tokens,
+        "commitments": [{"sketch": 0} for _ in range(seq_len)],
+        "proof_version": "v5",
+        "model": {"name": "test-model", "layer_index": 6},
+        "signature": "ab" * 32,
+        "beacon": {"randomness": "cd" * 16},
+        "rollout": {
+            "prompt_length": prompt_length,
+            "completion_length": completion_length,
+            "success": success,
+            "total_reward": total_reward,
+            "advantage": 0.0,
+            "token_logprobs": [0.0] * seq_len,
+        },
+    }
+
+
 def _rollouts(k):
-    return [
-        RolloutSubmission(
-            tokens=[1, 2, 3], reward=1.0 if i < k else 0.0,
-            commit={
-                "tokens": [1, 2, 3], "proof_version": "v5",
-                "completion_text_for_test": "WIN" if i < k else "lose",
-            },
-        )
-        for i in range(M_ROLLOUTS)
-    ]
+    rollouts = []
+    for i in range(M_ROLLOUTS):
+        reward = 1.0 if i < k else 0.0
+        commit = _make_commit(success=reward > 0.5, total_reward=reward)
+        rollouts.append(RolloutSubmission(
+            tokens=commit["tokens"],
+            reward=reward,
+            commit=commit,
+        ))
+    return rollouts
 
 
 def _make_service(checkpoint_hash="sha256:cp"):
@@ -120,8 +150,8 @@ def _patch_open_grpo_window(svc):
             # Stub out torch-dependent verifiers.
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
-            # Decode via the commit dict like existing smoke test does.
-            completion_text_fn=lambda rollout: rollout.commit.get("completion_text_for_test", ""),
+            # Decode via reward: FakeEnv.compute_reward returns 1.0 for "WIN".
+            completion_text_fn=lambda rollout: "WIN" if rollout.reward > 0.5 else "",
         )
 
     return patch.object(svc_mod, "open_grpo_window", side_effect=_mock_open)

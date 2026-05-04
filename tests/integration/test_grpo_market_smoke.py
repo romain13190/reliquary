@@ -8,7 +8,7 @@ import hashlib
 
 import pytest
 
-from reliquary.constants import B_BATCH, M_ROLLOUTS
+from reliquary.constants import B_BATCH, CHALLENGE_K, M_ROLLOUTS
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     RolloutSubmission,
@@ -26,15 +26,52 @@ class FakeEnv:
     def compute_reward(self, p, c): return 1.0 if "WIN" in c else 0.0
 
 
+class _ModelStub:
+    """Minimal model stub so verify_tokens can resolve vocab/length limits."""
+    class config:
+        vocab_size = 10_000
+        max_position_embeddings = 4096
+
+
+def _make_commit(
+    *,
+    tokens: list[int] | None = None,
+    prompt_length: int = 4,
+    success: bool = False,
+    total_reward: float = 0.0,
+) -> dict:
+    """Build a minimal commit that passes CommitModel.model_validate."""
+    if tokens is None:
+        tokens = list(range(CHALLENGE_K + prompt_length))
+    seq_len = len(tokens)
+    completion_length = seq_len - prompt_length
+    return {
+        "tokens": tokens,
+        "commitments": [{"sketch": 0} for _ in range(seq_len)],
+        "proof_version": "v5",
+        "model": {"name": "test-model", "layer_index": 6},
+        "signature": "ab" * 32,
+        "beacon": {"randomness": "cd" * 16},
+        "rollout": {
+            "prompt_length": prompt_length,
+            "completion_length": completion_length,
+            "success": success,
+            "total_reward": total_reward,
+            "advantage": 0.0,
+            "token_logprobs": [0.0] * seq_len,
+        },
+    }
+
+
 def _rollouts(k):
     out = []
     for i in range(M_ROLLOUTS):
-        text = "WIN" if i < k else "lose"
+        reward = 1.0 if i < k else 0.0
+        commit = _make_commit(success=reward > 0.5, total_reward=reward)
         out.append(RolloutSubmission(
-            tokens=[1, 2, 3],
-            reward=1.0 if i < k else 0.0,
-            commit={"tokens": [1, 2, 3], "proof_version": "v5",
-                    "completion_text_for_test": text},
+            tokens=commit["tokens"],
+            reward=reward,
+            commit=commit,
         ))
     return out
 
@@ -54,11 +91,11 @@ def _make_batcher(window, cooldown):
         window_start=window,
         current_round=window * 10 + 100,  # plenty of headroom for signed_round
         env=FakeEnv(),
-        model=None,
+        model=_ModelStub(),
         cooldown_map=cooldown,
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
-        completion_text_fn=lambda r: r.commit.get("completion_text_for_test", ""),
+        completion_text_fn=lambda r: "WIN" if r.reward > 0.5 else "",
     )
 
 
