@@ -107,11 +107,15 @@ def _request(
 
 
 def _make_batcher(**overrides) -> GrpoWindowBatcher:
+    class _DefaultFakeTokenizer:
+        eos_token_id = 99
+
     kwargs = dict(
         window_start=500,
         current_round=1000,
         env=FakeEnv(),
         model=None,
+        tokenizer=_DefaultFakeTokenizer(),
         verify_commitment_proofs_fn=_always_true_grail,
         verify_signature_fn=_always_true_sig,
         verify_proof_version_fn=_always_true_proof_version,
@@ -594,3 +598,13 @@ def test_supersede_only_records_after_full_success():
         prompt_idx=42, signed_round=998, hotkey="B", checkpoint_hash="",
     ))
     assert r2.accepted is True
+
+
+def test_constructor_accepts_tokenizer():
+    """Tokenizer must be passable to the batcher (used by TerminationValidator)."""
+    class FakeTokenizer:
+        eos_token_id = 99
+
+    fake_tok = FakeTokenizer()
+    b = _make_batcher(tokenizer=fake_tok)
+    assert b.tokenizer is fake_tok

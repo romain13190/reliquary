@@ -90,6 +90,7 @@ def open_grpo_window(
         current_round=current_round,
         env=env,
         model=model,
+        tokenizer=tokenizer,
         cooldown_map=cooldown_map,
         bootstrap=bootstrap,
         completion_text_fn=_completion_text,

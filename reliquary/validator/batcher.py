@@ -83,6 +83,7 @@ class GrpoWindowBatcher:
         env: Environment,
         model: Any,
         *,
+        tokenizer: Any = None,
         cooldown_map: CooldownMap | None = None,
         bootstrap: bool = False,
         completion_text_fn: Callable[[RolloutSubmission], str],
@@ -106,6 +107,7 @@ class GrpoWindowBatcher:
         self._now_round_fn = now_round_fn
         self.env = env
         self.model = model
+        self.tokenizer = tokenizer
         self.bootstrap = bootstrap
         self._completion_text = completion_text_fn
         # Returns the canonical prompt tokens for a given prompt_idx — used to
