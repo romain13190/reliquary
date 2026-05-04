@@ -58,7 +58,6 @@ def _make_batcher(window, cooldown):
         cooldown_map=cooldown,
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
-        verify_proof_version_fn=lambda c: True,
         completion_text_fn=lambda r: r.commit.get("completion_text_for_test", ""),
     )
 

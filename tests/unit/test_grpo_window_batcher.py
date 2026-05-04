@@ -41,10 +41,6 @@ def _always_true_sig(commit, hotkey):
     return True
 
 
-def _always_true_proof_version(commit):
-    return True
-
-
 def _make_commit(
     *,
     tokens: list[int] | None = None,
@@ -128,7 +124,6 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
         tokenizer=_DefaultFakeTokenizer(),
         verify_commitment_proofs_fn=_always_true_grail,
         verify_signature_fn=_always_true_sig,
-        verify_proof_version_fn=_always_true_proof_version,
         completion_text_fn=lambda rollout: (
             "CORRECT" if rollout.reward > 0.5 else "wrong"
         ),

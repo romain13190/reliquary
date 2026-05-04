@@ -12,9 +12,7 @@ import torch
 
 from reliquary.constants import (
     CHALLENGE_K,
-    GRAIL_PROOF_VERSION,
     LAYER_INDEX,
-    MAX_TOKENS_PER_ROLLOUT,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,11 +45,6 @@ def verify_signature(commit: dict, hotkey: str) -> bool:
     from reliquary.protocol.signatures import verify_commit_signature
 
     return verify_commit_signature(commit, hotkey)
-
-
-def verify_proof_version(commit: dict) -> bool:
-    """Hard check: proof version must match protocol."""
-    return commit.get("proof_version") == GRAIL_PROOF_VERSION
 
 
 def verify_termination(commit: dict, tokenizer: Any, logits: torch.Tensor) -> bool:
@@ -98,30 +91,7 @@ def verify_commitment_proofs(
     tokens = commit["tokens"]
     commitments = commit["commitments"]
 
-    # SECURITY: Miner must provide exactly one commitment per token.
-    # Otherwise they can omit commitments for positions they can't forge,
-    # and the verifier would silently skip those challenges.
     seq_len = len(tokens)
-    if len(commitments) != seq_len:
-        logger.warning(
-            "Commitment count mismatch: %d commitments for %d tokens",
-            len(commitments), seq_len,
-        )
-        return ProofResult(
-            all_passed=False, passed=0, checked=0,
-            logits=torch.empty(0),
-        )
-
-    # SECURITY: Reject sequences that would cause GPU OOM.
-    if seq_len > MAX_TOKENS_PER_ROLLOUT:
-        logger.warning(
-            "Token sequence too long: %d tokens (max %d)",
-            seq_len, MAX_TOKENS_PER_ROLLOUT,
-        )
-        return ProofResult(
-            all_passed=False, passed=0, checked=0,
-            logits=torch.empty(0),
-        )
 
     # SECURITY: Always use the validator's independently-computed randomness.
     # Never trust the miner's claimed beacon — a miner who controls the

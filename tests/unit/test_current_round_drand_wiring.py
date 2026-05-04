@@ -35,7 +35,6 @@ def _make_batcher(*, current_round=0, now_round_fn=None):
         completion_text_fn=_completion_text_stub,
         verify_commitment_proofs_fn=lambda *a, **k: None,
         verify_signature_fn=lambda c, h: True,
-        verify_proof_version_fn=lambda c: True,
         now_round_fn=now_round_fn,
     )
 

@@ -95,7 +95,6 @@ class GrpoWindowBatcher:
         canonical_prompt_tokens_fn: Callable[[int], list[int]] | None = None,
         verify_commitment_proofs_fn: Callable[..., Any] | None = None,
         verify_signature_fn: Callable[[dict, str], bool] | None = None,
-        verify_proof_version_fn: Callable[[dict], bool] | None = None,
         time_fn: Callable[[], float] | None = None,
         now_round_fn: Callable[[], int] | None = None,
     ) -> None:
@@ -137,13 +136,9 @@ class GrpoWindowBatcher:
         if verify_signature_fn is None:
             from reliquary.validator.verifier import verify_signature
             verify_signature_fn = verify_signature
-        if verify_proof_version_fn is None:
-            from reliquary.validator.verifier import verify_proof_version
-            verify_proof_version_fn = verify_proof_version
 
         self._verify_commitment = verify_commitment_proofs_fn
         self._verify_signature = verify_signature_fn
-        self._verify_proof_version = verify_proof_version_fn
 
         self._lock = threading.Lock()
         self._valid: list[ValidSubmission] = []
@@ -270,8 +265,6 @@ class GrpoWindowBatcher:
                 ]
                 if miner_prompt_tokens != canonical_prompt_tokens:
                     return self._reject(RejectReason.PROMPT_MISMATCH)
-            if not self._verify_proof_version(rollout.commit):
-                return self._reject(RejectReason.GRAIL_FAIL)
             if not self._verify_signature(rollout.commit, request.miner_hotkey):
                 return self._reject(RejectReason.BAD_SIGNATURE)
             proof = self._verify_commitment(

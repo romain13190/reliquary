@@ -120,7 +120,6 @@ def _patch_open_grpo_window(svc):
             # Stub out torch-dependent verifiers.
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
-            verify_proof_version_fn=lambda c: c.get("proof_version") == "v5",
             # Decode via the commit dict like existing smoke test does.
             completion_text_fn=lambda rollout: rollout.commit.get("completion_text_for_test", ""),
         )

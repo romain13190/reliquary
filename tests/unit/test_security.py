@@ -105,29 +105,56 @@ class TestMinerCannotControlRandomness:
 class TestCommitmentCountMustMatchTokens:
     """Attack: miner submits fewer commitments than tokens. Challenged
     positions beyond the array are silently skipped.
-    Fix: len(commitments) != len(tokens) → immediate reject.
+    Fix: len(commitments) != len(tokens) → CommitModel raises ValidationError
+    (now enforced by _commitments_len_matches_tokens Pydantic validator on
+    CommitModel, before verify_commitment_proofs is called).
     """
 
-    def test_fewer_commitments_rejected(self):
-        from reliquary.validator.verifier import verify_commitment_proofs
+    def _make_base_commit(self, tokens, commitments):
+        """Build a minimal commit dict with the given tokens and commitments."""
+        from reliquary.constants import CHALLENGE_K
+        seq_len = len(tokens)
+        completion_length = max(seq_len - 4, 1)
+        return {
+            "tokens": tokens,
+            "commitments": commitments,
+            "proof_version": "v5",
+            "model": {"name": "test-model", "layer_index": 6},
+            "signature": "ab" * 32,
+            "beacon": {"randomness": "cd" * 16},
+            "rollout": {
+                "prompt_length": min(4, seq_len - 1),
+                "completion_length": completion_length,
+                "success": False,
+                "total_reward": 0.0,
+                "advantage": 0.0,
+                "token_logprobs": [0.0] * seq_len,
+            },
+        }
 
-        commit = {"tokens": list(range(100)), "commitments": [{"sketch": 0}] * 10}
-        res = verify_commitment_proofs(commit, _make_mock_model(), "aabb")
-        assert res.all_passed is False and res.passed == 0 and res.checked == 0
+    def test_fewer_commitments_rejected(self):
+        from pydantic import ValidationError
+        from reliquary.protocol.submission import CommitModel
+
+        commit = self._make_base_commit(list(range(100)), [{"sketch": 0}] * 10)
+        with pytest.raises(ValidationError):
+            CommitModel.model_validate(commit)
 
     def test_more_commitments_rejected(self):
-        from reliquary.validator.verifier import verify_commitment_proofs
+        from pydantic import ValidationError
+        from reliquary.protocol.submission import CommitModel
 
-        commit = {"tokens": list(range(10)), "commitments": [{"sketch": 0}] * 100}
-        res = verify_commitment_proofs(commit, _make_mock_model(), "aabb")
-        assert res.all_passed is False and res.passed == 0 and res.checked == 0
+        commit = self._make_base_commit(list(range(10)), [{"sketch": 0}] * 100)
+        with pytest.raises(ValidationError):
+            CommitModel.model_validate(commit)
 
     def test_empty_commitments_rejected(self):
-        from reliquary.validator.verifier import verify_commitment_proofs
+        from pydantic import ValidationError
+        from reliquary.protocol.submission import CommitModel
 
-        commit = {"tokens": list(range(50)), "commitments": []}
-        res = verify_commitment_proofs(commit, _make_mock_model(), "aabb")
-        assert res.all_passed is False and res.passed == 0 and res.checked == 0
+        commit = self._make_base_commit(list(range(50)), [])
+        with pytest.raises(ValidationError):
+            CommitModel.model_validate(commit)
 
     @patch("reliquary.shared.forward.forward_single_layer")
     @patch("reliquary.shared.hf_compat.resolve_hidden_size", return_value=HIDDEN_DIM)
@@ -487,19 +514,22 @@ class TestProofVersionConsistency:
 
 class TestTokenSequenceLengthCheck:
     """Rollouts with excessively long token sequences must be rejected
-    before the forward pass to prevent GPU OOM."""
+    before the forward pass to prevent GPU OOM.
+    Fix: enforced by verify_tokens (_validate_sequence_length), which checks
+    len(tokens) against the model's max_position_embeddings before GRAIL
+    compute is triggered."""
 
     def test_rejects_oversized_sequence(self):
-        from reliquary.validator.verifier import verify_commitment_proofs
+        from reliquary.protocol.tokens import verify_tokens
         from reliquary.constants import MAX_TOKENS_PER_ROLLOUT
 
         tokens = list(range(MAX_TOKENS_PER_ROLLOUT + 1))
-        commit = {"tokens": tokens, "commitments": [{"sketch": 0}] * len(tokens)}
-        res = verify_commitment_proofs(
-            commit, _make_mock_model(), "aabb"
-        )
-        assert res.all_passed is False
-        assert res.checked == 0
+
+        class _OverflowConfig:
+            vocab_size = MAX_TOKENS_PER_ROLLOUT + 10
+            max_position_embeddings = MAX_TOKENS_PER_ROLLOUT
+
+        assert verify_tokens(tokens, _OverflowConfig()) is False
 
     def test_accepts_valid_length(self):
         from reliquary.validator.verifier import verify_commitment_proofs

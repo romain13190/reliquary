@@ -68,7 +68,6 @@ def _batcher(window_start=500, cooldown_map=None):
         cooldown_map=cooldown_map,
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
-        verify_proof_version_fn=lambda c: True,
         completion_text_fn=lambda r: "CORRECT" if r.reward > 0.5 else "wrong",
     )
     batcher.current_checkpoint_hash = "sha256:test"
