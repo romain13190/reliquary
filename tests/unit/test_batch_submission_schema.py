@@ -103,3 +103,10 @@ def test_grpo_batch_state_exposes_cooldown():
     )
     dumped = state.model_dump()
     assert set(dumped["cooldown_prompts"]) == {42, 7, 99}
+
+
+def test_new_reject_reasons_exist():
+    """Schema/Token/Termination validators emit dedicated reject codes."""
+    assert RejectReason.BAD_SCHEMA.value == "bad_schema"
+    assert RejectReason.BAD_TOKENS.value == "bad_tokens"
+    assert RejectReason.BAD_TERMINATION.value == "bad_termination"
