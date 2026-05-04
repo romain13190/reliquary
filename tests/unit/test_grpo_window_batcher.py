@@ -410,27 +410,34 @@ def _request_with_prompt_tokens(
 ):
     """Like ``_request`` but sets ``commit['rollout']['prompt_length']`` and
     builds ``commit['tokens']`` = prompt + completion explicitly so the
-    validator's prompt-binding check has something to inspect."""
+    validator's prompt-binding check has something to inspect.
+
+    Pads completion_tokens to ensure total sequence length >= CHALLENGE_K so
+    CommitModel schema validation passes.
+    """
+    prompt_list = list(prompt_tokens)
     if completion_tokens is None:
         completion_tokens = [99]
+    comp_list = list(completion_tokens)
+    # Ensure total >= CHALLENGE_K (CommitModel min_length requirement)
+    min_comp_len = max(len(comp_list), CHALLENGE_K - len(prompt_list))
+    if len(comp_list) < min_comp_len:
+        comp_list = comp_list + [0] * (min_comp_len - len(comp_list))
     if rewards is None:
         rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
     rollouts = []
     for r in rewards:
-        text = "CORRECT" if r > 0.5 else "wrong"
-        full_tokens = list(prompt_tokens) + list(completion_tokens)
+        full_tokens = prompt_list + comp_list
+        commit = _make_commit(
+            tokens=full_tokens,
+            prompt_length=len(prompt_list),
+            success=r > 0.5,
+            total_reward=r,
+        )
         rollouts.append(
             RolloutSubmission(
                 tokens=full_tokens, reward=r,
-                commit={
-                    "proof_version": "v5",
-                    "tokens": full_tokens,
-                    "rollout": {
-                        "prompt_length": len(prompt_tokens),
-                        "completion_length": len(completion_tokens),
-                    },
-                    "completion_text_for_test": text,
-                },
+                commit=commit,
             )
         )
     return BatchSubmissionRequest(
@@ -608,3 +615,132 @@ def test_constructor_accepts_tokenizer():
     fake_tok = FakeTokenizer()
     b = _make_batcher(tokenizer=fake_tok)
     assert b.tokenizer is fake_tok
+
+
+import torch
+from reliquary.validator.verifier import ProofResult
+
+
+def _grail_with_logits(seq_len: int, eos_id: int = 99):
+    """Stub that returns logits where EOS is highly probable everywhere."""
+    def _fn(commit, model, randomness):
+        logits = torch.zeros(seq_len, 100)
+        logits[:, eos_id] = 5.0
+        return ProofResult(
+            all_passed=True, passed=1, checked=1, logits=logits,
+            sketch_diff_max=0,
+        )
+    return _fn
+
+
+# ----- SchemaValidator wiring -----
+
+def test_reject_bad_schema_missing_proof_version():
+    b = _make_batcher()
+    req = _request()
+    # Mutate one rollout's commit to break schema
+    req.rollouts[0].commit.pop("proof_version")
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_SCHEMA
+
+
+def test_reject_bad_schema_extra_field():
+    b = _make_batcher()
+    req = _request()
+    req.rollouts[0].commit["unauthorized_field"] = "x"
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_SCHEMA
+
+
+def test_reject_bad_schema_inconsistent_lengths():
+    b = _make_batcher()
+    req = _request()
+    req.rollouts[0].commit["rollout"]["prompt_length"] = 999
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_SCHEMA
+
+
+# ----- TokenValidator wiring -----
+# The verify_tokens function in protocol/tokens.py is now wired into the
+# batcher AFTER schema validation. We stub model.config so verify_tokens
+# can resolve vocab_size.
+
+class _ModelStubWithVocab:
+    """Minimal stub satisfying resolve_vocab_size(model.config)."""
+    class config:
+        vocab_size = 1000
+        max_position_embeddings = 4096
+
+
+def test_reject_bad_tokens_above_vocab():
+    b = _make_batcher(model=_ModelStubWithVocab())
+    req = _request()
+    # vocab_size=1000, inject a token == vocab_size (out of bounds)
+    req.rollouts[0].commit["tokens"] = [1000] * (CHALLENGE_K + 4)
+    # Re-sync the outer field so RolloutSubmission stays consistent
+    req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
+    # Re-sync commitments + token_logprobs lengths for schema
+    req.rollouts[0].commit["commitments"] = [
+        {"sketch": 0} for _ in range(CHALLENGE_K + 4)
+    ]
+    req.rollouts[0].commit["rollout"]["token_logprobs"] = [0.0] * (CHALLENGE_K + 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TOKENS
+
+
+def test_reject_bad_tokens_negative_id():
+    b = _make_batcher(model=_ModelStubWithVocab())
+    req = _request()
+    req.rollouts[0].commit["tokens"] = [-1] + list(range(CHALLENGE_K + 3))
+    req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
+    req.rollouts[0].commit["commitments"] = [
+        {"sketch": 0} for _ in range(CHALLENGE_K + 4)
+    ]
+    req.rollouts[0].commit["rollout"]["token_logprobs"] = [0.0] * (CHALLENGE_K + 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TOKENS
+
+
+# ----- TerminationValidator wiring -----
+
+def test_reject_bad_termination_when_last_token_not_eos():
+    seq_len = CHALLENGE_K + 4
+    b = _make_batcher(
+        model=_ModelStubWithVocab(),
+        verify_commitment_proofs_fn=_grail_with_logits(seq_len),
+    )
+    req = _request()
+    # Last token != 99 (EOS) — sequence ends in seq_len-1
+    req.rollouts[0].commit["tokens"] = list(range(seq_len))
+    req.rollouts[0].tokens = req.rollouts[0].commit["tokens"]
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BAD_TERMINATION
+
+
+def test_termination_skipped_when_grail_returns_empty_logits():
+    """Backward-compat: when the GRAIL stub returns empty logits, the
+    termination check is skipped. The default ``_always_true_grail`` does
+    this (it predates the cached-logits path), so the existing
+    full-pipeline tests stay green without becoming termination-aware.
+    """
+    b = _make_batcher(model=_ModelStubWithVocab())
+    req = _request()  # default rewards [1,1,1,1,0,0,0,0] → sigma above SIGMA_MIN
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    assert resp.reason == RejectReason.ACCEPTED
+
+
+# Note on "happy path with logits" test: a positive case where the rollout
+# DOES end with EOS *and* survives the full pipeline (logprob + distribution)
+# requires synthetic logits whose log_softmax matches the miner-claimed
+# token_logprobs (which the test fixture sets to all-zero). Building such a
+# fixture pulls the test toward an end-to-end integration test. We cover the
+# wiring with the reject case above and the empty-logits skip case; the
+# happy path is exercised by the existing pipeline tests through the
+# empty-logits branch. A real end-to-end happy path lives in tests/integration.

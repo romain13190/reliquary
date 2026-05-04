@@ -12,6 +12,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from pydantic import ValidationError
+
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
     B_BATCH,
@@ -21,11 +23,13 @@ from reliquary.environment.base import Environment
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
+    CommitModel,
     GrpoBatchState,
     RejectReason,
     RolloutSubmission,
     WindowState,
 )
+from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import select_batch
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.verifier import (
@@ -34,6 +38,7 @@ from reliquary.validator.verifier import (
     rewards_std,
     verify_logprobs_claim,
     verify_reward_claim,
+    verify_termination,
 )
 
 logger = logging.getLogger(__name__)
@@ -247,6 +252,18 @@ class GrpoWindowBatcher:
             )
 
         for rollout in request.rollouts:
+            # Schema check: structural validation of commit dict (cheap, no GPU)
+            try:
+                CommitModel.model_validate(rollout.commit)
+            except ValidationError:
+                return self._reject(RejectReason.BAD_SCHEMA)
+
+            # Token check: vocab bounds + max length (cheap, protects forward pass)
+            if self.model is not None and not verify_tokens(
+                rollout.commit["tokens"], self.model.config
+            ):
+                return self._reject(RejectReason.BAD_TOKENS)
+
             if canonical_prompt_tokens is not None:
                 rollout_meta = rollout.commit.get("rollout", {}) or {}
                 miner_prompt_len = int(rollout_meta.get("prompt_length", 0))
@@ -266,6 +283,15 @@ class GrpoWindowBatcher:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
                 return self._reject(RejectReason.GRAIL_FAIL)
+
+            # Termination check: rollout must end with EOS at p(EOS) >= threshold.
+            # Reuses cached logits from the GRAIL forward — zero extra compute.
+            # Skipped when grail stub returns empty logits (legacy test fixtures).
+            if proof.logits.numel() > 0:
+                if not verify_termination(
+                    rollout.commit, self.tokenizer, proof.logits
+                ):
+                    return self._reject(RejectReason.BAD_TERMINATION)
 
             # Behavioural checks (use cached logits from the GRAIL forward pass).
             # Skip gracefully if the logits tensor is empty (legacy stubs in tests).

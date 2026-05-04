@@ -3,7 +3,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from reliquary.constants import M_ROLLOUTS
+from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     GrpoBatchState,
@@ -28,6 +28,30 @@ def _always_true_proof(commit, model, randomness):
     return ProofResult(all_passed=True, passed=1, checked=1, logits=torch.empty(0))
 
 
+def _make_commit(success: bool = False, total_reward: float = 0.0) -> dict:
+    """Build a schema-compliant commit dict for server tests."""
+    prompt_length = 4
+    seq_len = CHALLENGE_K + prompt_length
+    tokens = list(range(seq_len))
+    completion_length = seq_len - prompt_length
+    return {
+        "tokens": tokens,
+        "commitments": [{"sketch": 0} for _ in range(seq_len)],
+        "proof_version": "v5",
+        "model": {"name": "test-model", "layer_index": 6},
+        "signature": "ab" * 32,
+        "beacon": {"randomness": "cd" * 16},
+        "rollout": {
+            "prompt_length": prompt_length,
+            "completion_length": completion_length,
+            "success": success,
+            "total_reward": total_reward,
+            "advantage": 0.0,
+            "token_logprobs": [0.0] * seq_len,
+        },
+    }
+
+
 def _batcher(window_start=500, cooldown_map=None):
     batcher = GrpoWindowBatcher(
         window_start=window_start,
@@ -38,7 +62,7 @@ def _batcher(window_start=500, cooldown_map=None):
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
         verify_proof_version_fn=lambda c: True,
-        completion_text_fn=lambda r: r.commit.get("completion_text_for_test", ""),
+        completion_text_fn=lambda r: "CORRECT" if r.reward > 0.5 else "wrong",
     )
     batcher.current_checkpoint_hash = "sha256:test"
     return batcher
@@ -47,12 +71,14 @@ def _batcher(window_start=500, cooldown_map=None):
 def _request(prompt_idx=42, window_start=500, signed_round=1000, k=4, checkpoint_hash="sha256:test"):
     rollouts = []
     for i in range(M_ROLLOUTS):
-        text = "CORRECT" if i < k else "wrong"
+        success = i < k
+        reward = 1.0 if success else 0.0
+        commit = _make_commit(success=success, total_reward=reward)
         rollouts.append(
             RolloutSubmission(
-                tokens=[1, 2, 3],
-                reward=1.0 if i < k else 0.0,
-                commit={"tokens": [1, 2, 3], "proof_version": "v5", "completion_text_for_test": text},
+                tokens=commit["tokens"],
+                reward=reward,
+                commit=commit,
             )
         )
     return BatchSubmissionRequest(
