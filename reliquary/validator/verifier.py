@@ -54,6 +54,31 @@ def verify_proof_version(commit: dict) -> bool:
     return commit.get("proof_version") == GRAIL_PROOF_VERSION
 
 
+def verify_termination(commit: dict, tokenizer: Any, logits: torch.Tensor) -> bool:
+    """Hard check: rollout ends with EOS at p(EOS) >= MIN_EOS_PROBABILITY.
+
+    Reuses the per-token logits cached from ``verify_commitment_proofs``,
+    so this costs O(vocab) on a single position — no extra forward pass.
+
+    Strict EOS-only: a rollout that hit ``max_new_tokens`` without sampling
+    EOS is treated as artificially truncated and rejected. In RL settings
+    where reward depends on parsing the model's final output (boxed math,
+    code block, JSON), a truncated rollout scores zero anyway — there is
+    no legitimate reason for a healthy rollout to hit the cap.
+    """
+    from reliquary.constants import MIN_EOS_PROBABILITY
+
+    tokens = commit["tokens"]
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        return False
+    if tokens[-1] != eos_id:
+        return False
+    # logits[-2] is the distribution that produced tokens[-1] (the EOS).
+    p_eos = float(torch.softmax(logits[-2].float(), dim=-1)[eos_id].item())
+    return p_eos >= MIN_EOS_PROBABILITY
+
+
 def verify_commitment_proofs(
     commit: dict,
     model: Any,
