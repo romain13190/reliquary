@@ -259,9 +259,7 @@ class GrpoWindowBatcher:
                 return self._reject(RejectReason.BAD_SCHEMA)
 
             # Token check: vocab bounds + max length (cheap, protects forward pass)
-            if self.model is not None and not verify_tokens(
-                rollout.commit["tokens"], self.model.config
-            ):
+            if not verify_tokens(rollout.commit["tokens"], self.model.config):
                 return self._reject(RejectReason.BAD_TOKENS)
 
             if canonical_prompt_tokens is not None:

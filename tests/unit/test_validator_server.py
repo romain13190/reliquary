@@ -52,12 +52,19 @@ def _make_commit(success: bool = False, total_reward: float = 0.0) -> dict:
     }
 
 
+class _ModelStub:
+    """Minimal stub for TokenValidator tests."""
+    class config:
+        vocab_size = 10000
+        max_position_embeddings = 4096
+
+
 def _batcher(window_start=500, cooldown_map=None):
     batcher = GrpoWindowBatcher(
         window_start=window_start,
         current_round=1000,
         env=FakeEnv(),
-        model=None,
+        model=_ModelStub(),
         cooldown_map=cooldown_map,
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,

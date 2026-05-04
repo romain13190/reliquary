@@ -110,11 +110,21 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
     class _DefaultFakeTokenizer:
         eos_token_id = 99
 
+    class _DefaultModelStub:
+        """Minimal stub satisfying resolve_vocab_size + resolve_max_context_length.
+
+        vocab_size=10000 is comfortably above any test token id (existing tests
+        use ids in [0, CHALLENGE_K + 4) ~ 36).
+        """
+        class config:
+            vocab_size = 10000
+            max_position_embeddings = 4096
+
     kwargs = dict(
         window_start=500,
         current_round=1000,
         env=FakeEnv(),
-        model=None,
+        model=_DefaultModelStub(),
         tokenizer=_DefaultFakeTokenizer(),
         verify_commitment_proofs_fn=_always_true_grail,
         verify_signature_fn=_always_true_sig,
