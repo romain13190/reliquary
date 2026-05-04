@@ -6,13 +6,12 @@ and the miner submitter (reliquary/miner/submitter.py) produces them.
 
 from __future__ import annotations
 
-from typing import Any
+from enum import Enum
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from enum import Enum
-
-from reliquary.constants import M_ROLLOUTS
+from reliquary.constants import CHALLENGE_K, M_ROLLOUTS, MAX_NEW_TOKENS_PROTOCOL_CAP
 
 
 # ---------------------------------------------------------------------------
@@ -114,3 +113,79 @@ class GrpoBatchState(BaseModel):
     checkpoint_n: int = Field(..., ge=0)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
+
+
+class ModelInfo(BaseModel):
+    """Identifies the model the miner ran."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    layer_index: int
+
+
+class BeaconInfo(BaseModel):
+    """Drand beacon randomness used for this commit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    randomness: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
+
+
+class RolloutMetadata(BaseModel):
+    """Per-rollout meta: lengths, success flag, claimed reward, logprobs."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    prompt_length: int = Field(..., ge=0)
+    completion_length: int = Field(..., gt=0, le=MAX_NEW_TOKENS_PROTOCOL_CAP)
+    success: bool
+    total_reward: float
+    advantage: float
+    token_logprobs: list[float]
+
+
+class CommitModel(BaseModel):
+    """The inner ``commit`` dict shipped by the miner inside ``RolloutSubmission``.
+
+    Validated explicitly at the top of ``GrpoWindowBatcher._accept_locked``
+    rather than via Pydantic on ``RolloutSubmission.commit`` — keeps the
+    failure path inside the batcher's reject-counts telemetry.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tokens: list[int] = Field(..., min_length=CHALLENGE_K)
+    commitments: list[dict]
+    proof_version: Literal["v5"]
+    model: ModelInfo
+    signature: str = Field(..., pattern=r"^[0-9a-fA-F]+$")
+    beacon: BeaconInfo
+    rollout: RolloutMetadata
+
+    @field_validator("commitments")
+    @classmethod
+    def _commitments_len_matches_tokens(cls, v, info):
+        tokens = info.data.get("tokens", [])
+        if len(v) != len(tokens):
+            raise ValueError(
+                f"commitments length {len(v)} must equal tokens length {len(tokens)}"
+            )
+        return v
+
+    @field_validator("rollout")
+    @classmethod
+    def _lengths_consistent(cls, v, info):
+        tokens = info.data.get("tokens", [])
+        if v.prompt_length + v.completion_length != len(tokens):
+            raise ValueError(
+                f"prompt_length({v.prompt_length}) + "
+                f"completion_length({v.completion_length}) must equal "
+                f"len(tokens)={len(tokens)}"
+            )
+        if len(v.token_logprobs) != len(tokens):
+            raise ValueError(
+                f"token_logprobs length {len(v.token_logprobs)} "
+                f"must equal tokens length {len(tokens)}"
+            )
+        return v
