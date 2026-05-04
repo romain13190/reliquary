@@ -15,14 +15,36 @@ from reliquary.protocol.submission import (
 
 
 def _valid_rollouts(k: int = 4):
-    """k successes, (M - k) failures, all with well-formed GRAIL fields."""
+    """k successes, (M - k) failures, all with schema-compliant commits."""
+    from reliquary.constants import CHALLENGE_K
+
     rollouts = []
+    seq_len = CHALLENGE_K + 4
+    prompt_len = 4
+    completion_len = seq_len - prompt_len
     for i in range(M_ROLLOUTS):
+        tokens = list(range(seq_len))
+        commit = {
+            "tokens": tokens,
+            "commitments": [{"sketch": 0} for _ in range(seq_len)],
+            "proof_version": "v5",
+            "model": {"name": "test-model", "layer_index": 6},
+            "signature": "ab" * 32,
+            "beacon": {"randomness": "cd" * 16},
+            "rollout": {
+                "prompt_length": prompt_len,
+                "completion_length": completion_len,
+                "success": i < k,
+                "total_reward": 1.0 if i < k else 0.0,
+                "advantage": 0.0,
+                "token_logprobs": [0.0] * seq_len,
+            },
+        }
         rollouts.append(
             RolloutSubmission(
-                tokens=[1, 2, 3, 4, 5],
+                tokens=tokens,
                 reward=1.0 if i < k else 0.0,
-                commit={"proof_version": "v5", "tokens": [1, 2, 3, 4, 5]},
+                commit=commit,
             )
         )
     return rollouts
