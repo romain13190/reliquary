@@ -6,10 +6,13 @@ Operational guide for running a validator on subnet 81. Both modes deploy via Do
 
 | Mode | Who | Hardware | Auto-update |
 |---|---|---|---|
-| **Weight-only** |  ✅ Watchtower polls GHCR every 5 min |
-| **Trainer** | A100 40 GB+ GPU, 64 GB RAM | ❌ Manual (sensitive — never restart mid-step) |
+| **Weight-only** | recommended for almost every operator | CPU box, 4 GB RAM, no GPU | Watchtower polls GHCR every 5 min |
+| **Trainer** | the Reliquary core team | A100 40 GB+ GPU, 64 GB RAM | manual (sensitive — never restart mid-step) |
 
-To start, we want to run only one training, the Reliquary team will handle it, so validator can use the Weight-only validator
+While the network is bootstrapping there is exactly **one** trainer and the
+core team runs it. Every other operator runs the weight-only mode, which
+mirrors the on-chain weight signal from the trainer and earns validator
+emission without any of the GPU cost or coordination overhead.
 
 ---
 

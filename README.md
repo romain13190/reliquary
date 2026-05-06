@@ -4,6 +4,14 @@ Decentralized GRPO training for large language models on Bittensor subnet 81.
 
 Reliquary is a coordination protocol that turns a set of independent GPU operators into a single distributed RLHF pipeline. Miners generate cryptographically-proven rollouts; the validator aggregates them into a GRPO training batch, updates a live LLM checkpoint, and publishes the result to Hugging Face — all without trusting any single participant.
 
+## The incentive shift, in one line
+
+**Old subnets:** miners are paid per rollout. The competition is "do as many rollouts as you can."
+
+**Reliquary:** miners are paid for the rollouts the trainer actually uses. The competition is "find the rollouts I need to train on" — i.e. predict which prompts sit at the policy's current learning frontier (group-σ in the trainable band, not yet in cooldown). A miner who picks well lands earlier in `signed_round`, wins batch slots, and earns emission. A miner who picks poorly burns their own rollouts on `OUT_OF_ZONE` rejects.
+
+This converts DAPO's reactive Dynamic Sampling filter into an ex-ante prediction market: the generate-then-discard cost is pushed out of the validator and onto the miner who guessed wrong. As the policy matures and the learning frontier narrows, selection intelligence becomes more valuable, not less. See [docs/concepts.md](docs/concepts.md#the-thesis) for the full argument.
+
 ## What it does
 
 Each training window is one GRPO step. The cadence is event-driven: a window seals the instant eight valid, distinct-prompt rollout groups land. Miners race to submit; the first eight in (by `signed_round`) win the batch. The validator runs a PPO-clipped surrogate loss with a KL penalty against the frozen reference, then pushes the updated weights to a public HF repo. The whole cycle repeats immediately.
