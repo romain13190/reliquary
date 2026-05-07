@@ -705,3 +705,16 @@ def test_termination_skipped_when_grail_returns_empty_logits():
 # wiring with the reject case above and the empty-logits skip case; the
 # happy path is exercised by the existing pipeline tests through the
 # empty-logits branch. A real end-to-end happy path lives in tests/integration.
+
+
+def test_rejected_submissions_list_initialised_empty():
+    from reliquary.validator.batcher import GrpoWindowBatcher, RejectedSubmission
+    b = _make_batcher()  # existing helper in this file
+    assert hasattr(b, "rejected_submissions")
+    assert b.rejected_submissions == []
+    # Confirm the dataclass exists and has the documented fields.
+    fields = {f.name for f in RejectedSubmission.__dataclass_fields__.values()}
+    assert {
+        "hotkey", "prompt_idx", "reason",
+        "sketch_diff_max", "lp_dev_max", "dist_q10_min",
+    }.issubset(fields)

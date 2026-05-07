@@ -75,6 +75,28 @@ class ValidSubmission:
         self.merkle_root = self.merkle_root_bytes
 
 
+@dataclass
+class RejectedSubmission:
+    """A submission that did NOT pass verification.
+
+    Persisted to the R2 archive (subject to per-hotkey cap) so rejected
+    miners can self-diagnose. Diagnostics are best-effort: only fields
+    computed before the rejection point are populated.
+
+    Anti-tuning: ``sketch_diff_max`` is intentionally LEFT NONE for
+    ``GRAIL_FAIL`` rejections. Surfacing the exact diff would let a cheater
+    calibrate against ``PROOF_SKETCH_TOLERANCE_BASE``. Other reject reasons
+    are not threshold-tunable, so their diagnostics are surfaced verbatim.
+    """
+
+    hotkey: str
+    prompt_idx: int
+    reason: str  # RejectReason.value
+    sketch_diff_max: int | None = None
+    lp_dev_max: float | None = None
+    dist_q10_min: float | None = None
+
+
 class GrpoWindowBatcher:
     """Accepts v2 submissions, runs the full verification pipeline, and
     exposes ``valid_submissions()`` + ``select_batch()`` at window close.
@@ -143,6 +165,12 @@ class GrpoWindowBatcher:
         # Persisted in the R2 archive so miners can see which filter is
         # rejecting the most submissions in any given round.
         self.reject_counts: dict[str, int] = {}
+
+        # Per-hotkey-capped metadata for rejected submissions. Persisted in
+        # the R2 archive next to ``reject_counts`` so a rejected miner can
+        # see *which* of their submissions failed and why, instead of just
+        # an aggregate count. Cap protects against single-attacker flooding.
+        self.rejected_submissions: list[RejectedSubmission] = []
 
         # v2.1: seal_event fires the moment the B-th distinct non-cooldown
         # valid submission lands. Service awaits this to close the window.
