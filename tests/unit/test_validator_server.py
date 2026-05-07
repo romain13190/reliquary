@@ -74,7 +74,7 @@ def _batcher(window_start=500, cooldown_map=None):
     return batcher
 
 
-def _request(prompt_idx=42, window_start=500, signed_round=1000, k=4, checkpoint_hash="sha256:test"):
+def _request(prompt_idx=42, window_start=500, k=4, checkpoint_hash="sha256:test"):
     rollouts = []
     for i in range(M_ROLLOUTS):
         success = i < k
@@ -91,7 +91,6 @@ def _request(prompt_idx=42, window_start=500, signed_round=1000, k=4, checkpoint
         miner_hotkey="hk",
         prompt_idx=prompt_idx,
         window_start=window_start,
-        signed_round=signed_round,
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,

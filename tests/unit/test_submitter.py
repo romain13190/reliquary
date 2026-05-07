@@ -98,7 +98,6 @@ def _v2_request():
         miner_hotkey="hk",
         prompt_idx=42,
         window_start=100,
-        signed_round=999,
         merkle_root="00" * 32,
         rollouts=_rollouts(),
         checkpoint_hash="sha256:test",

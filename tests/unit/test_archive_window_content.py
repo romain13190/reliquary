@@ -56,7 +56,6 @@ def _valid_submission(prompt_idx, k=4, hotkey="hk", eos_first=False):
     return ValidSubmission(
         hotkey=hotkey,
         prompt_idx=prompt_idx,
-        signed_round=100,
         merkle_root_bytes=b"\xab" * 32,
         sigma=sigma,
         rollouts=rollouts,

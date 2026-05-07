@@ -58,15 +58,13 @@ def test_grpo_batch_state_checkpoint_optional_pre_first_publish():
 def test_batch_submission_requires_checkpoint_hash():
     with pytest.raises(ValidationError, match="checkpoint_hash"):
         BatchSubmissionRequest(
-            miner_hotkey="hk", prompt_idx=0, window_start=0,
-            signed_round=0, merkle_root="00" * 32, rollouts=_rollouts(),
+            miner_hotkey="hk", prompt_idx=0, window_start=0, merkle_root="00" * 32, rollouts=_rollouts(),
         )
 
 
 def test_batch_submission_with_checkpoint_hash_parses():
     req = BatchSubmissionRequest(
-        miner_hotkey="hk", prompt_idx=0, window_start=0,
-        signed_round=0, merkle_root="00" * 32, rollouts=_rollouts(),
+        miner_hotkey="hk", prompt_idx=0, window_start=0, merkle_root="00" * 32, rollouts=_rollouts(),
         checkpoint_hash="sha256:abc",
     )
     assert req.checkpoint_hash == "sha256:abc"

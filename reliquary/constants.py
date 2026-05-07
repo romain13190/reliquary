@@ -168,7 +168,7 @@ BOOTSTRAP_SIGMA_MIN = 0.33    # matches old k ∈ [1, 7]
 M_ROLLOUTS = 8
 
 # Training batch size — the first B valid in-zone submissions (FIFO by
-# signed_round, distinct prompts, not in cooldown) feed the GRPO step.
+# TCP arrival, distinct prompts, not in cooldown) feed the GRPO step.
 B_BATCH = 8
 
 # Sampling temperature fixed at protocol level. Miners who use a different

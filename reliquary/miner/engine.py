@@ -268,7 +268,6 @@ class MiningEngine:
                     miner_hotkey=self.wallet.hotkey.ss58_address,
                     prompt_idx=prompt_idx,
                     window_start=state.window_n,
-                    signed_round=state.current_round,
                     merkle_root=merkle_root,
                     rollouts=rollout_submissions,
                     checkpoint_hash=local_hash,

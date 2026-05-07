@@ -433,7 +433,7 @@ class ValidationService:
                 out.append(entry)
             return out
 
-        batched_keys = {(s.hotkey, s.prompt_idx, s.signed_round) for s in batch}
+        batched_keys = {(s.hotkey, s.prompt_idx) for s in batch}
 
         batch_entries = []
         for s in batch:
@@ -441,7 +441,6 @@ class ValidationService:
             batch_entries.append({
                 "hotkey": s.hotkey,
                 "prompt_idx": s.prompt_idx,
-                "signed_round": s.signed_round,
                 "sigma": s.sigma,
                 "prompt": problem.get("prompt", ""),
                 "ground_truth": problem.get("ground_truth", ""),
@@ -459,13 +458,12 @@ class ValidationService:
         # without ballooning the dataset size.
         runners_up = []
         for s in batcher.valid_submissions():
-            key = (s.hotkey, s.prompt_idx, s.signed_round)
+            key = (s.hotkey, s.prompt_idx)
             if key in batched_keys:
                 continue
             runners_up.append({
                 "hotkey": s.hotkey,
                 "prompt_idx": s.prompt_idx,
-                "signed_round": s.signed_round,
                 "sigma": s.sigma,
                 "response_time": _resp_time(s.arrived_at),
                 "merkle_root": s.merkle_root_bytes.hex(),
@@ -707,11 +705,11 @@ class ValidationService:
         return chain.compute_window_randomness(block_hash)
 
     def _compute_current_drand_round(self) -> int:
-        """Live drand round at the time of call. Used by the batcher's
-        anti-replay check to slide the accepted-round window with wall
-        clock — a window that lasts WINDOW_TIMEOUT_SECONDS would otherwise
-        outlive STALE_ROUND_LAG_MAX × period seconds and reject every
-        submission past that point.
+        """Live drand round at the time of call.
+
+        v2.2: kept on the batcher API for window randomness only.
+        ``signed_round`` was removed from the wire protocol entirely;
+        ordering is now pure TCP-arrival FIFO.
 
         With ``use_drand=False`` (test/mock mode) we return ``window_n``
         so legacy deterministic tests keep working.

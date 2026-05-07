@@ -76,7 +76,7 @@ def _make_commit(
 
 
 def _request(
-    prompt_idx=42, signed_round=1000, window_start=500,
+    prompt_idx=42, window_start=500,
     rewards=None, hotkey="hk",
 ) -> BatchSubmissionRequest:
     if rewards is None:
@@ -95,7 +95,6 @@ def _request(
         miner_hotkey=hotkey,
         prompt_idx=prompt_idx,
         window_start=window_start,
-        signed_round=signed_round,
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
@@ -144,14 +143,6 @@ def test_reject_window_mismatch():
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.WINDOW_MISMATCH
-
-
-def test_reject_stale_round():
-    b = _make_batcher(current_round=1000)
-    req = _request(signed_round=500)
-    resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.STALE_ROUND
 
 
 def test_accept_in_zone_submission():
@@ -209,7 +200,6 @@ def test_reject_reward_mismatch():
         miner_hotkey="hk",
         prompt_idx=42,
         window_start=500,
-        signed_round=1000,
         merkle_root="00" * 32,
         rollouts=rollouts,
         checkpoint_hash="sha256:test",
@@ -227,25 +217,23 @@ def test_seal_batch_empty_pool_returns_empty():
 
 
 def test_seal_batch_fifo_across_many_submissions():
+    """v2.2: ordering is by ``arrived_at`` (TCP arrival time), not signed_round."""
     b = _make_batcher(current_round=1010)
-    # Jumbled rounds within the fresh range [1000, 1010] (LAG_MAX=10); duplicates
-    # allowed since that window is only 11 values wide but B_BATCH may exceed 11.
-    round_nums = [1010 - (i * 3) % 11 for i in range(B_BATCH)]
-    for i, round_num in enumerate(round_nums):
+    for i in range(B_BATCH):
         req = _request(
-            prompt_idx=i, signed_round=round_num, hotkey=f"hk{i}",
+            prompt_idx=i, hotkey=f"hk{i}",
         )
         resp = b.accept_submission(req)
         assert resp.accepted, f"unexpected reject for {i}: {resp.reason}"
     batch = b.seal_batch()
     assert len(batch) == B_BATCH
-    rounds = [s.signed_round for s in batch]
-    assert rounds == sorted(rounds)
+    arrivals = [s.arrived_at for s in batch]
+    assert arrivals == sorted(arrivals), "batch must be ordered by arrived_at"
 
 
 def test_seal_batch_cooldown_recorded():
     b = _make_batcher()
-    req = _request(prompt_idx=42, signed_round=1000)
+    req = _request(prompt_idx=42)
     b.accept_submission(req)
     batch = b.seal_batch()
     assert len(batch) == 1
@@ -258,7 +246,7 @@ def test_sealed_batch_respects_cooldown_from_previous_window():
     cd = CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
     cd.record_batched(prompt_idx=42, window=100)
     b = _make_batcher(window_start=120, cooldown_map=cd)
-    req = _request(prompt_idx=42, signed_round=1000, window_start=120)
+    req = _request(prompt_idx=42, window_start=120)
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.PROMPT_IN_COOLDOWN
@@ -278,9 +266,9 @@ def test_state_endpoint_exposes_cooldown():
 
 def test_distinct_prompts_in_batch_only():
     b = _make_batcher(current_round=1002)
-    b.accept_submission(_request(prompt_idx=42, signed_round=1000, hotkey="alice"))
-    b.accept_submission(_request(prompt_idx=42, signed_round=1001, hotkey="bob"))
-    b.accept_submission(_request(prompt_idx=7, signed_round=1002, hotkey="carol"))
+    b.accept_submission(_request(prompt_idx=42, hotkey="alice"))
+    b.accept_submission(_request(prompt_idx=42, hotkey="bob"))
+    b.accept_submission(_request(prompt_idx=7, hotkey="carol"))
     batch = b.seal_batch()
     assert len(batch) == 2
     hotkeys = {s.hotkey for s in batch}
@@ -294,7 +282,7 @@ import asyncio
 import pytest
 
 
-def _request_v21(prompt_idx=42, signed_round=1000, window_start=500,
+def _request_v21(prompt_idx=42, window_start=500,
                  rewards=None, hotkey="hk", checkpoint_hash="sha256:abc"):
     """v2.1 request: includes the required checkpoint_hash field."""
     if rewards is None:
@@ -310,7 +298,7 @@ def _request_v21(prompt_idx=42, signed_round=1000, window_start=500,
         )
     return BatchSubmissionRequest(
         miner_hotkey=hotkey, prompt_idx=prompt_idx,
-        window_start=window_start, signed_round=signed_round,
+        window_start=window_start,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
     )
@@ -355,7 +343,7 @@ async def test_seal_event_set_when_b_valid_distinct_landed():
     # wrap so B_BATCH submissions all land in that range.
     for i in range(B_BATCH):
         req = _request_v21(
-            prompt_idx=i, signed_round=1990 + (i % 11), hotkey=f"hk{i}",
+            prompt_idx=i, hotkey=f"hk{i}",
             checkpoint_hash="sha256:hash",
         )
         b.accept_submission(req)
@@ -370,7 +358,7 @@ def test_seal_event_not_set_with_only_duplicate_prompts():
     b.current_checkpoint_hash = "sha256:hash"
     for i in range(2):
         req = _request_v21(
-            prompt_idx=42, signed_round=1993 + i, hotkey=f"hk{i}",
+            prompt_idx=42, hotkey=f"hk{i}",
             checkpoint_hash="sha256:hash",
         )
         b.accept_submission(req)
@@ -384,7 +372,7 @@ def test_seal_event_not_set_with_fewer_than_b():
     b.current_checkpoint_hash = "sha256:hash"
     for i in range(B_BATCH - 1):
         req = _request_v21(
-            prompt_idx=i, signed_round=1993 + i, hotkey=f"hk{i}",
+            prompt_idx=i, hotkey=f"hk{i}",
             checkpoint_hash="sha256:hash",
         )
         b.accept_submission(req)
@@ -447,7 +435,7 @@ def _request_with_prompt_tokens(
         )
     return BatchSubmissionRequest(
         miner_hotkey=hotkey, prompt_idx=prompt_idx,
-        window_start=500, signed_round=1000,
+        window_start=500,
         merkle_root="00" * 32, rollouts=rollouts,
         checkpoint_hash="",  # gate disabled for these tests
     )
@@ -512,36 +500,15 @@ def test_no_canonical_fn_disables_check():
 # through to the full pipeline.
 
 
-def test_superseded_rejects_higher_signed_round_same_prompt():
-    """Second arrival for the same prompt with a *later* signed_round can't
-    beat the incumbent → reject before reward/GRAIL compute."""
+def test_supersede_blocks_same_miner_duplicate_spam():
+    """Same-miner spamming the same prompt is short-circuited: the second
+    submission must be rejected SUPERSEDED before any heavy validation."""
     b = _make_batcher()
     first = _request_v21(
-        prompt_idx=42, signed_round=995, hotkey="A", checkpoint_hash="",
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
     )
     second = _request_v21(
-        prompt_idx=42, signed_round=998, hotkey="B", checkpoint_hash="",
-    )
-    r1 = b.accept_submission(first)
-    r2 = b.accept_submission(second)
-    assert r1.accepted is True
-    assert r2.accepted is False
-    assert r2.reason == RejectReason.SUPERSEDED
-    # Only the incumbent is in _valid — the SUPERSEDED reject didn't pollute it.
-    assert len(b._valid) == 1
-    assert b._valid[0].hotkey == "A"
-
-
-def test_superseded_rejects_equal_signed_round_same_prompt():
-    """Same signed_round can't strictly beat the incumbent (tiebreak is
-    deterministic but still a tie at the round level) → reject early.
-    This also handles the same-miner-spamming-same-prompt DoS case."""
-    b = _make_batcher()
-    first = _request_v21(
-        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
-    )
-    second = _request_v21(
-        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
     )
     assert b.accept_submission(first).accepted is True
     r2 = b.accept_submission(second)
@@ -549,65 +516,60 @@ def test_superseded_rejects_equal_signed_round_same_prompt():
     assert r2.reason == RejectReason.SUPERSEDED
 
 
-def test_lower_signed_round_falls_through_and_wins_at_seal():
-    """A late-arriving submission with strictly smaller signed_round
-    legitimately races ahead — it must run through the full pipeline,
-    not be rejected. select_batch will then pick it over the incumbent."""
+def test_second_arrival_for_same_prompt_is_short_circuited():
+    """v2.2: any subsequent submission for an already-claimed prompt is
+    rejected SUPERSEDED before any heavy validation — no fall-through,
+    no second entry in _valid."""
     b = _make_batcher()
     incumbent = _request_v21(
-        prompt_idx=42, signed_round=998, hotkey="B", checkpoint_hash="",
+        prompt_idx=42, hotkey="B", checkpoint_hash="",
     )
     challenger = _request_v21(
-        prompt_idx=42, signed_round=995, hotkey="A", checkpoint_hash="",
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
     )
     assert b.accept_submission(incumbent).accepted is True
     r2 = b.accept_submission(challenger)
-    assert r2.accepted is True
-    assert r2.reason == RejectReason.ACCEPTED
-    # Both are in _valid; select_batch resolves by signed_round.
-    assert len(b._valid) == 2
-    from reliquary.validator.batch_selection import select_batch
-    batch = select_batch(
-        b._valid, b=B_BATCH, current_window=b.window_start, cooldown_map=b._cooldown,
-    )
-    assert len(batch) == 1
-    assert batch[0].hotkey == "A"  # smaller signed_round won
+    assert r2.accepted is False
+    assert r2.reason == RejectReason.SUPERSEDED
+    # Only the first arrival is in _valid.
+    assert len(b._valid) == 1
+    assert b._valid[0].hotkey == "B"
 
 
 def test_different_prompts_tracked_independently():
     """SUPERSEDED is per-prompt — accepting prompt 42 must not block prompt 43."""
     b = _make_batcher()
     r_a = b.accept_submission(_request_v21(
-        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
     ))
     r_b = b.accept_submission(_request_v21(
-        prompt_idx=43, signed_round=1000, hotkey="A", checkpoint_hash="",
+        prompt_idx=43, hotkey="A", checkpoint_hash="",
     ))
     assert r_a.accepted is True
     assert r_b.accepted is True
     assert len(b._valid) == 2
-    assert b._best_round_per_prompt == {42: 1000, 43: 1000}
+    assert b._claimed_prompts == {42, 43}
 
 
 def test_supersede_only_records_after_full_success():
     """If a submission gets rejected mid-pipeline (e.g. GRAIL fail), it must
-    NOT update _best_round_per_prompt — otherwise an honest later submission
-    with a higher signed_round would be wrongly rejected as SUPERSEDED."""
+    NOT mark the prompt as claimed — otherwise an honest later submission
+    for the same prompt would be wrongly rejected as SUPERSEDED."""
     # Use an always-failing GRAIL so the submission is rejected post-cheap-checks.
     b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
     first_fails = _request_v21(
-        prompt_idx=42, signed_round=1000, hotkey="A", checkpoint_hash="",
+        prompt_idx=42, hotkey="A", checkpoint_hash="",
     )
     r1 = b.accept_submission(first_fails)
     assert r1.accepted is False
     assert r1.reason == RejectReason.GRAIL_FAIL
-    # No incumbent recorded for prompt 42.
-    assert 42 not in b._best_round_per_prompt
-    # A subsequent honest submission for prompt 42 with a later signed_round
-    # must NOT be wrongly rejected as SUPERSEDED.
+    # No claim recorded for prompt 42.
+    assert 42 not in b._claimed_prompts
+    # A subsequent honest submission for prompt 42 must NOT be wrongly
+    # rejected as SUPERSEDED.
     b._verify_commitment = _always_true_grail
     r2 = b.accept_submission(_request_v21(
-        prompt_idx=42, signed_round=998, hotkey="B", checkpoint_hash="",
+        prompt_idx=42, hotkey="B", checkpoint_hash="",
     ))
     assert r2.accepted is True
 

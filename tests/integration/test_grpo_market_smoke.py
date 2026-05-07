@@ -112,8 +112,7 @@ def test_two_windows_with_cooldown():
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{i}",
             prompt_idx=i,
-            window_start=0,
-            signed_round=95,  # within LAG_MAX=10 of current_round=100
+            window_start=0,  # within LAG_MAX=10 of current_round=100
             merkle_root=_merkle(i),
             rollouts=_rollouts(k=4),
             checkpoint_hash="sha256:test",
@@ -133,8 +132,7 @@ def test_two_windows_with_cooldown():
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{prompt_idx}",
             prompt_idx=prompt_idx,
-            window_start=1,
-            signed_round=105,  # within LAG_MAX=10 of current_round=110
+            window_start=1,  # within LAG_MAX=10 of current_round=110
             merkle_root=_merkle(100 + prompt_idx),
             rollouts=_rollouts(k=4),
             checkpoint_hash="sha256:test",
@@ -150,8 +148,7 @@ def test_two_windows_with_cooldown():
     req = BatchSubmissionRequest(
         miner_hotkey=f"hk{reuse_prompt}",
         prompt_idx=reuse_prompt,
-        window_start=4,
-        signed_round=135,  # within LAG_MAX=10 of current_round=140
+        window_start=4,  # within LAG_MAX=10 of current_round=140
         merkle_root=_merkle(500),
         rollouts=_rollouts(k=4),
         checkpoint_hash="sha256:test",
@@ -218,8 +215,7 @@ def test_out_of_zone_rejected_end_to_end():
     req = BatchSubmissionRequest(
         miner_hotkey="hk",
         prompt_idx=42,
-        window_start=0,
-        signed_round=95,  # within LAG_MAX=10 of current_round=100
+        window_start=0,  # within LAG_MAX=10 of current_round=100
         merkle_root=_merkle(42),
         rollouts=_rollouts(k=0),  # all losses
         checkpoint_hash="sha256:test",

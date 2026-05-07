@@ -94,7 +94,7 @@ def test_service_update_ema_for_sealed_batch():
     ]
     batch = [
         ValidSubmission(
-            hotkey=f"hk{i}", prompt_idx=i, signed_round=100,
+            hotkey=f"hk{i}", prompt_idx=i,
             merkle_root_bytes=b"\x00" * 32, sigma=0.5, rollouts=rollouts,
         )
         for i in range(5)

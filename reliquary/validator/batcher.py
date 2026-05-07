@@ -44,10 +44,10 @@ from reliquary.validator.verifier import (
 logger = logging.getLogger(__name__)
 
 
-# Maximum drand-round lag tolerated: a miner's ``signed_round`` may be up to
-# this many rounds behind ``current_round`` to be accepted. Newer than
-# current_round is always rejected (replay of future beacon).
-STALE_ROUND_LAG_MAX = 10
+# v2.2: ``signed_round`` was removed entirely from the protocol. The batch
+# selection mechanism is now pure TCP-arrival FIFO (see ``batch_selection.py``)
+# and submissions are short-circuited to SUPERSEDED on the first claim of
+# any given ``prompt_idx`` for the active window.
 
 
 @dataclass
@@ -56,7 +56,6 @@ class ValidSubmission:
 
     hotkey: str
     prompt_idx: int
-    signed_round: int
     merkle_root_bytes: bytes
     merkle_root: bytes = field(init=False)  # alias for select_batch Protocol
     sigma: float = 0.0
@@ -104,9 +103,10 @@ class GrpoWindowBatcher:
         # If ``now_round_fn`` is supplied, ``current_round`` becomes a live
         # property that re-evaluates the drand round on every access — this
         # is what the production validator uses so the anti-replay window
-        # (STALE_ROUND_LAG_MAX rounds) stays a sliding 30-second window
-        # over the full WINDOW_TIMEOUT_SECONDS lifetime, instead of being
-        # frozen at window open. Tests pass a static int for determinism.
+        # rolls forward correctly during the window. Tests pass a static
+        # int for determinism. (As of v2.2 ``current_round`` is only used
+        # by the future-replay check — see ``_accept_locked``; it is no
+        # longer used to enforce a lag-based freshness window.)
         self._current_round_static = current_round
         self._now_round_fn = now_round_fn
         self.env = env
@@ -142,13 +142,13 @@ class GrpoWindowBatcher:
 
         self._lock = threading.Lock()
         self._valid: list[ValidSubmission] = []
-        # Per-prompt tracker for the lowest signed_round seen so far. Drives
-        # early rejection of any submission whose signed_round can't beat the
-        # incumbent — the FIFO winner per prompt is whichever has the smallest
-        # signed_round, so a new arrival with signed_round >= incumbent has
-        # zero chance of making the batch and we skip its GRAIL forward pass.
-        # Updated only after a submission passes the full pipeline.
-        self._best_round_per_prompt: dict[int, int] = {}
+        # Per-prompt claim set. As of v2.2 the FIFO mechanism is pure
+        # TCP-arrival: the first submission accepted for a given
+        # ``prompt_idx`` claims the slot, and any subsequent submission for
+        # the same prompt is rejected SUPERSEDED before any heavy
+        # validation (reward / GRAIL forward pass). This replaces the old
+        # ``_best_round_per_prompt`` mechanism keyed by ``signed_round``.
+        self._claimed_prompts: set[int] = set()
         self.randomness: str = ""
         # Accumulated reject reasons this window (RejectReason.value → count).
         # Persisted in the R2 archive so miners can see which filter is
@@ -200,19 +200,17 @@ class GrpoWindowBatcher:
             return self._reject(RejectReason.WRONG_CHECKPOINT)
         if request.prompt_idx >= len(self.env):
             return self._reject(RejectReason.BAD_PROMPT_IDX)
-        if not self._round_fresh(request.signed_round):
-            return self._reject(RejectReason.STALE_ROUND)
+        # v2.2: ``signed_round`` was removed from the protocol entirely.
+        # Cooldown and prompt-claim short-circuits below handle ordering.
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
             return self._reject(RejectReason.PROMPT_IN_COOLDOWN)
-        # FIFO short-circuit: select_batch picks the submission with the
-        # smallest signed_round per prompt_idx. A new arrival whose round
-        # is >= the incumbent's can't beat it, so reject before the heavy
-        # checks (reward / GRAIL). Smaller signed_round still falls through
-        # to the full pipeline and may replace the incumbent on success
-        # (keeps FIFO-by-signed_round semantics intact). Same-prompt-same-
-        # miner duplicate spam falls into the >= branch and is also blocked.
-        incumbent_round = self._best_round_per_prompt.get(request.prompt_idx)
-        if incumbent_round is not None and request.signed_round >= incumbent_round:
+        # FIFO short-circuit by TCP arrival: the first submission to pass the
+        # full validation pipeline for a given ``prompt_idx`` claims the
+        # slot. Every subsequent submission for the same prompt is rejected
+        # immediately, BEFORE the expensive reward + GRAIL checks. This is
+        # what protects the validator from being DoS'd by a flood of
+        # duplicate-prompt submissions and keeps each prompt single-winner.
+        if request.prompt_idx in self._claimed_prompts:
             return self._reject(RejectReason.SUPERSEDED)
 
         problem = self.env.get_problem(request.prompt_idx)
@@ -331,18 +329,15 @@ class GrpoWindowBatcher:
                 )
                 return self._reject(RejectReason.DISTRIBUTION_SUSPICIOUS)
 
-        # All checks passed — record the new (or improved) FIFO incumbent for
-        # this prompt so future submissions with signed_round >= this one are
-        # rejected early. A submission with a strictly smaller signed_round
-        # (rare; would require a stale beacon) still wins via select_batch
-        # because it sorts by signed_round across all entries in self._valid.
-        self._best_round_per_prompt[request.prompt_idx] = request.signed_round
+        # All checks passed — claim this prompt. Future submissions for the
+        # same ``prompt_idx`` are short-circuited at the top of
+        # ``_accept_locked`` and never reach the validation pipeline.
+        self._claimed_prompts.add(request.prompt_idx)
 
         self._valid.append(
             ValidSubmission(
                 hotkey=request.miner_hotkey,
                 prompt_idx=request.prompt_idx,
-                signed_round=request.signed_round,
                 merkle_root_bytes=bytes.fromhex(request.merkle_root),
                 sigma=sigma,
                 rollouts=list(request.rollouts),
@@ -368,11 +363,6 @@ class GrpoWindowBatcher:
         return BatchSubmissionResponse(
             accepted=True, reason=RejectReason.ACCEPTED
         )
-
-    def _round_fresh(self, signed_round: int) -> bool:
-        if signed_round > self.current_round:
-            return False
-        return (self.current_round - signed_round) <= STALE_ROUND_LAG_MAX
 
     def _reject(self, reason: RejectReason) -> BatchSubmissionResponse:
         self.reject_counts[reason.value] = self.reject_counts.get(reason.value, 0) + 1

@@ -205,7 +205,6 @@ async def test_submission_with_matching_hash_accepted_during_open():
             miner_hotkey=f"hk{i}",
             prompt_idx=i,
             window_start=batcher.window_start,
-            signed_round=batcher.current_round,
             merkle_root="00" * 32,
             rollouts=_rollouts(k=4),
             checkpoint_hash="sha256:cpA",
@@ -227,7 +226,6 @@ async def test_submission_with_wrong_hash_rejected():
     req = BatchSubmissionRequest(
         miner_hotkey="hk", prompt_idx=0,
         window_start=batcher.window_start,
-        signed_round=batcher.current_round,
         merkle_root="00" * 32,
         rollouts=_rollouts(k=4),
         checkpoint_hash="sha256:stale",  # mismatched
@@ -258,7 +256,6 @@ async def test_timeout_partial_seal_skips_train_and_publish():
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{i}", prompt_idx=i,
             window_start=batcher.window_start,
-            signed_round=batcher.current_round,
             merkle_root="00" * 32,
             rollouts=_rollouts(k=4),
             checkpoint_hash="sha256:cpA",

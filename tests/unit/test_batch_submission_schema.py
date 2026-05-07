@@ -55,7 +55,6 @@ def test_valid_request_parses():
         miner_hotkey="hk" * 24,
         prompt_idx=42,
         window_start=1000,
-        signed_round=999_999,
         merkle_root="00" * 32,
         rollouts=_valid_rollouts(k=4),
         checkpoint_hash="sha256:test",
@@ -70,7 +69,6 @@ def test_wrong_rollout_count_rejected():
             miner_hotkey="hk",
             prompt_idx=42,
             window_start=1000,
-            signed_round=999_999,
             merkle_root="00" * 32,
             rollouts=_valid_rollouts(k=4)[:7],  # 7 instead of M
         )
@@ -82,7 +80,6 @@ def test_negative_prompt_idx_rejected():
             miner_hotkey="hk",
             prompt_idx=-1,
             window_start=1000,
-            signed_round=999_999,
             merkle_root="00" * 32,
             rollouts=_valid_rollouts(),
         )
@@ -94,7 +91,6 @@ def test_malformed_merkle_root_rejected():
             miner_hotkey="hk",
             prompt_idx=0,
             window_start=1000,
-            signed_round=999_999,
             merkle_root="zz",
             rollouts=_valid_rollouts(),
         )

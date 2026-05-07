@@ -1,8 +1,12 @@
-"""Pure batch selection: FIFO by signed_round, distinct prompts, cooldown-aware.
+"""Pure batch selection: FIFO by TCP-arrival, distinct prompts, cooldown-aware.
 
 Called once per window to pick the B submissions that go into the training
 step. Separated from the orchestrator (``GrpoWindowBatcher``) to make the
 selection logic trivially testable in isolation.
+
+v2.2: ordering switched from ``signed_round`` (drand-anchored) to
+``arrived_at`` (TCP-arrival). The ``signed_round`` field was removed
+entirely from the wire protocol — see ``BatchSubmissionRequest``.
 """
 
 from __future__ import annotations
@@ -18,8 +22,8 @@ class _SubmissionLike(Protocol):
 
     hotkey: str
     prompt_idx: int
-    signed_round: int
     merkle_root: bytes
+    arrived_at: float
 
 
 def _tiebreak_key(sub: _SubmissionLike) -> bytes:
@@ -46,7 +50,12 @@ def select_batch(
     """Return the ordered list of at most *b* batch members.
 
     Rules:
-        1. Sort by ``(signed_round, tiebreak_hash)`` — deterministic FIFO.
+        1. Sort by ``(arrived_at, tiebreak_hash)`` — true TCP-arrival FIFO.
+           ``arrived_at`` is the validator-side timestamp recorded the
+           instant the submission was accepted into ``_valid``.
+           ``tiebreak_hash`` is a deterministic hash of (hotkey, prompt_idx,
+           merkle_root), only used in the (extremely rare) case where two
+           submissions have identical ``arrived_at`` floats.
         2. For each submission in order:
            - skip if its ``prompt_idx`` is already represented in the batch
              (diversity constraint — one prompt per batch slot)
@@ -54,11 +63,20 @@ def select_batch(
            - otherwise append; stop when ``len(batch) == b``
         3. Does NOT mutate ``cooldown_map`` — the caller records
            post-selection (via ``record_batched``) once the batch is final.
+
+    Note: in the v2.2 batcher the per-prompt SUPERSEDED short-circuit means
+    each ``prompt_idx`` appears at most once in ``submissions``. The diversity
+    constraint in step 2 thus mostly reduces to a no-op, but is preserved for
+    safety against future loosening of the short-circuit invariant.
     """
     if b <= 0:
         return []
 
-    ordered = sorted(submissions, key=lambda s: (s.signed_round, _tiebreak_key(s)))
+    def _order_key(s: Any) -> tuple:
+        arrived_at = getattr(s, "arrived_at", 0.0) or 0.0
+        return (arrived_at, _tiebreak_key(s))
+
+    ordered = sorted(submissions, key=_order_key)
 
     batch: list[Any] = []
     seen_prompts: set[int] = set()

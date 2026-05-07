@@ -32,7 +32,6 @@ class RejectReason(str, Enum):
     BAD_PROMPT_IDX = "bad_prompt_idx"
     PROMPT_MISMATCH = "prompt_mismatch"
     DISTRIBUTION_SUSPICIOUS = "distribution_suspicious"
-    STALE_ROUND = "stale_round"
     PROMPT_IN_COOLDOWN = "prompt_in_cooldown"
     SUPERSEDED = "superseded"
     GRAIL_FAIL = "grail_fail"
@@ -75,7 +74,6 @@ class BatchSubmissionRequest(BaseModel):
     miner_hotkey: str = Field(..., min_length=1)
     prompt_idx: int = Field(..., ge=0)
     window_start: int = Field(..., ge=0)
-    signed_round: int = Field(..., ge=0)
     merkle_root: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
     rollouts: list[RolloutSubmission]
     # Empty string is allowed as a bootstrap sentinel: before the validator
