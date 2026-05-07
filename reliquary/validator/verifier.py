@@ -47,7 +47,9 @@ def verify_signature(commit: dict, hotkey: str) -> bool:
     return verify_commit_signature(commit, hotkey)
 
 
-def verify_termination(commit: dict, tokenizer: Any, logits: torch.Tensor) -> bool:
+def verify_termination(
+    commit: dict, tokenizer: Any, logits: torch.Tensor, model: Any = None,
+) -> bool:
     """Hard check: rollout ends with EOS at p(EOS) >= MIN_EOS_PROBABILITY.
 
     Reuses the per-token logits cached from ``verify_commitment_proofs``,
@@ -58,18 +60,39 @@ def verify_termination(commit: dict, tokenizer: Any, logits: torch.Tensor) -> bo
     where reward depends on parsing the model's final output (boxed math,
     code block, JSON), a truncated rollout scores zero anyway — there is
     no legitimate reason for a healthy rollout to hit the cap.
+
+    Source of stop tokens: ``model.generation_config.eos_token_id`` is the
+    canonical list (matches what vLLM stops on). For Qwen3-Instruct it is
+    ``[151645, 151643]`` — the model legitimately stops on either, so the
+    check must accept either. Fallback to ``tokenizer.eos_token_id`` when
+    ``model`` is not provided (legacy callers / test stubs).
     """
     from reliquary.constants import MIN_EOS_PROBABILITY
 
     tokens = commit["tokens"]
-    eos_id = getattr(tokenizer, "eos_token_id", None)
-    if eos_id is None:
+
+    eos_ids: Any = None
+    gen_cfg = getattr(model, "generation_config", None) if model is not None else None
+    if gen_cfg is not None:
+        eos_ids = getattr(gen_cfg, "eos_token_id", None)
+    if eos_ids is None:
+        eos_ids = getattr(tokenizer, "eos_token_id", None)
+    if eos_ids is None:
         return False
-    if tokens[-1] != eos_id:
+    if isinstance(eos_ids, int):
+        eos_ids = [eos_ids]
+    eos_set = {int(e) for e in eos_ids if e is not None}
+    if not eos_set:
         return False
-    # logits[-2] is the distribution that produced tokens[-1] (the EOS).
-    p_eos = float(torch.softmax(logits[-2].float(), dim=-1)[eos_id].item())
-    return p_eos >= MIN_EOS_PROBABILITY
+
+    if int(tokens[-1]) not in eos_set:
+        return False
+    # logits[-2] is the distribution that produced tokens[-1]. Sum p(any
+    # accepted stop token) since the model legitimately distributes mass
+    # across them.
+    probs = torch.softmax(logits[-2].float(), dim=-1)
+    p_stop = float(sum(probs[eid].item() for eid in eos_set))
+    return p_stop >= MIN_EOS_PROBABILITY
 
 
 def verify_commitment_proofs(

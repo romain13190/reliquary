@@ -267,7 +267,7 @@ class GrpoWindowBatcher:
             # Skipped when grail stub returns empty logits (legacy test fixtures).
             if proof.logits.numel() > 0:
                 if not verify_termination(
-                    rollout.commit, self.tokenizer, proof.logits
+                    rollout.commit, self.tokenizer, proof.logits, self.model
                 ):
                     return self._reject(RejectReason.BAD_TERMINATION)
 
