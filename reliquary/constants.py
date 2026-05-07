@@ -87,6 +87,12 @@ UPLOAD_BUFFER = NETWORK_UPLOAD_LATENCY
 # Network-wide protocol cap on completion length.
 MAX_NEW_TOKENS_PROTOCOL_CAP = 8192
 
+# Soft cap on per-hotkey entries persisted to ``archive["rejected"]`` per
+# window. Beyond this, ``reject_counts`` still increments but no metadata is
+# appended — protects the R2 payload size against a flood of garbage
+# submissions from a single attacker.
+REJECTED_LIST_CAP_PER_HOTKEY = 5
+
 # ────────────────  GRPO BATCHING  ────────────────
 
 # Default HTTP port the validator listens on for miner submissions.
