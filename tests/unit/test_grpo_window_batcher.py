@@ -718,3 +718,44 @@ def test_rejected_submissions_list_initialised_empty():
         "hotkey", "prompt_idx", "reason",
         "sketch_diff_max", "lp_dev_max", "dist_q10_min",
     }.issubset(fields)
+
+
+def _empty_logits():
+    import torch
+    return torch.empty(0)
+
+
+def _build_request(*, hotkey: str = "hk", prompt_idx: int = 42, window_start: int = 500):
+    """Thin wrapper around ``_request`` for the rejection-archive tests."""
+    return _request(prompt_idx=prompt_idx, window_start=window_start, hotkey=hotkey)
+
+
+def test_rejected_grail_fail_omits_sketch_diff_max(monkeypatch):
+    """GRAIL_FAIL must NOT expose sketch_diff_max — anti-tuning."""
+    from reliquary.validator.verifier import ProofResult
+    from reliquary.protocol.submission import RejectReason
+
+    b = _make_batcher()  # existing helper
+
+    # Stub verify_commitment to return a failing proof with a known diff.
+    def fake_verify(commit, model, randomness):
+        return ProofResult(
+            all_passed=False,
+            passed=2,
+            checked=4,
+            sketch_diff_max=4242,  # MUST NOT leak into archive
+            logits=_empty_logits(),
+        )
+    b._verify_commitment = fake_verify
+    b._verify_signature = lambda commit, hk: True
+
+    req = _build_request(hotkey="hk_grail", prompt_idx=3)  # existing helper
+    resp = b.accept_submission(req)
+    assert resp.reason == RejectReason.GRAIL_FAIL
+
+    assert len(b.rejected_submissions) == 1
+    rec = b.rejected_submissions[0]
+    assert rec.hotkey == "hk_grail"
+    assert rec.prompt_idx == 3
+    assert rec.reason == "grail_fail"
+    assert rec.sketch_diff_max is None  # ← anti-tuning invariant
