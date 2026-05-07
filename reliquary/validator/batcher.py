@@ -254,6 +254,12 @@ class GrpoWindowBatcher:
             if proof.sketch_diff_max > sketch_diff_max:
                 sketch_diff_max = proof.sketch_diff_max
             if not proof.all_passed:
+                logger.warning(
+                    "grail_fail diag hotkey=%s prompt=%d sketch_diff_max=%d "
+                    "passed=%d/%d",
+                    request.miner_hotkey, request.prompt_idx,
+                    proof.sketch_diff_max, proof.passed, proof.checked,
+                )
                 return self._reject(RejectReason.GRAIL_FAIL)
 
             # Termination check: rollout must end with EOS at p(EOS) >= threshold.
