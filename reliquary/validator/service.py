@@ -462,7 +462,7 @@ class ValidationService:
                 "dist_q10_min": s.dist_q10_min,
             })
 
-        rejected_payload = [
+        rejected_entries = [
             {
                 "hotkey": r.hotkey,
                 "prompt_idx": r.prompt_idx,
@@ -482,7 +482,7 @@ class ValidationService:
             "batch": batch_entries,
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
-            "rejected": rejected_payload,
+            "rejected": rejected_entries,
         }
         await storage.upload_window_dataset(batcher.window_start, archive)
 

@@ -170,23 +170,29 @@ async def test_archive_includes_prompt_and_rollout_content():
     # reject_summary persisted from batcher.
     assert archive["reject_summary"] == {"out_of_zone": 3, "logprob_mismatch": 1}
 
-    # rejected[] persisted from batcher.rejected_submissions — metadata only.
+    # rejected[] persisted from batcher.rejected_submissions.
+    # Test the archive contract WITHOUT pinning the full dataclass field set —
+    # adding a new RejectedSubmission field shouldn't break this test, but a
+    # missing identity field or an anti-tuning regression must.
     assert "rejected" in archive
-    assert archive["rejected"] == [
-        {
-            "hotkey": "hk_evict",
-            "prompt_idx": 4,
-            "reason": "out_of_zone",
-            "sketch_diff_max": None,
-            "lp_dev_max": None,
-            "dist_q10_min": None,
-        },
-        {
-            "hotkey": "hk_grail_cheater",
-            "prompt_idx": 5,
-            "reason": "grail_fail",
-            "sketch_diff_max": None,  # anti-tuning: never surfaced
-            "lp_dev_max": None,
-            "dist_q10_min": None,
-        },
-    ]
+    assert len(archive["rejected"]) == 2
+
+    # Required public fields must be present on every entry.
+    REQUIRED_KEYS = {"hotkey", "prompt_idx", "reason"}
+    for entry in archive["rejected"]:
+        assert REQUIRED_KEYS.issubset(entry.keys()), (
+            f"archive entry missing required keys: {REQUIRED_KEYS - entry.keys()}"
+        )
+
+    evict, grail = archive["rejected"]
+    assert (evict["hotkey"], evict["prompt_idx"], evict["reason"]) == (
+        "hk_evict", 4, "out_of_zone",
+    )
+    assert (grail["hotkey"], grail["prompt_idx"], grail["reason"]) == (
+        "hk_grail_cheater", 5, "grail_fail",
+    )
+
+    # Anti-tuning invariant: GRAIL_FAIL must NOT surface sketch_diff_max in
+    # the public archive — even if the dataclass gains new diagnostic fields,
+    # this specific value MUST stay scrubbed.
+    assert grail["sketch_diff_max"] is None
