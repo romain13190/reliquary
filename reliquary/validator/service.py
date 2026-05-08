@@ -31,7 +31,7 @@ from reliquary.environment.base import Environment
 from reliquary.infrastructure import chain, storage
 from reliquary.protocol.submission import RolloutSubmission, WindowState
 from reliquary.validator import telemetry
-from reliquary.validator.batcher import GrpoWindowBatcher, ValidSubmission
+from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer

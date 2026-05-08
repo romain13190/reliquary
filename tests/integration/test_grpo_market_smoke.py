@@ -155,34 +155,26 @@ def test_two_windows_with_cooldown():
     assert resp.accepted is True, f"expected eligibility after cooldown, got {resp.reason}"
 
 
-def _run_ema_windows(hotkey_counts_per_window: list[dict[str, int]]) -> defaultdict:
-    """Simulate _update_ema over multiple windows; return final EMA dict."""
-    from unittest.mock import MagicMock
-    from reliquary.validator.service import ValidationService
+def _run_ema_windows(hotkey_counts_per_window: list[dict[str, int]]) -> dict:
+    """Replay EMA over a synthetic archive sequence; return final EMA dict.
 
-    class _W:
-        class _Hk:
-            ss58_address = "5FHk"
-            @staticmethod
-            def sign(d): return b"sig"
-        hotkey = _Hk()
+    Builds R2-style archive records out of the per-window hotkey counts and
+    feeds them through ``WeightOnlyValidator._replay_ema`` — the single
+    canonical scoring path used by both trainer and weight-only modes.
+    """
+    from reliquary.validator.weight_only import WeightOnlyValidator
 
-    svc = ValidationService(
-        wallet=_W(), model=MagicMock(), tokenizer=MagicMock(),
-        env=MagicMock(), netuid=99,
-    )
-    svc._miner_scores_ema = defaultdict(float)
-
-    for counts in hotkey_counts_per_window:
-        batch = []
+    archives = []
+    for window_idx, counts in enumerate(hotkey_counts_per_window):
+        batch_entries = []
         for hk, n in counts.items():
             for _ in range(n):
-                sub = MagicMock()
-                sub.hotkey = hk
-                batch.append(sub)
-        svc._update_ema(batch)
-
-    return svc._miner_scores_ema
+                batch_entries.append({"hotkey": hk, "prompt_idx": 0})
+        archives.append({
+            "window_start": window_idx,
+            "batch": batch_entries,
+        })
+    return WeightOnlyValidator._replay_ema(archives)
 
 
 def test_weights_for_full_batch():
