@@ -276,10 +276,14 @@ MIN_EOS_PROBABILITY = 0.02
 
 # LogprobValidator: max allowed median importance-sampling deviation
 # across K=CHALLENGE_K positions. dev_i = exp(|model_lp - miner_lp|) - 1.
-# Honest miners observed at ~0.00013 median dev in live testnet runs;
-# the smallest cheater drift (1-step stale checkpoint) already produces
-# ~0.01+. Tightened from 0.10 → 0.01 with ~77× margin over honest peak.
-LOGPROB_IS_EPS = 0.01
+# Reverted to GRAIL upstream's 0.10 (calibrated at 0% FP, ~50% headroom
+# over the worst honest case). The previous 0.01 was tightened against
+# same-stack miners observed at ~0.00013 median dev, but cross-stack
+# honest drift (transformers 4.x miner ↔ 5.x validator) sits around
+# 0.03-0.04 and was getting falsely rejected. 0.10 still flags clearly
+# stale or forged checkpoints (cheater drift grows quickly past 0.10),
+# while making the network functional for the majority of honest setups.
+LOGPROB_IS_EPS = 0.10
 
 # DistributionValidator: chosen-token probability thresholds. A "chosen
 # token" is the token the miner sampled at step t; its probability under
