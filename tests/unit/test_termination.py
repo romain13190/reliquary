@@ -67,3 +67,77 @@ def test_uses_logits_at_second_to_last_position():
     logits[:, 99] = -10.0
     logits[-2, 99] = 5.0  # p(EOS|context-at-pos-2) ~ 0.97
     assert verify_termination(_commit(tokens), _FakeTokenizer(), logits) is True
+
+
+# ---------------------------------------------------------------------
+# Path 1 — max-length termination based on total context length.
+# Honest miners running under a `max_model_len` ceiling (e.g. vLLM) cap
+# at prompt_length + completion_length = max_model_len, so completion_length
+# alone never reaches MAX_NEW_TOKENS_PROTOCOL_CAP. Path 1 must check the
+# total to accept these.
+# ---------------------------------------------------------------------
+
+
+def _commit_with_lengths(tokens: list[int], prompt_length: int, completion_length: int) -> dict:
+    return {
+        "tokens": tokens,
+        "rollout": {
+            "prompt_length": prompt_length,
+            "completion_length": completion_length,
+        },
+    }
+
+
+def test_path1_accepts_max_model_len_bound_termination():
+    """Miner with max_model_len=cap and prompt_length>0 hits prompt+compl=cap.
+    Last token is not EOS (model drifted), p_stop is ~0 — Path 2 fails — but
+    Path 1 must accept on total-length grounds."""
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt_length = 33
+    completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP - prompt_length  # exactly fills the cap
+    seq_len = prompt_length + completion_length
+    # Token 42 is not EOS (eos_token_id=99 in _FakeTokenizer)
+    tokens = [42] * seq_len
+    # Logits assign vanishing probability to EOS — Path 2 would reject
+    logits = torch.zeros(seq_len, 100)
+    logits[:, 99] = -20.0
+    assert verify_termination(
+        _commit_with_lengths(tokens, prompt_length, completion_length),
+        _FakeTokenizer(), logits,
+    ) is True
+
+
+def test_path1_accepts_when_completion_alone_meets_cap():
+    """Backwards-compat: a miner running pure max_new_tokens=cap (no
+    max_model_len constraint) still passes Path 1."""
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt_length = 0
+    completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP
+    seq_len = completion_length
+    tokens = [42] * seq_len
+    logits = torch.zeros(seq_len, 100)
+    logits[:, 99] = -20.0  # Path 2 fails
+    assert verify_termination(
+        _commit_with_lengths(tokens, prompt_length, completion_length),
+        _FakeTokenizer(), logits,
+    ) is True
+
+
+def test_path1_rejects_short_truncation_below_cap():
+    """A miner who truncates well below the cap and forges a non-EOS last
+    token must be rejected — this is the gaming-safe property of Path 1."""
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
+
+    prompt_length = 33
+    completion_length = 100  # total = 133, way below the cap
+    seq_len = prompt_length + completion_length
+    tokens = [42] * seq_len  # last token NOT EOS
+    logits = torch.zeros(seq_len, 100)
+    logits[:, 99] = -20.0  # p_stop ~ 0
+    assert prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP
+    assert verify_termination(
+        _commit_with_lengths(tokens, prompt_length, completion_length),
+        _FakeTokenizer(), logits,
+    ) is False

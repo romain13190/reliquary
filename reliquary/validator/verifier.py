@@ -52,13 +52,19 @@ def verify_termination(
 ) -> bool:
     """Two paths to a valid termination, both gaming-safe:
 
-    Path 1 — max-length termination: ``completion_length`` reached the
-    network-wide protocol cap ``MAX_NEW_TOKENS_PROTOCOL_CAP``. The model
-    legitimately ran out of tokens. A miner who'd try to game this path by
-    truncating early can't: anything below the cap fails Path 1, and a
-    ``tokens[-1]`` that wasn't actually sampled by the model fails Path 2's
-    p_stop check (the GRAIL forward replays the logits, so forged stops are
-    detected).
+    Path 1 — max-length termination: total token sequence (prompt +
+    completion) reached the network-wide protocol cap
+    ``MAX_NEW_TOKENS_PROTOCOL_CAP``. The miner ran out of context window.
+    We check the *total* length rather than ``completion_length`` alone
+    because honest miners running under a ``max_model_len`` ceiling
+    (e.g. vLLM, where prompt + generation ≤ max_model_len) can never
+    satisfy ``completion_length ≥ cap`` — the prompt eats part of the
+    budget. ``prompt_length`` is verified against the canonical prompt
+    upstream (PROMPT_MISMATCH check), so a miner cannot inflate it to
+    cheat. A miner who'd try to game this path by truncating early can't:
+    anything below the cap fails Path 1, and a ``tokens[-1]`` that wasn't
+    actually sampled by the model fails Path 2's p_stop check (the GRAIL
+    forward replays the logits, so forged stops are detected).
 
     Path 2 — natural EOS termination: ``tokens[-1]`` is one of the stop
     tokens declared in ``model.generation_config.eos_token_id`` (Qwen3-Instruct
@@ -77,9 +83,11 @@ def verify_termination(
     tokens = commit["tokens"]
     rollout_meta = commit.get("rollout", {}) or {}
     completion_length = int(rollout_meta.get("completion_length", 0))
+    prompt_length = int(rollout_meta.get("prompt_length", 0))
 
-    # Path 1: max-length termination.
-    if completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP:
+    # Path 1: max-length termination — check total length, not completion
+    # alone (see docstring for the max_model_len rationale).
+    if prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP:
         return True
 
     # Path 2: natural EOS with non-trivial probability.
@@ -89,10 +97,13 @@ def verify_termination(
         eos_ids = getattr(gen_cfg, "eos_token_id", None)
     if eos_ids is None:
         eos_ids = getattr(tokenizer, "eos_token_id", None)
+    total_length = prompt_length + completion_length
     if eos_ids is None:
         logger.warning(
-            "termination_fail reason=no_eos_ids completion_length=%d cap=%d",
-            completion_length, MAX_NEW_TOKENS_PROTOCOL_CAP,
+            "termination_fail reason=no_eos_ids prompt_length=%d "
+            "completion_length=%d total=%d cap=%d",
+            prompt_length, completion_length, total_length,
+            MAX_NEW_TOKENS_PROTOCOL_CAP,
         )
         return False
     if isinstance(eos_ids, int):
@@ -100,8 +111,10 @@ def verify_termination(
     eos_set = {int(e) for e in eos_ids if e is not None}
     if not eos_set:
         logger.warning(
-            "termination_fail reason=empty_eos_set completion_length=%d cap=%d",
-            completion_length, MAX_NEW_TOKENS_PROTOCOL_CAP,
+            "termination_fail reason=empty_eos_set prompt_length=%d "
+            "completion_length=%d total=%d cap=%d",
+            prompt_length, completion_length, total_length,
+            MAX_NEW_TOKENS_PROTOCOL_CAP,
         )
         return False
 
@@ -112,9 +125,11 @@ def verify_termination(
     ok = in_eos and p_stop >= MIN_EOS_PROBABILITY
     if not ok:
         logger.warning(
-            "termination_fail completion_length=%d cap=%d last_token=%d "
-            "in_eos=%s p_stop=%.5f min_p=%.3f eos_set=%s",
-            completion_length, MAX_NEW_TOKENS_PROTOCOL_CAP,
+            "termination_fail prompt_length=%d completion_length=%d "
+            "total=%d cap=%d last_token=%d in_eos=%s p_stop=%.5f "
+            "min_p=%.3f eos_set=%s",
+            prompt_length, completion_length, total_length,
+            MAX_NEW_TOKENS_PROTOCOL_CAP,
             last_tok, in_eos, p_stop, MIN_EOS_PROBABILITY, sorted(eos_set),
         )
     return ok
