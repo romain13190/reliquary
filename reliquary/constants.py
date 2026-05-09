@@ -58,10 +58,9 @@ ATTN_IMPLEMENTATION = _os.environ.get("GRAIL_ATTN_IMPL", "flash_attention_2")
 # ────────────────  TIMING (CONSENSUS)  ────────────────
 
 # Blocks per window — 5 blocks × 12s ≈ 60s.
-# All roles use this to determine window boundaries. With
-# WEIGHT_SUBMISSION_INTERVAL=360, that yields ROLLING_WINDOWS=72 windows of
-# scoring per on-chain weight submission, providing ~72× smoothing of miner
-# scores over the epoch.
+# All roles use this to determine window boundaries. With a typical tempo of
+# 360 blocks, that yields ROLLING_WINDOWS=72 windows of scoring per on-chain
+# weight submission, providing ~72× smoothing of miner scores over the epoch.
 WINDOW_LENGTH = 5
 
 # Bittensor block time target average (seconds).
@@ -117,7 +116,11 @@ POLL_INTERVAL_SECONDS = 10
 
 # ────────────────  WEIGHT SUBMISSION  ────────────────
 
-WEIGHT_SUBMISSION_INTERVAL = 360  # Blocks between weight submissions
+# Submit weights when blocks_until_next_epoch <= this value. Tuned so all
+# validators of a netuid land in the same ~20-block window (≈4 min on
+# 12s/block) and read near-identical R2 archive snapshots, then converge
+# to identical weights via the deterministic EMA replay.
+EPOCH_SUBMIT_LEAD_BLOCKS = 20
 
 # ────────────────  STORAGE  ────────────────
 
