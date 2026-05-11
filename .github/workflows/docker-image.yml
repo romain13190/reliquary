@@ -5,6 +5,23 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Serialize image builds + always let the newest commit win.
+#
+# Why: when two PRs land in rapid succession, GH Actions starts both builds
+# concurrently. They both push to ``:latest``. The slower build pushes LAST,
+# so its (older) commit wins the tag — even though the newer commit was
+# merged later. This caused PR #5 to silently get overwritten by PR #4's
+# slower build on 2026-05-11, leaving the validator on outdated code despite
+# both PRs being merged.
+#
+# ``cancel-in-progress: true`` interrupts any older in-flight build when a
+# newer commit lands. The newer commit's build runs alone and is the only
+# one pushing ``:latest``. Worst case we waste an in-flight build's compute;
+# best case we ship the right code faster.
+concurrency:
+  group: docker-image-build
+  cancel-in-progress: true
+
 permissions:
   contents: read
   packages: write
