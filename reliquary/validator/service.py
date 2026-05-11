@@ -288,13 +288,15 @@ class ValidationService:
         )
 
     def _open_window(self) -> None:
-        """Create a new GrpoWindowBatcher and mark state OPEN.
+        """Create a new GrpoWindowBatcher in a non-active state.
 
-        Increments ``self._window_n`` and wires the active checkpoint hash
-        into the batcher so miners on stale checkpoints get WRONG_CHECKPOINT
-        rejected before GRAIL compute. Per-window randomness is set
-        separately by the async caller via ``_set_window_randomness`` —
-        it needs the subtensor, which this sync path doesn't carry.
+        Builds the batcher and wires the active checkpoint hash, but does
+        NOT expose it to the HTTP server yet — call ``_activate_window``
+        after ``_set_window_randomness`` succeeds. This two-phase open
+        prevents miner submissions from reaching a batcher whose
+        ``randomness`` is still the default ``""``, which crashes commitment
+        verification in ``indices_from_root`` if the chain call that fills
+        randomness fails (e.g. finney WebSocket returns 503).
         """
         self._window_n += 1
         bootstrap = is_bootstrap_window(
@@ -311,6 +313,17 @@ class ValidationService:
         self._active_batcher.current_checkpoint_hash = (
             cp.revision if cp else ""
         )
+
+    def _activate_window(self) -> None:
+        """Expose the prepared batcher to the HTTP server and mark OPEN.
+
+        Must be called only after ``_set_window_randomness`` has populated
+        ``self._active_batcher.randomness``; otherwise miner submissions
+        arriving in the window between OPEN and a later randomness set
+        would fail verification with ``Empty randomness hex string``.
+        """
+        if self._active_batcher is None:
+            return
         self.server.set_active_batcher(self._active_batcher)
         self._set_state(WindowState.OPEN)
 
@@ -559,6 +572,7 @@ class ValidationService:
                 try:
                     self._open_window()
                     await self._set_window_randomness(subtensor)
+                    self._activate_window()
                     try:
                         await asyncio.wait_for(
                             self._active_batcher.seal_event.wait(),

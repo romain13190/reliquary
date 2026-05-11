@@ -73,3 +73,40 @@ async def test_rebuild_cooldown_from_history_populates_map():
     assert len(svc._cooldown_map) == 2
 
 
+def test_open_window_does_not_expose_batcher_before_activation():
+    """_open_window builds the batcher in a non-active state; only
+    _activate_window registers it with the HTTP server.
+
+    Regression for the prod cascade where finney WebSocket 503s during
+    _set_window_randomness left the batcher exposed with randomness=""
+    and every miner submission crashed in indices_from_root('').
+    """
+    from reliquary.validator.service import ValidationService, WindowState
+
+    class FakeWallet:
+        class _Hk:
+            ss58_address = "5FHk"
+        hotkey = _Hk()
+
+    svc = ValidationService(
+        wallet=FakeWallet(),
+        model=None,
+        tokenizer=MagicMock(),
+        env=_FakeEnv(),
+        netuid=99,
+    )
+    svc.server = MagicMock()
+    svc._checkpoint_store = MagicMock()
+    svc._checkpoint_store.current_manifest.return_value = None
+
+    svc._open_window()
+    # Batcher exists internally but the server hasn't been told.
+    assert svc._active_batcher is not None
+    svc.server.set_active_batcher.assert_not_called()
+    assert svc._current_window_state != WindowState.OPEN
+
+    svc._activate_window()
+    # Now the server is registered and the state has flipped to OPEN.
+    svc.server.set_active_batcher.assert_called_once_with(svc._active_batcher)
+    assert svc._current_window_state == WindowState.OPEN
+
