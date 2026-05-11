@@ -148,7 +148,6 @@ class ValidationService:
         env: Environment,
         netuid: int,
         *,
-        use_drand: bool = True,
         http_host: str = "0.0.0.0",
         http_port: int = VALIDATOR_HTTP_PORT,
         external_ip: str | None = None,
@@ -191,7 +190,6 @@ class ValidationService:
         self.tokenizer = tokenizer
         self.env = env
         self.netuid = netuid
-        self.use_drand = use_drand
         self.external_ip = external_ip
         self.external_port = external_port
 
@@ -760,17 +758,23 @@ class ValidationService:
             )
 
     async def _derive_randomness(self, subtensor, target_window: int) -> str:
-        block_hash = await chain.get_block_hash(subtensor, target_window)
-        if self.use_drand:
-            from reliquary.infrastructure.drand import get_beacon, get_current_chain
-            chain_info = get_current_chain()
-            drand_round = chain.compute_drand_round_for_window(
-                target_window, chain_info["genesis_time"], chain_info["period"],
-            )
-            beacon = get_beacon(round_id=str(drand_round), use_drand=True)
-            return chain.compute_window_randomness(
-                block_hash, beacon["randomness"], drand_round=beacon["round"],
-            )
-        return chain.compute_window_randomness(block_hash)
+        """Derive per-window randomness from drand (no chain dependency).
+
+        ``subtensor`` is kept in the signature for API symmetry with the
+        async caller but is unused — drand-only derivation removed the
+        finney ``get_block_hash`` dependency that was wedging windows
+        during 503 storms. The drand round is purely deterministic from
+        ``target_window`` + drand chain info, and the beacon is fetched
+        over HTTP from Cloudflare-hosted drand gateways.
+        """
+        from reliquary.infrastructure.drand import get_beacon, get_current_chain
+        chain_info = get_current_chain()
+        drand_round = chain.compute_drand_round_for_window(
+            target_window, chain_info["genesis_time"], chain_info["period"],
+        )
+        beacon = get_beacon(round_id=str(drand_round), use_drand=True)
+        return chain.compute_window_randomness(
+            drand_randomness=beacon["randomness"], drand_round=beacon["round"],
+        )
 
 

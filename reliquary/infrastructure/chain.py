@@ -133,20 +133,22 @@ def compute_drand_round_for_window(
 
 
 def compute_window_randomness(
-    block_hash: str,
-    drand_randomness: str | None = None,
-    drand_round: int | None = None,
+    drand_randomness: str,
+    drand_round: int,
 ) -> str:
-    """Combine block hash, drand randomness, and round into window randomness.
+    """Derive window randomness from a drand beacon.
 
-    Including the round number prevents a miner from choosing a round
-    whose randomness is favorable.
+    Drand is the sole source of per-window unpredictability in v2.2: the
+    beacon for ``drand_round`` is only published when that round's
+    timestamp is reached, so neither side can precompute. The round
+    number is mixed into the hash to prevent any future ambiguity if the
+    drand chain is ever re-keyed.
+
+    Removing the previous ``block_hash`` dependency: the chain RPC for
+    ``get_block_hash`` is the bottleneck during finney 503 storms — every
+    window open used to wedge on a substrate WebSocket. Drand HTTP is
+    served from a much more reliable infrastructure and keeps windows
+    advancing through finney outages.
     """
-    clean_hash = block_hash.replace("0x", "")
-    if drand_randomness:
-        material = bytes.fromhex(clean_hash) + bytes.fromhex(drand_randomness)
-        if drand_round is not None:
-            material += drand_round.to_bytes(8, "big")
-        combined = hashlib.sha256(material).hexdigest()
-        return combined
-    return clean_hash
+    material = bytes.fromhex(drand_randomness) + drand_round.to_bytes(8, "big")
+    return hashlib.sha256(material).hexdigest()

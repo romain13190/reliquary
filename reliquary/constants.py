@@ -6,7 +6,7 @@ No os.getenv() overrides. Changes require coordinated deployment.
 
 # ────────────────  GRAIL PROOF VERSION  ────────────────
 
-GRAIL_PROOF_VERSION = "v5"
+GRAIL_PROOF_VERSION = "v6"
 
 # ────────────────  CRYPTOGRAPHIC CONSTANTS  ────────────────
 

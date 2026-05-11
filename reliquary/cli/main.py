@@ -21,7 +21,6 @@ def setup_logging(level: str = "INFO"):
 
 @app.command()
 def mine(
-    use_drand: bool = typer.Option(True, help="Use drand for randomness"),
     network: str = typer.Option("finney", help="Bittensor network"),
     netuid: int = typer.Option(81, help="Subnet UID"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
@@ -140,7 +139,7 @@ def mine(
 
         logger.info("Miner ready. Entering main loop.")
         try:
-            await engine.mine_window(subtensor, 0, use_drand=use_drand)
+            await engine.mine_window(subtensor, 0)
         except KeyboardInterrupt:
             logger.info("Miner interrupted by user")
         except Exception as e:
@@ -161,7 +160,6 @@ def validate(
             "computes EMA, submits weights. No GPU, no HF, no HTTP server."
         ),
     ),
-    use_drand: bool = typer.Option(True, help="Use drand for randomness"),
     network: str = typer.Option("finney", help="Bittensor network"),
     netuid: int = typer.Option(81, help="Subnet UID"),
     wallet_name: str = typer.Option("default", help="Wallet name"),
@@ -249,7 +247,6 @@ def validate(
                 tokenizer,
                 env,
                 netuid,
-                use_drand=use_drand,
                 http_host=http_host,
                 http_port=http_port,
                 external_ip=external_ip or None,

@@ -177,7 +177,6 @@ class MiningEngine:
         self,
         subtensor,
         window_start: int = 0,  # v2.0 param kept for CLI compat; ignored
-        use_drand: bool = True,
     ) -> list:
         """v2.1: poll state, pull checkpoint on n-change, submit when OPEN.
 
@@ -204,13 +203,15 @@ class MiningEngine:
             metagraph = await chain.get_metagraph(subtensor, chain.NETUID)
             url = discover_validator_url(metagraph)
 
-        # Compute randomness (once — v2.1 uses it only for GRAIL sketch seed)
-        randomness = await self._compute_randomness(subtensor, 0, use_drand)
-
         rng = random.Random()
         results = []
         local_n = 0
         local_hash = ""
+        # Cache the per-window randomness across iterations within the same
+        # window — drand HTTP is cheap but recomputing per-rollout would
+        # spam the beacon endpoint unnecessarily.
+        randomness: str | None = None
+        randomness_for_window: int | None = None
 
         async with httpx.AsyncClient(timeout=30) as client:
             while True:
@@ -239,6 +240,21 @@ class MiningEngine:
                 if state.state != WindowState.OPEN:
                     await asyncio.sleep(1)
                     continue
+
+                # Per-window randomness: recompute when window_n advances.
+                # Must match the validator's _derive_randomness output for
+                # this same window — both sides use the same drand round.
+                if randomness_for_window != state.window_n:
+                    try:
+                        randomness = await self._compute_randomness(state.window_n)
+                        randomness_for_window = state.window_n
+                    except Exception:
+                        logger.exception(
+                            "randomness derivation failed for window %d; "
+                            "skipping this poll", state.window_n,
+                        )
+                        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                        continue
 
                 # Pick prompt, generate, submit.
                 cooldown_set = set(state.cooldown_prompts)
@@ -425,23 +441,25 @@ class MiningEngine:
     # Private helpers
     # ------------------------------------------------------------------
 
-    async def _compute_randomness(
-        self, subtensor, window_start: int, use_drand: bool
-    ) -> str:
-        """Derive window randomness from block hash (+ optional drand beacon)."""
-        block_hash = await chain.get_block_hash(subtensor, window_start)
-        if use_drand:
-            from reliquary.infrastructure.drand import get_beacon, get_current_chain
+    async def _compute_randomness(self, window_start: int) -> str:
+        """Derive per-window randomness from drand (no chain dependency).
 
-            chain_info = get_current_chain()
-            drand_round = chain.compute_drand_round_for_window(
-                window_start, chain_info["genesis_time"], chain_info["period"]
-            )
-            beacon = get_beacon(round_id=str(drand_round), use_drand=True)
-            return chain.compute_window_randomness(
-                block_hash, beacon["randomness"], drand_round=beacon["round"]
-            )
-        return chain.compute_window_randomness(block_hash)
+        Must mirror the validator's ``_derive_randomness`` bit-for-bit so
+        GRAIL sketches and challenge indices match. The drand round is
+        computed deterministically from ``window_start`` + the drand
+        chain's genesis/period, then the beacon for that round is
+        fetched over HTTP. No subtensor call, no block_hash.
+        """
+        from reliquary.infrastructure.drand import get_beacon, get_current_chain
+
+        chain_info = get_current_chain()
+        drand_round = chain.compute_drand_round_for_window(
+            window_start, chain_info["genesis_time"], chain_info["period"]
+        )
+        beacon = get_beacon(round_id=str(drand_round), use_drand=True)
+        return chain.compute_window_randomness(
+            drand_randomness=beacon["randomness"], drand_round=beacon["round"]
+        )
 
     def _build_grail_commit(self, generation: dict, randomness: str) -> dict:
         """Construct a GRAIL proof commit dict from a generation dict.

@@ -13,15 +13,22 @@ class TestDeterministicBeaconRound:
         a miner from choosing a favorable round."""
         from reliquary.infrastructure.chain import compute_window_randomness
 
-        block_hash = "aa" * 32
         drand_rand = "bb" * 32
 
-        r1 = compute_window_randomness(block_hash, drand_rand, drand_round=100)
-        r2 = compute_window_randomness(block_hash, drand_rand, drand_round=101)
-        r_no_round = compute_window_randomness(block_hash, drand_rand, drand_round=None)
+        r1 = compute_window_randomness(drand_rand, drand_round=100)
+        r2 = compute_window_randomness(drand_rand, drand_round=101)
+        r1_again = compute_window_randomness(drand_rand, drand_round=100)
 
         assert r1 != r2, "Different rounds must produce different randomness"
-        assert r1 != r_no_round, "Providing a round must change the result"
+        assert r1 == r1_again, "Same inputs must produce same randomness"
+
+    def test_compute_window_randomness_includes_drand_value(self):
+        """Different drand beacons for the same round must produce different randomness."""
+        from reliquary.infrastructure.chain import compute_window_randomness
+
+        r1 = compute_window_randomness("bb" * 32, drand_round=100)
+        r2 = compute_window_randomness("cc" * 32, drand_round=100)
+        assert r1 != r2
 
     def test_compute_drand_round_for_window(self):
         """Round selection must be deterministic from window_start and chain params."""
