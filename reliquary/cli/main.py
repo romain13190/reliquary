@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import threading
 
 import typer
 
@@ -10,11 +11,16 @@ from reliquary.constants import DEFAULT_BASE_MODEL, DEFAULT_HF_REPO_ID, ENVIRONM
 
 app = typer.Typer(name="reliquary", help="Reliquary — Verifiable Inference Subnet")
 
+logger = logging.getLogger(__name__)
+
 
 def setup_logging(level: str = "INFO"):
+    # ``%(threadName)s`` distinguishes the main asyncio loop from the
+    # dedicated ``weight-setter`` thread (see ``validate`` below) when
+    # tailing logs.
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+        format="%(asctime)s | %(threadName)s | %(name)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -257,15 +263,27 @@ def validate(
                 hf_repo_id=hf_repo_id,
                 resume_from=resume_from or None,
             )
-            # Run training + scoring as two independent concurrent loops so
-            # set_weights fires once per subnet epoch instead
-            # of being gated by the trainer's window timeouts.
+            # Run the weight setter in a dedicated OS thread with its own
+            # event loop. asyncio is single-threaded, so any sync blocking
+            # call on the trainer's loop (e.g. /state acquiring a lock the
+            # GRAIL verifier is holding) would stall set_weights too. The
+            # weight setter's own subtensor (see WeightOnlyValidator.run)
+            # plus its own loop here means neither side can block the other.
             from reliquary.validator.weight_only import WeightOnlyValidator
-            weights_worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)
-            await asyncio.gather(
-                service.run(subtensor),
-                weights_worker.run(),
-            )
+
+            def _run_weight_setter() -> None:
+                try:
+                    worker = WeightOnlyValidator(wallet=wallet, netuid=netuid)
+                    asyncio.run(worker.run())
+                except Exception:
+                    logger.exception("weight-setter thread crashed")
+
+            threading.Thread(
+                target=_run_weight_setter,
+                name="weight-setter",
+                daemon=True,
+            ).start()
+            await service.run(subtensor)
         else:
             from reliquary.validator.weight_only import WeightOnlyValidator
 
