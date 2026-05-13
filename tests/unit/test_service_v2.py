@@ -110,3 +110,34 @@ def test_open_window_does_not_expose_batcher_before_activation():
     svc.server.set_active_batcher.assert_called_once_with(svc._active_batcher)
     assert svc._current_window_state == WindowState.OPEN
 
+
+def test_service_has_separate_verify_and_train_models():
+    """ValidationService keeps verify_model and train_model as distinct
+    PyTorch objects. The verify model is frozen (eval mode,
+    requires_grad=False); the train model is trainable.
+    """
+    import torch.nn as nn
+    from reliquary.validator.service import ValidationService
+
+    train = nn.Linear(4, 4)
+    svc = ValidationService(
+        wallet=MagicMock(hotkey=MagicMock(ss58_address="x")),
+        model=train,
+        tokenizer=MagicMock(),
+        env=_FakeEnv(),
+        netuid=99,
+    )
+    assert svc.train_model is train
+    assert svc.verify_model is not train
+    assert all(not p.requires_grad for p in svc.verify_model.parameters())
+    assert not svc.verify_model.training  # eval mode
+
+    # In-place refresh works: mutate train, copy into verify, check.
+    import torch
+    with torch.no_grad():
+        for p in svc.train_model.parameters():
+            p.add_(1.0)
+    svc.verify_model.load_state_dict(svc.train_model.state_dict())
+    for p_t, p_v in zip(svc.train_model.parameters(), svc.verify_model.parameters()):
+        assert torch.equal(p_t, p_v)
+

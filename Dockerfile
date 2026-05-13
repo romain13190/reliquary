@@ -44,6 +44,10 @@ RUN pip uninstall -y cyscale \
 # boto3 for R2 (weight-only mode + trainer archive uploads)
 RUN pip install boto3
 
+# wandb for trainer telemetry (lazy-imported in reliquary.validator.telemetry).
+# No-op at runtime if WANDB_API_KEY is unset.
+RUN pip install wandb
+
 # Runtime
 ENV GRAIL_ATTN_IMPL=flash_attention_2
 COPY docker/entrypoint.sh /opt/entrypoint.sh

@@ -15,14 +15,14 @@ from reliquary.validator.training import train_step, reset_training_state
 def test_train_step_with_empty_batch():
     reset_training_state()
     model = MagicMock()
-    result = train_step(model=model, batch=[])
+    result = train_step(model=model, batch=[], ref_model=MagicMock())
     assert result is model
 
 
 def test_train_step_empty_batch_logs(caplog):
     reset_training_state()
     caplog.set_level(logging.INFO, logger="reliquary.validator.training")
-    train_step(model=MagicMock(), batch=[])
+    train_step(model=MagicMock(), batch=[], ref_model=MagicMock())
     assert any("empty batch" in rec.message for rec in caplog.records)
 
 
@@ -44,7 +44,9 @@ def test_train_step_returns_model_on_all_degenerate_groups():
     group.rollouts = [rollout] * 4
     group.prompt_idx = 0
 
-    result = train_step(model=model, batch=[group])
+    import copy
+    ref = copy.deepcopy(model)
+    result = train_step(model=model, batch=[group], ref_model=ref)
     assert result is model
 
     # Optimizer state should have been initialised but step not taken
@@ -102,7 +104,9 @@ def test_train_step_forwards_metrics_to_telemetry(monkeypatch):
 
     monkeypatch.setattr(_t, "_rollout_loss", fake_loss)
 
-    _t.train_step(model=model, batch=[group], window_index=7)
+    import copy
+    ref = copy.deepcopy(model)
+    _t.train_step(model=model, batch=[group], ref_model=ref, window_index=7)
 
     assert captured["step"] == 7
     m = captured["metrics"]
@@ -145,7 +149,9 @@ def test_train_step_counts_degenerate_groups(monkeypatch):
     group.rollouts = [rollout] * 4
     group.prompt_idx = 0
 
-    _t.train_step(model=model, batch=[group], window_index=3)
+    import copy
+    ref = copy.deepcopy(model)
+    _t.train_step(model=model, batch=[group], ref_model=ref, window_index=3)
 
     # No successful step → no metrics emitted.
     assert called == []

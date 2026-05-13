@@ -11,13 +11,12 @@ saves one forward pass per rollout.
 
 from __future__ import annotations
 
-import copy
 import logging
 import math
 from typing import Any, Optional
 
 import torch
-import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from reliquary.validator import telemetry
 from reliquary.constants import (
@@ -33,8 +32,7 @@ logger = logging.getLogger(__name__)
 
 _optimizer: Optional[torch.optim.Optimizer] = None
 _scheduler: Optional[torch.optim.lr_scheduler.LambdaLR] = None
-_ref_model: Optional[Any] = None
-_model_id: Optional[int] = None
+_optimizer_model_id: Optional[int] = None
 
 
 def _build_optimizer(params) -> torch.optim.Optimizer:
@@ -67,15 +65,14 @@ def _build_optimizer(params) -> torch.optim.Optimizer:
 
 
 def _lazy_init(model) -> bool:
-    """Create optimizer, scheduler, and reference model snapshot on first
-    call for a given model object. No-op on subsequent calls with the same
-    model. If the caller swaps to a different model instance, we rebuild.
-
-    Returns True on success, False if the model is not a usable nn.Module
-    (e.g. a MagicMock in tests or a non-torch placeholder).
+    """Create optimizer + scheduler on first call for a given model. No-op
+    on subsequent calls with the same model. The reference model used for
+    KL is no longer built here — it's passed in by the caller (typically
+    ``ValidationService.verify_model``) and refreshed externally on each
+    publish.
     """
-    global _optimizer, _scheduler, _ref_model, _model_id
-    if _model_id == id(model):
+    global _optimizer, _scheduler, _optimizer_model_id
+    if _optimizer_model_id == id(model):
         return True
 
     try:
@@ -98,15 +95,8 @@ def _lazy_init(model) -> bool:
         return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
     _scheduler = torch.optim.lr_scheduler.LambdaLR(_optimizer, _lr_lambda)
-
-    # Reference model: deep-copy, eval mode, frozen. Used for KL.
-    _ref_model = copy.deepcopy(model)
-    _ref_model.eval()
-    for p in _ref_model.parameters():
-        p.requires_grad = False
-
-    _model_id = id(model)
-    logger.info("Training state initialised (optimizer, scheduler, ref_model)")
+    _optimizer_model_id = id(model)
+    logger.info("Training state initialised (optimizer, scheduler)")
     return True
 
 
@@ -114,13 +104,12 @@ def reset_training_state() -> None:
     """Clear the module-level singletons. Used by tests to start fresh.
 
     Production code should never call this — it throws away optimiser
-    momentum and the reference model snapshot.
+    momentum.
     """
-    global _optimizer, _scheduler, _ref_model, _model_id
+    global _optimizer, _scheduler, _optimizer_model_id
     _optimizer = None
     _scheduler = None
-    _ref_model = None
-    _model_id = None
+    _optimizer_model_id = None
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +136,51 @@ def _compute_advantages(rewards: list[float]) -> list[float]:
 # ---------------------------------------------------------------------------
 # Per-rollout loss (forward-pass heavy — uses the model)
 # ---------------------------------------------------------------------------
+
+# Row-chunk for selected-logprob streaming. With Qwen3 vocab=152064:
+#   chunk × vocab × 4 bytes = 64 × 152064 × 4 ≈ 39 MiB peak fp32 alloc per chunk.
+_LOGPROB_CHUNK = 64
+
+
+def _logprob_block(logits_slice: torch.Tensor, indices_slice: torch.Tensor) -> torch.Tensor:
+    """log p(idx | row) for one chunk, in fp32. Equivalent to
+    ``log_softmax(logits_slice.float(), dim=-1).gather(1, idx).squeeze(1)``.
+    """
+    logits_f = logits_slice.float()
+    lse = torch.logsumexp(logits_f, dim=-1)
+    gathered = logits_f.gather(1, indices_slice.unsqueeze(1)).squeeze(1)
+    return gathered - lse
+
+
+def _selected_logprobs(
+    logits: torch.Tensor,
+    indices: torch.Tensor,
+    chunk: int = _LOGPROB_CHUNK,
+) -> torch.Tensor:
+    """Streaming, fp32-stable equivalent of
+    ``log_softmax(logits.float(), dim=-1).gather(1, indices.unsqueeze(1)).squeeze(1)``.
+
+    Materialises at most ``chunk × vocab × 4`` bytes of fp32 at a time
+    instead of the full ``N × vocab × 4`` tensor. When ``logits.requires_grad``
+    is True, each chunk is wrapped in ``torch.utils.checkpoint`` so backward
+    also peaks at one chunk's worth of memory (recompute on demand) rather
+    than holding the full fp32 cast for the backward pass.
+    """
+    n = logits.shape[0]
+    use_ckpt = logits.requires_grad
+    parts = []
+    for i in range(0, n, chunk):
+        end = i + chunk
+        if use_ckpt:
+            part = torch.utils.checkpoint.checkpoint(
+                _logprob_block, logits[i:end], indices[i:end],
+                use_reentrant=False,
+            )
+        else:
+            part = _logprob_block(logits[i:end], indices[i:end])
+        parts.append(part)
+    return torch.cat(parts, dim=0)
+
 
 def _rollout_loss(
     model,
@@ -181,10 +215,10 @@ def _rollout_loss(
     with dtype_ctx:
         logits = model(tokens, use_cache=False).logits[0]  # [T, vocab]
 
-    # log π_new(token_{t+1} | context_<=t) — cast to fp32 for stability
-    log_probs_all = F.log_softmax(logits[:-1].float(), dim=-1)
+    # log π_new(token_{t+1} | context_<=t) computed in fp32 but streamed
+    # over rows — see _selected_logprobs.
     next_tokens = tokens[0, 1:]  # [T-1]
-    new_logprobs = log_probs_all.gather(1, next_tokens.unsqueeze(1)).squeeze(1)
+    new_logprobs = _selected_logprobs(logits[:-1], next_tokens)
 
     # Slice to completion tokens only: logits[prompt_length-1] predicts
     # tokens[prompt_length] (first completion token).
@@ -194,8 +228,7 @@ def _rollout_loss(
     with torch.no_grad():
         with dtype_ctx:
             ref_logits = ref_model(tokens, use_cache=False).logits[0]
-        ref_log_probs_all = F.log_softmax(ref_logits[:-1].float(), dim=-1)
-        ref_logprobs = ref_log_probs_all.gather(1, next_tokens.unsqueeze(1)).squeeze(1)
+        ref_logprobs = _selected_logprobs(ref_logits[:-1], next_tokens)
     ref_logprobs_c = ref_logprobs[prompt_length - 1:]
 
     # π_old from miner (same completion slice)
@@ -228,20 +261,22 @@ def _rollout_loss(
 # Main entry point — one GRPO step per call
 # ---------------------------------------------------------------------------
 
-def train_step(model, batch: list, window_index: int | None = None) -> Any:
+def train_step(
+    model,
+    batch: list,
+    *,
+    ref_model,
+    window_index: int | None = None,
+) -> Any:
     """Run one GRPO step on *batch* (list of ValidSubmission).
 
-    If *window_index* is provided, it is used as the wandb step when
-    telemetry is enabled — aligning the x-axis of wandb charts with the
-    subnet window index. Safe to omit in tests.
+    *ref_model* is the frozen reference policy for the KL penalty. The
+    caller is responsible for keeping it up to date (in production:
+    ``ValidationService.verify_model``, refreshed at every successful
+    publish).
 
-    Each ValidSubmission has M rollouts on the same prompt. Within-group
-    advantages are computed from rewards; PPO-clipped surrogate is
-    summed across all rollouts; KL penalty against the frozen reference
-    is added. One optimiser step per train_step call.
-
-    Returns the (same) model — in-place mutations happen via the
-    optimiser.
+    *window_index* is used as the wandb step when telemetry is enabled.
+    Safe to omit in tests.
     """
     if not batch:
         logger.info("train_step: empty batch, skipping")
@@ -250,7 +285,7 @@ def train_step(model, batch: list, window_index: int | None = None) -> Any:
     if not _lazy_init(model):
         logger.info("train_step: model not initializable (non-torch?), skipping")
         return model
-    assert _optimizer is not None and _scheduler is not None and _ref_model is not None
+    assert _optimizer is not None and _scheduler is not None
 
     model.train()
     device = next(model.parameters()).device
@@ -274,7 +309,7 @@ def train_step(model, batch: list, window_index: int | None = None) -> Any:
         for rollout, adv in zip(group.rollouts, advantages):
             try:
                 ppo_loss, kl = _rollout_loss(
-                    model=model, ref_model=_ref_model,
+                    model=model, ref_model=ref_model,
                     rollout=rollout, advantage=adv, device=device,
                 )
             except ValueError as e:

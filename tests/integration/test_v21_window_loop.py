@@ -187,6 +187,125 @@ async def test_one_window_lap_bumps_counters(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
+    """The batcher must receive verify_model (not train_model) so
+    verify_commitment_proofs runs against the published checkpoint."""
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    svc = _make_service()
+
+    # Tag the two models so we can identify which one reaches the batcher.
+    svc.train_model = MagicMock(name="train_model_sentinel")
+    svc.verify_model = MagicMock(name="verify_model_sentinel")
+
+    captured = {}
+
+    import reliquary.validator.service as svc_mod
+    real_open = svc_mod.open_grpo_window
+
+    def _capture_open(window_start, env, model, *, cooldown_map, tokenizer, bootstrap=False):
+        captured["model"] = model
+        # Return a minimal batcher stub so the rest of _open_window doesn't crash
+        from reliquary.validator.batcher import GrpoWindowBatcher
+        return GrpoWindowBatcher(
+            window_start=window_start, env=env, model=model,
+            cooldown_map=cooldown_map, bootstrap=bootstrap,
+            verify_commitment_proofs_fn=_always_true_proof,
+            verify_signature_fn=lambda c, h: True,
+            completion_text_fn=lambda r: "",
+        )
+
+    with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):
+        svc._open_window()
+
+    assert captured["model"] is svc.verify_model
+    assert captured["model"] is not svc.train_model
+
+
+@pytest.mark.asyncio
+async def test_verify_model_refreshed_only_after_publish(monkeypatch):
+    """verify_model.load_state_dict(train_model.state_dict()) must run
+    after a successful publish, and ONLY after a publish (not on windows
+    where publish is skipped)."""
+    import torch
+    import torch.nn as nn
+
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    svc = _make_service()
+
+    # Real (tiny) models so load_state_dict has something to copy.
+    train = nn.Linear(4, 4)
+    verify = nn.Linear(4, 4)
+    # Force the two to start identical so divergence is measurable.
+    verify.load_state_dict(train.state_dict())
+    svc.train_model = train
+    svc.verify_model = verify
+
+    # Stub train_step to mutate train_model (simulate a real grad step).
+    def _fake_train_step(model, batch, *, ref_model, window_index=None):
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(1.0)
+        return model
+
+    import reliquary.validator.service as svc_mod
+    monkeypatch.setattr(svc_mod, "train_step", _fake_train_step)
+
+    # publish_every=1 by default in _make_service → publish runs every window.
+    with _patch_open_grpo_window(svc):
+        svc._open_window()
+    svc._active_batcher.seal_event.set()
+    # Pretend the seal produced a full batch so trained=True.
+    svc._active_batcher.seal_batch = MagicMock(return_value=[MagicMock()] * 100)
+
+    await svc._train_and_publish()
+
+    # After publish, verify_model should equal the mutated train_model.
+    for p_t, p_v in zip(train.parameters(), verify.parameters()):
+        assert torch.equal(p_t, p_v), "verify_model not refreshed after publish"
+
+
+@pytest.mark.asyncio
+async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
+    """When the publish-interval gate fails (e.g. window % 10 != 0),
+    verify_model must keep its previous weights even though train_step ran."""
+    import torch
+    import torch.nn as nn
+
+    monkeypatch.setattr("reliquary.validator.service.B_BATCH", 0)
+    svc = _make_service()
+    svc._publish_every = 10  # default-like cadence
+    svc._window_n = 5  # not a multiple of 10 → publish skipped
+
+    train = nn.Linear(4, 4)
+    verify = nn.Linear(4, 4)
+    verify.load_state_dict(train.state_dict())
+    svc.train_model = train
+    svc.verify_model = verify
+    verify_snapshot = {k: v.detach().clone() for k, v in verify.state_dict().items()}
+
+    def _fake_train_step(model, batch, *, ref_model, window_index=None):
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(1.0)
+        return model
+
+    import reliquary.validator.service as svc_mod
+    monkeypatch.setattr(svc_mod, "train_step", _fake_train_step)
+
+    with _patch_open_grpo_window(svc):
+        svc._open_window()  # bumps to 6
+    svc._active_batcher.seal_event.set()
+    svc._active_batcher.seal_batch = MagicMock(return_value=[MagicMock()] * 100)
+
+    await svc._train_and_publish()
+
+    # verify_model must be unchanged
+    for k, before in verify_snapshot.items():
+        assert torch.equal(verify.state_dict()[k], before), \
+            f"verify_model param '{k}' changed despite publish being skipped"
+
+
+@pytest.mark.asyncio
 async def test_submission_with_matching_hash_accepted_during_open():
     """Inject an 8-submission batch into an OPEN batcher; seal_event fires."""
     svc = _make_service(checkpoint_hash="sha256:cpA")

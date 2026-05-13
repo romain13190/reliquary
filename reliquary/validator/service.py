@@ -179,14 +179,34 @@ class ValidationService:
                 "reliquary_version": reliquary_version,
             },
         )
-        self.model = model
-        # Enable gradient checkpointing to reduce activation memory.
-        # Harmless if already enabled or unsupported by the model.
+        import copy
+        # Two-model architecture (see docs/superpowers/plans/2026-05-13-...).
+        # train_model: trainable, mutated by train_step every window.
+        # verify_model: frozen snapshot of the last published checkpoint —
+        # used by batcher.verify_commitment_proofs and as the KL reference
+        # inside train_step. Refreshed in-place after every successful
+        # publish via load_state_dict.
+        self.train_model = model
+        if model is not None:
+            try:
+                self.verify_model = copy.deepcopy(model)
+                self.verify_model.eval()
+                for p in self.verify_model.parameters():
+                    p.requires_grad = False
+            except (AttributeError, TypeError):
+                # Test fixtures (e.g. MagicMock) — fall back to sharing the
+                # same object. Tests don't exercise the train/verify split
+                # in this case.
+                self.verify_model = model
+        else:
+            self.verify_model = None
+
+        # Enable gradient checkpointing on the train model only.
         try:
-            self.model.gradient_checkpointing_enable()
+            self.train_model.gradient_checkpointing_enable()
         except (AttributeError, NotImplementedError):
             logger.warning(
-                "model does not support gradient_checkpointing_enable"
+                "train_model does not support gradient_checkpointing_enable"
             )
         self.tokenizer = tokenizer
         self.env = env
@@ -257,8 +277,23 @@ class ValidationService:
             download_fn=_download,
             commit_title_fn=_commit_title,
         )
-        # Load weights — this replaces the base model loaded at __init__.
-        self.model = self._load_model_fn(local_path)
+        # Load weights — this replaces both models loaded at __init__.
+        # verify_model gets the resumed weights too (so the batcher
+        # verifies miners against the resumed checkpoint, which is what
+        # they have access to via HF).
+        self.train_model = self._load_model_fn(local_path)
+        try:
+            self.train_model.gradient_checkpointing_enable()
+        except (AttributeError, NotImplementedError):
+            pass
+        if self.verify_model is not None:
+            self.verify_model.load_state_dict(self.train_model.state_dict())
+        else:
+            import copy
+            self.verify_model = copy.deepcopy(self.train_model)
+            self.verify_model.eval()
+            for p in self.verify_model.parameters():
+                p.requires_grad = False
         # Extract the canonical revision string to publish to miners.
         # IMPORTANT: strip the scheme prefix — miners call HF with this value
         # as the ``revision=`` kwarg, and HF rejects ``sha:<hex>`` / ``path:<dir>``
@@ -305,7 +340,7 @@ class ValidationService:
         )
         self._active_batcher = open_grpo_window(
             window_start=self._window_n,
-            env=self.env, model=self.model,
+            env=self.env, model=self.verify_model,
             cooldown_map=self._cooldown_map, tokenizer=self.tokenizer,
             bootstrap=bootstrap,
         )
@@ -405,8 +440,10 @@ class ValidationService:
             trained = False
         elif trained:
             try:
-                self.model = train_step(
-                    self.model, batch, window_index=self._window_n,
+                self.train_model = train_step(
+                    self.train_model, batch,
+                    ref_model=self.verify_model,
+                    window_index=self._window_n,
                 )
             except Exception:
                 # Don't let a training failure (e.g. CUDA OOM) skip
@@ -442,12 +479,24 @@ class ValidationService:
             if should_publish:
                 try:
                     entry = await self._checkpoint_store.publish(
-                        checkpoint_n=next_n, model=self.model,
+                        checkpoint_n=next_n, model=self.train_model,
                     )
                     self._checkpoint_n = next_n
                     self.server.set_current_checkpoint(entry)
+                    # Refresh verify_model in-place so the next window's
+                    # batcher verifies miners against the just-published
+                    # checkpoint. In-place copy: no new allocation.
+                    try:
+                        self.verify_model.load_state_dict(
+                            self.train_model.state_dict()
+                        )
+                    except (AttributeError, RuntimeError):
+                        logger.exception(
+                            "verify_model refresh failed; verify_model now "
+                            "stale wrt checkpoint %d", entry.checkpoint_n,
+                        )
                     logger.info(
-                        "Published checkpoint %d to %s@%s",
+                        "Published checkpoint %d to %s@%s and refreshed verify_model",
                         entry.checkpoint_n, entry.repo_id, entry.revision[:12],
                     )
                 except Exception:

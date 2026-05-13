@@ -214,7 +214,7 @@ async def test_resume_from_path_installs_manifest():
         )
         await svc._apply_resume_from()
 
-        assert svc.model is not None
+        assert svc.train_model is not None
         assert load_calls == [ckpt_dir]
         mf = svc._checkpoint_store.current_manifest()
         assert mf is not None
