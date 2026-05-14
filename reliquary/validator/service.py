@@ -97,7 +97,7 @@ def open_grpo_window(
     model,
     *,
     cooldown_map: CooldownMap,
-    hash_set,
+    hash_set: RolloutHashSet | None,
     tokenizer,
     bootstrap: bool = False,
 ) -> GrpoWindowBatcher:
