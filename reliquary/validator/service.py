@@ -539,7 +539,11 @@ class ValidationService:
         def _rollout_payload(s, with_text: bool):
             out = []
             texts = s.completion_texts if with_text else [None] * len(s.rollouts)
-            for r, text in zip(s.rollouts, texts):
+            # rollout_hashes is populated at accept-time; for legacy paths
+            # (e.g. test fixtures bypassing _accept_locked) it may be empty,
+            # in which case we omit the `hash` field rather than guessing.
+            hashes = s.rollout_hashes if s.rollout_hashes else [None] * len(s.rollouts)
+            for r, text, h in zip(s.rollouts, texts, hashes):
                 tokens = list(r.tokens)
                 rollout_dict = (r.commit or {}).get("rollout", {}) or {}
                 prompt_length = int(rollout_dict.get("prompt_length", 0))
@@ -555,6 +559,8 @@ class ValidationService:
                     "completion_length": completion_length,
                     "eos_terminated": eos_terminated,
                 }
+                if h is not None:
+                    entry["hash"] = h.hex()
                 if with_text:
                     entry["completion_text"] = text
                 out.append(entry)
