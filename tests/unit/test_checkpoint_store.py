@@ -82,9 +82,17 @@ async def test_upload_fn_receives_folder_and_kwargs(tmp_path):
     captured = {}
 
     async def capturing_upload(folder_path, repo_id, commit_message):
+        # Capture not just the path but also the *state* of the staging
+        # directory at upload time — after publish() returns the dir is
+        # cleaned up, so directory-content assertions have to be evaluated
+        # here, while the directory still exists.
+        from pathlib import Path as _P
         captured["folder_path"] = folder_path
         captured["repo_id"] = repo_id
         captured["commit_message"] = commit_message
+        captured["is_dir_at_upload"] = _P(folder_path).is_dir()
+        captured["has_safetensors"] = (_P(folder_path) / "model.safetensors").exists()
+        captured["has_config"] = (_P(folder_path) / "config.json").exists()
         return "captured_revision_sha"
 
     store = CheckpointStore(
@@ -97,11 +105,10 @@ async def test_upload_fn_receives_folder_and_kwargs(tmp_path):
     )
     entry = await store.publish(5, model=object())
     assert captured["repo_id"] == "aivolutionedge/reliquary-sn"
-    # folder_path points to a real directory under staging
-    from pathlib import Path as _P
-    assert _P(captured["folder_path"]).is_dir()
-    assert (_P(captured["folder_path"]) / "model.safetensors").exists()
-    assert (_P(captured["folder_path"]) / "config.json").exists()
+    # folder_path was a real directory + had the snapshot files at upload time.
+    assert captured["is_dir_at_upload"] is True
+    assert captured["has_safetensors"] is True
+    assert captured["has_config"] is True
     assert "5" in captured["commit_message"]
     assert entry.revision == "captured_revision_sha"
 
@@ -178,3 +185,100 @@ async def test_repo_id_stored_in_manifest(tmp_path):
     entry = await store.publish(3, model=object())
     assert entry.repo_id == "myorg/my-model"
     assert entry.revision == "some_rev"
+
+
+# ---- staging cleanup behaviour ---------------------------------------------
+#
+# The local ``ckpt_<N>`` directory is staging-only — once HuggingFace has
+# acknowledged the upload (returning the revision SHA), the validator
+# never reads the local copy again. Miners reload via
+# ``snapshot_download(repo_id, revision)`` directly from HF. Keeping the
+# local dir caused unbounded disk creep at ~7.6 GB / training step.
+# These tests pin the post-fix invariant: the dir is gone when publish()
+# returns, both on the happy path and on save/upload failure.
+
+
+@pytest.mark.asyncio
+async def test_publish_deletes_staging_dir_after_successful_upload(tmp_path):
+    """After a successful publish(), ckpt_<N> must not exist on disk."""
+    fake_upload = AsyncMock(return_value="rev_sha_001")
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="org/repo",
+        staging_dir_path=str(tmp_path),
+        upload_fn=fake_upload,
+        save_fn=_save_stub,
+    )
+    await store.publish(checkpoint_n=42, model=MagicMock())
+    # The ckpt_42 directory must be gone — HF revision is the canonical
+    # copy; keeping the local file would creep disk indefinitely.
+    assert not (tmp_path / "ckpt_42").exists(), (
+        "publish() leaked the local snapshot directory after upload"
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_deletes_staging_dir_on_upload_failure(tmp_path):
+    """If the HF upload raises, the staging dir is still cleaned up."""
+    async def failing_upload(folder_path, repo_id, commit_message):
+        raise RuntimeError("HF rate limit hit")
+
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="org/repo",
+        staging_dir_path=str(tmp_path),
+        upload_fn=failing_upload,
+        save_fn=_save_stub,
+    )
+    with pytest.raises(RuntimeError, match="HF rate limit hit"):
+        await store.publish(checkpoint_n=7, model=MagicMock())
+    # Even on upload failure, the half-written staging dir is cleaned up
+    # so retried publishes don't accumulate orphaned checkpoints.
+    assert not (tmp_path / "ckpt_7").exists(), (
+        "publish() leaked the staging directory after upload failure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_deletes_staging_dir_on_save_failure(tmp_path):
+    """If the local save raises, the partial dir is still cleaned up."""
+    def failing_save(model, tokenizer, path):
+        # Simulate a save that partially writes then crashes.
+        (path / "partial.bin").write_bytes(b"x")
+        raise IOError("disk full")
+
+    fake_upload = AsyncMock(return_value="never_called")
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="org/repo",
+        staging_dir_path=str(tmp_path),
+        upload_fn=fake_upload,
+        save_fn=failing_save,
+    )
+    with pytest.raises(IOError, match="disk full"):
+        await store.publish(checkpoint_n=99, model=MagicMock())
+    assert not (tmp_path / "ckpt_99").exists()
+    fake_upload.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_publish_repeated_calls_do_not_accumulate_directories(tmp_path):
+    """N publishes leave 0 ckpt_* dirs behind (pre-fix: N dirs)."""
+    fake_upload = AsyncMock(side_effect=[f"rev_{i}" for i in range(5)])
+    store = CheckpointStore(
+        validator_hotkey="5FHk",
+        wallet=FakeWallet(),
+        repo_id="org/repo",
+        staging_dir_path=str(tmp_path),
+        upload_fn=fake_upload,
+        save_fn=_save_stub,
+    )
+    for i in range(1, 6):
+        await store.publish(checkpoint_n=i, model=MagicMock())
+    leftover = sorted(p.name for p in tmp_path.iterdir() if p.is_dir())
+    assert leftover == [], (
+        f"publish() left orphan staging directories: {leftover}"
+    )

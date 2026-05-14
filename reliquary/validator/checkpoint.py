@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol
@@ -75,18 +76,32 @@ class CheckpointStore:
         return self._current
 
     async def publish(self, checkpoint_n: int, model: Any) -> ManifestEntry:
-        """Save locally → upload to HF → sign (n || revision) → install manifest."""
+        """Save locally → upload to HF → sign (n || revision) → install manifest.
+
+        The local ``ckpt_<N>`` directory is removed after a successful
+        upload (or on any exception in the save/upload pipeline). The HF
+        revision is the canonical source — the local copy is staging-only
+        and has no role in recovery or miner reload. Keeping it caused
+        unbounded disk creep at ~7.6 GB/training step in v2.1.
+        """
         # 1. Save HF-format snapshot locally (dir with safetensors + config + tokenizer).
         snapshot_dir = self.staging_dir / f"ckpt_{checkpoint_n}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
-        self._save(model, self.tokenizer, snapshot_dir)
+        try:
+            self._save(model, self.tokenizer, snapshot_dir)
 
-        # 2. Upload the whole folder to HF — one commit per checkpoint.
-        revision = await self._upload(
-            folder_path=str(snapshot_dir),
-            repo_id=self.repo_id,
-            commit_message=f"checkpoint {checkpoint_n}",
-        )
+            # 2. Upload the whole folder to HF — one commit per checkpoint.
+            revision = await self._upload(
+                folder_path=str(snapshot_dir),
+                repo_id=self.repo_id,
+                commit_message=f"checkpoint {checkpoint_n}",
+            )
+        finally:
+            # Always delete the staging copy. HF revision is canonical;
+            # a half-written dir on save/upload failure is just waste.
+            # ``ignore_errors`` so a transient filesystem issue here can't
+            # mask a real upload error (which would already have raised).
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
 
         # 3. Sign (n || revision) — strong cross-validator proof
         sig_payload = f"{checkpoint_n}|{revision}".encode()
