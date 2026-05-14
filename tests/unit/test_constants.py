@@ -19,7 +19,7 @@ def test_v2_temperature_fixed_nonzero():
 
 
 def test_v2_cooldown_values():
-    assert C.BATCH_PROMPT_COOLDOWN_WINDOWS == 50
+    assert C.BATCH_PROMPT_COOLDOWN_WINDOWS == 200
     assert C.BOOTSTRAP_WINDOWS == 100
 
 

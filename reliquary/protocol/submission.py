@@ -44,6 +44,7 @@ class RejectReason(str, Enum):
     PROMPT_IN_COOLDOWN = "prompt_in_cooldown"
     SUPERSEDED = "superseded"
     GRAIL_FAIL = "grail_fail"
+    HASH_DUPLICATE = "hash_duplicate"
     LOGPROB_MISMATCH = "logprob_mismatch"
     REWARD_MISMATCH = "reward_mismatch"
     OUT_OF_ZONE = "out_of_zone"

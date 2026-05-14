@@ -33,6 +33,7 @@ from reliquary.protocol.submission import (
 from reliquary.protocol.tokens import verify_tokens
 from reliquary.validator.batch_selection import select_batch
 from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
 from reliquary.validator.verifier import (
     evaluate_token_distribution,
     is_in_zone,
@@ -71,6 +72,7 @@ class ValidSubmission:
     # Miner-claimed checkpoint hash at submit time — useful for post-hoc
     # forensic analysis of who lied about their checkpoint.
     claimed_checkpoint_hash: str = ""
+    rollout_hashes: list[bytes] = field(default_factory=list)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -111,6 +113,7 @@ class GrpoWindowBatcher:
         *,
         tokenizer: Any = None,
         cooldown_map: CooldownMap | None = None,
+        hash_set: RolloutHashSet | None = None,
         bootstrap: bool = False,
         completion_text_fn: Callable[[RolloutSubmission], str],
         canonical_prompt_tokens_fn: Callable[[int], list[int]] | None = None,
@@ -141,6 +144,7 @@ class GrpoWindowBatcher:
             cooldown_map if cooldown_map is not None
             else CooldownMap(cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS)
         )
+        self._hash_set: RolloutHashSet | None = hash_set
 
         # Lock-free snapshot read by the HTTP /state handler. The submit
         # worker holds ``_lock`` for the entire GRAIL verify (~5-25s); a
@@ -242,6 +246,26 @@ class GrpoWindowBatcher:
         # duplicate-prompt submissions and keeps each prompt single-winner.
         if request.prompt_idx in self._claimed_prompts:
             return self._reject(RejectReason.SUPERSEDED, hotkey=hk, prompt_idx=pi)
+
+        # Per-rollout hash dedup against the persistent set + within this
+        # submission. Computed once here, reused at seal_batch and archive.
+        # Skipped entirely when hash_set is None (back-compat for tests that
+        # pass identical-token rollouts through the pipeline).
+        rollout_hashes: list[bytes] = []
+        if self._hash_set is not None:
+            local_seen: set[bytes] = set()
+            for rollout in request.rollouts:
+                h = compute_rollout_hash(rollout.commit["tokens"])
+                if h in local_seen or h in self._hash_set:
+                    logger.info(
+                        "reject reason=hash_duplicate hotkey=%s prompt=%d",
+                        hk, pi,
+                    )
+                    return self._reject(
+                        RejectReason.HASH_DUPLICATE, hotkey=hk, prompt_idx=pi,
+                    )
+                local_seen.add(h)
+                rollout_hashes.append(h)
 
         problem = self.env.get_problem(request.prompt_idx)
         completion_texts = []
@@ -418,6 +442,7 @@ class GrpoWindowBatcher:
                 lp_dev_max=lp_dev_max,
                 dist_q10_min=dist_q10_min,
                 claimed_checkpoint_hash=request.checkpoint_hash,
+                rollout_hashes=rollout_hashes,
             )
         )
         # Lock-free read in /state — see ``__init__`` for rationale.
@@ -487,6 +512,11 @@ class GrpoWindowBatcher:
             )
             for sub in batch:
                 self._cooldown.record_batched(sub.prompt_idx, self.window_start)
+                if self._hash_set is not None:
+                    for h in sub.rollout_hashes:
+                        self._hash_set.add(h, self.window_start)
+            if self._hash_set is not None:
+                self._hash_set.prune(self.window_start)
             return batch
 
     def get_state(self) -> GrpoBatchState:

@@ -71,11 +71,16 @@ def _make_commit(
     }
 
 
-def _rollouts(k):
+def _rollouts(k, seed: int = 0):
+    """Build M_ROLLOUTS rollouts.  ``seed`` offsets token values so
+    submissions from different miners produce distinct hashes.
+    Each rollout within a submission is also unique (different ``i`` offset)
+    so the within-submission dedup check does not fire."""
     rollouts = []
     for i in range(M_ROLLOUTS):
         reward = 1.0 if i < k else 0.0
-        commit = _make_commit(success=reward > 0.5, total_reward=reward)
+        tokens = [seed * 1000 + i * 100 + j for j in range(CHALLENGE_K + 4)]
+        commit = _make_commit(success=reward > 0.5, total_reward=reward, tokens=tokens)
         rollouts.append(RolloutSubmission(
             tokens=commit["tokens"],
             reward=reward,
@@ -138,12 +143,13 @@ def _patch_open_grpo_window(svc):
 
     real_open = svc_mod.open_grpo_window
 
-    def _mock_open(window_start, env, model, *, cooldown_map, tokenizer, bootstrap=False):
+    def _mock_open(window_start, env, model, *, cooldown_map, hash_set, tokenizer, bootstrap=False):
         return GrpoWindowBatcher(
             window_start=window_start,
             env=env,
             model=model,
             cooldown_map=cooldown_map,
+            hash_set=hash_set,
             bootstrap=bootstrap,
             # Stub out torch-dependent verifiers.
             verify_commitment_proofs_fn=_always_true_proof,
@@ -172,6 +178,7 @@ async def test_one_window_lap_bumps_counters(monkeypatch):
 
     with _patch_open_grpo_window(svc):
         svc._open_window()
+    svc._activate_window()
     assert svc._current_window_state == WindowState.OPEN
     assert svc._window_n == initial_wn + 1
 
@@ -202,13 +209,13 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
     import reliquary.validator.service as svc_mod
     real_open = svc_mod.open_grpo_window
 
-    def _capture_open(window_start, env, model, *, cooldown_map, tokenizer, bootstrap=False):
+    def _capture_open(window_start, env, model, *, cooldown_map, hash_set, tokenizer, bootstrap=False):
         captured["model"] = model
         # Return a minimal batcher stub so the rest of _open_window doesn't crash
         from reliquary.validator.batcher import GrpoWindowBatcher
         return GrpoWindowBatcher(
             window_start=window_start, env=env, model=model,
-            cooldown_map=cooldown_map, bootstrap=bootstrap,
+            cooldown_map=cooldown_map, hash_set=hash_set, bootstrap=bootstrap,
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
@@ -316,14 +323,14 @@ async def test_submission_with_matching_hash_accepted_during_open():
     batcher = svc._active_batcher
     assert batcher.current_checkpoint_hash == "sha256:cpA"
 
-    # Feed B distinct submissions (k=4 → in zone)
+    # Feed B distinct submissions (k=4 → in zone); unique seed per miner.
     for i in range(B_BATCH):
         req = BatchSubmissionRequest(
             miner_hotkey=f"hk{i}",
             prompt_idx=i,
             window_start=batcher.window_start,
             merkle_root="00" * 32,
-            rollouts=_rollouts(k=4),
+            rollouts=_rollouts(k=4, seed=i),
             checkpoint_hash="sha256:cpA",
         )
         resp = batcher.accept_submission(req)
@@ -374,7 +381,7 @@ async def test_timeout_partial_seal_skips_train_and_publish():
             miner_hotkey=f"hk{i}", prompt_idx=i,
             window_start=batcher.window_start,
             merkle_root="00" * 32,
-            rollouts=_rollouts(k=4),
+            rollouts=_rollouts(k=4, seed=i),
             checkpoint_hash="sha256:cpA",
         )
         batcher.accept_submission(req)

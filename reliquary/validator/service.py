@@ -35,6 +35,7 @@ from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
@@ -96,6 +97,7 @@ def open_grpo_window(
     model,
     *,
     cooldown_map: CooldownMap,
+    hash_set: RolloutHashSet | None,
     tokenizer,
     bootstrap: bool = False,
 ) -> GrpoWindowBatcher:
@@ -119,6 +121,7 @@ def open_grpo_window(
         model=model,
         tokenizer=tokenizer,
         cooldown_map=cooldown_map,
+        hash_set=hash_set,
         bootstrap=bootstrap,
         completion_text_fn=_completion_text,
         canonical_prompt_tokens_fn=_canonical_prompt_tokens,
@@ -220,8 +223,13 @@ class ValidationService:
         self._cooldown_map = CooldownMap(
             cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
         )
+        self._hash_set = RolloutHashSet(
+            retention_windows=BATCH_PROMPT_COOLDOWN_WINDOWS,
+        )
+        self._late_drops: dict[str, dict[str, int]] = {}
 
         self.server = ValidatorServer(host=http_host, port=http_port)
+        self.server.set_late_drop_callback(self.record_late_drop)
 
         # v2.1 state machine infrastructure — in-memory only, bootstrapped at
         # startup from R2 + HF (no local JSON state file).
@@ -245,6 +253,13 @@ class ValidationService:
         self._current_window_state = s
         # Also notify the server so /state returns the right value.
         self.server.set_current_state(s)
+
+    def record_late_drop(self, hotkey: str, reason: str) -> None:
+        """Bump the (hotkey, reason) counter. Both call sites run on the
+        asyncio event loop so no lock is needed. Reset in _archive_window.
+        """
+        bucket = self._late_drops.setdefault(hotkey, {})
+        bucket[reason] = bucket.get(reason, 0) + 1
 
     async def _apply_resume_from(self) -> None:
         """If --resume-from was set, load the model from that source and
@@ -341,7 +356,9 @@ class ValidationService:
         self._active_batcher = open_grpo_window(
             window_start=self._window_n,
             env=self.env, model=self.verify_model,
-            cooldown_map=self._cooldown_map, tokenizer=self.tokenizer,
+            cooldown_map=self._cooldown_map,
+            hash_set=self._hash_set,
+            tokenizer=self.tokenizer,
             bootstrap=bootstrap,
         )
         cp = self._checkpoint_store.current_manifest()
@@ -531,7 +548,11 @@ class ValidationService:
         def _rollout_payload(s, with_text: bool):
             out = []
             texts = s.completion_texts if with_text else [None] * len(s.rollouts)
-            for r, text in zip(s.rollouts, texts):
+            # rollout_hashes is populated at accept-time; for legacy paths
+            # (e.g. test fixtures bypassing _accept_locked) it may be empty,
+            # in which case we omit the `hash` field rather than guessing.
+            hashes = s.rollout_hashes if s.rollout_hashes else [None] * len(s.rollouts)
+            for r, text, h in zip(s.rollouts, texts, hashes):
                 tokens = list(r.tokens)
                 rollout_dict = (r.commit or {}).get("rollout", {}) or {}
                 prompt_length = int(rollout_dict.get("prompt_length", 0))
@@ -547,6 +568,8 @@ class ValidationService:
                     "completion_length": completion_length,
                     "eos_terminated": eos_terminated,
                 }
+                if h is not None:
+                    entry["hash"] = h.hex()
                 if with_text:
                     entry["completion_text"] = text
                 out.append(entry)
@@ -612,7 +635,14 @@ class ValidationService:
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
             "rejected": rejected_entries,
+            "late_drops": {
+                hk: dict(counts) for hk, counts in self._late_drops.items()
+            },
         }
+        # Reset the in-memory counter for the next window. New events
+        # arriving while this window's payload is uploading land in the
+        # fresh dict and will appear in the next archive.
+        self._late_drops.clear()
         # Non-blocking archive: enqueue to disk and return immediately.
         # The background ``ArchiveQueue`` worker (started in run()) picks
         # this up and uploads via the same sync-boto3 path used in
@@ -628,6 +658,7 @@ class ValidationService:
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
         await self._rebuild_cooldown_from_history()
+        await self._rebuild_hashes_from_history()
 
         # Start the background archive-upload worker. It scans the queue
         # directory for any pending payloads (from before this restart
@@ -806,6 +837,33 @@ class ValidationService:
         except Exception:
             logger.exception(
                 "Failed to rebuild cooldown from history; starting with empty state"
+            )
+
+    async def _rebuild_hashes_from_history(self) -> None:
+        """Rebuild ``self._hash_set`` from the last cooldown-horizon archives.
+
+        Mirror of ``_rebuild_cooldown_from_history`` — same archives, same
+        horizon. The dedup is operational from the first window post-
+        deploy because the compat path in ``RolloutHashSet.rebuild_from_history``
+        recomputes hashes from archived ``tokens`` when the new ``hash``
+        field is absent.
+        """
+        try:
+            current_window = self._window_n
+            archives = await storage.list_recent_datasets(
+                current_window=current_window + 1,
+                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
+            )
+            self._hash_set.rebuild_from_history(
+                archives, current_window=current_window,
+            )
+            logger.info(
+                "Rebuilt hash set from %d archive windows (current=%d, size=%d)",
+                len(archives), current_window, len(self._hash_set),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to rebuild hash set from history; starting empty"
             )
 
     async def _derive_randomness(self, subtensor, target_window: int) -> str:

@@ -192,7 +192,7 @@ TOP_K_PROTO = 0
 # A prompt that entered the training batch is ineligible for B_BATCH for
 # the next N windows (= training steps). Forces curriculum rotation so
 # the policy has time to shift between reuses.
-BATCH_PROMPT_COOLDOWN_WINDOWS = 72
+BATCH_PROMPT_COOLDOWN_WINDOWS = 200
 
 # Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
 # relaxed thresholds to keep the batch filling while miner pop + env
