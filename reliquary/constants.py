@@ -202,6 +202,13 @@ BATCH_PROMPT_COOLDOWN_WINDOWS = 200
 # stale generations fall through the distribution / logprob filters.
 HASH_DEDUP_RETENTION_WINDOWS = 10000
 
+# Max submissions any single hotkey can send per window. Counter resets at
+# every new window (on batcher swap). Excess submissions are HTTP-rejected
+# as RATE_LIMITED before touching the validation pipeline. 8 matches B_BATCH
+# — an honest miner needs 1 winning submission per window; 8 leaves 7 retries
+# for SUPERSEDED losses on hot prompts.
+MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
+
 # Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
 # relaxed thresholds to keep the batch filling while miner pop + env
 # coverage are thin.
