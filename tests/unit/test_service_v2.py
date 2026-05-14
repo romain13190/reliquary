@@ -29,6 +29,7 @@ def test_service_creates_grpo_window_batcher():
         env=_FakeEnv(),
         model=None,
         cooldown_map=shared_cooldown,
+        hash_set=None,
         tokenizer=MagicMock(),
     )
     assert isinstance(batcher, GrpoWindowBatcher)
@@ -140,4 +141,35 @@ def test_service_has_separate_verify_and_train_models():
     svc.verify_model.load_state_dict(svc.train_model.state_dict())
     for p_t, p_v in zip(svc.train_model.parameters(), svc.verify_model.parameters()):
         assert torch.equal(p_t, p_v)
+
+
+def test_service_constructs_hash_set_with_cooldown_retention():
+    """ValidationService owns a RolloutHashSet sized to BATCH_PROMPT_COOLDOWN_WINDOWS."""
+    from unittest.mock import MagicMock
+    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
+    from reliquary.validator.dedup import RolloutHashSet
+    from reliquary.validator.service import ValidationService
+
+    class _FakeEnv:
+        name = "fake"
+        def __len__(self): return 100
+        def get_problem(self, i): return {"prompt": "p", "ground_truth": "a"}
+        def compute_reward(self, p, c): return 0.0
+
+    class _FakeWallet:
+        class _Hk:
+            ss58_address = "5FHk"
+            @staticmethod
+            def sign(d): return b"sig"
+        hotkey = _Hk()
+
+    fake_tok = MagicMock()
+    fake_tok.eos_token_id = 99
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=fake_tok,
+        env=_FakeEnv(), netuid=99,
+    )
+    assert isinstance(svc._hash_set, RolloutHashSet)
+    # Retention horizon equals the cooldown horizon (we reuse the constant).
+    assert svc._hash_set._retention_windows == BATCH_PROMPT_COOLDOWN_WINDOWS
 

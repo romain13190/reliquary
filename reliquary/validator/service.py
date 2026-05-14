@@ -35,6 +35,7 @@ from reliquary.validator import telemetry
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.checkpoint import CheckpointStore
 from reliquary.validator.cooldown import CooldownMap
+from reliquary.validator.dedup import RolloutHashSet
 from reliquary.validator.server import ValidatorServer
 from reliquary.validator.training import train_step
 
@@ -96,6 +97,7 @@ def open_grpo_window(
     model,
     *,
     cooldown_map: CooldownMap,
+    hash_set,
     tokenizer,
     bootstrap: bool = False,
 ) -> GrpoWindowBatcher:
@@ -119,6 +121,7 @@ def open_grpo_window(
         model=model,
         tokenizer=tokenizer,
         cooldown_map=cooldown_map,
+        hash_set=hash_set,
         bootstrap=bootstrap,
         completion_text_fn=_completion_text,
         canonical_prompt_tokens_fn=_canonical_prompt_tokens,
@@ -219,6 +222,9 @@ class ValidationService:
         self._windows_in_interval: int = 0
         self._cooldown_map = CooldownMap(
             cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
+        )
+        self._hash_set = RolloutHashSet(
+            retention_windows=BATCH_PROMPT_COOLDOWN_WINDOWS,
         )
 
         self.server = ValidatorServer(host=http_host, port=http_port)
@@ -341,7 +347,9 @@ class ValidationService:
         self._active_batcher = open_grpo_window(
             window_start=self._window_n,
             env=self.env, model=self.verify_model,
-            cooldown_map=self._cooldown_map, tokenizer=self.tokenizer,
+            cooldown_map=self._cooldown_map,
+            hash_set=self._hash_set,
+            tokenizer=self.tokenizer,
             bootstrap=bootstrap,
         )
         cp = self._checkpoint_store.current_manifest()
