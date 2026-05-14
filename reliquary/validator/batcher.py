@@ -257,6 +257,10 @@ class GrpoWindowBatcher:
             for rollout in request.rollouts:
                 h = compute_rollout_hash(rollout.commit["tokens"])
                 if h in local_seen or h in self._hash_set:
+                    logger.info(
+                        "reject reason=hash_duplicate hotkey=%s prompt=%d",
+                        hk, pi,
+                    )
                     return self._reject(
                         RejectReason.HASH_DUPLICATE, hotkey=hk, prompt_idx=pi,
                     )
