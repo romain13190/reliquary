@@ -27,3 +27,31 @@ def compute_rollout_hash(tokens: Iterable[int]) -> bytes:
             raise ValueError(f"compute_rollout_hash: negative token id {t}")
         h.update(int(t).to_bytes(4, "big", signed=False))
     return h.digest()
+
+
+class RolloutHashSet:
+    """Per-rollout content set with a sliding retention horizon.
+
+    Membership tested via ``__contains__``. Entries older than
+    ``retention_windows`` are dropped via ``prune``.
+    """
+
+    def __init__(self, retention_windows: int) -> None:
+        if retention_windows < 0:
+            raise ValueError("retention_windows must be non-negative")
+        self._retention_windows = retention_windows
+        self._entries: dict[bytes, int] = {}
+
+    def add(self, h: bytes, window: int) -> None:
+        if window < 0:
+            raise ValueError("window must be non-negative")
+        # Keep the most recent window for any given hash.
+        prev = self._entries.get(h, -1)
+        if window > prev:
+            self._entries[h] = window
+
+    def __contains__(self, h: bytes) -> bool:
+        return h in self._entries
+
+    def __len__(self) -> int:
+        return len(self._entries)
