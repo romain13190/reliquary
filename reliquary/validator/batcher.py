@@ -512,6 +512,11 @@ class GrpoWindowBatcher:
             )
             for sub in batch:
                 self._cooldown.record_batched(sub.prompt_idx, self.window_start)
+                if self._hash_set is not None:
+                    for h in sub.rollout_hashes:
+                        self._hash_set.add(h, self.window_start)
+            if self._hash_set is not None:
+                self._hash_set.prune(self.window_start)
             return batch
 
     def get_state(self) -> GrpoBatchState:

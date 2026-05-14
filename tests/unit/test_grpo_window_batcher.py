@@ -878,3 +878,48 @@ def test_hash_dup_accept_when_not_in_set():
     stored = b.valid_submissions()[0]
     assert len(stored.rollout_hashes) == M_ROLLOUTS
     assert all(isinstance(h, bytes) and len(h) == 32 for h in stored.rollout_hashes)
+
+
+def test_seal_batch_populates_hash_set():
+    """After seal_batch, every batched rollout's hash is in the shared set."""
+    from reliquary.validator.dedup import RolloutHashSet
+
+    hs = RolloutHashSet(retention_windows=50)
+    b = _make_batcher(hash_set=hs)
+    req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+    batch = b.seal_batch()
+    assert len(batch) == 1
+    for sub in batch:
+        assert len(sub.rollout_hashes) == M_ROLLOUTS
+        for h in sub.rollout_hashes:
+            assert h in hs
+
+
+def test_seal_batch_prunes_expired_hashes():
+    """seal_batch calls prune so the set stays bounded across windows."""
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+
+    hs = RolloutHashSet(retention_windows=50)
+    # Seed a stale hash from a window way past retention.
+    stale = compute_rollout_hash([1234, 5678])
+    hs.add(stale, window=100)
+
+    b = _make_batcher(hash_set=hs)
+    # window_start defaults to 500 — stale (w=100) is 400 windows old, well
+    # past retention=50.
+    req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
+    b.accept_submission(req)
+    b.seal_batch()
+    assert stale not in hs
+
+
+def test_seal_batch_with_none_hash_set_is_noop():
+    """seal_batch must not crash when hash_set=None (test fixture path)."""
+    b = _make_batcher(hash_set=None)
+    req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
+    b.accept_submission(req)
+    batch = b.seal_batch()
+    assert len(batch) == 1  # behaviour unchanged
