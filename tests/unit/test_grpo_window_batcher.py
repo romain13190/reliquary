@@ -82,8 +82,11 @@ def _request(
     if rewards is None:
         rewards = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
     rollouts = []
-    for r in rewards:
-        commit = _make_commit(success=r > 0.5, total_reward=r)
+    for idx, r in enumerate(rewards):
+        # Shift token ids by idx so each rollout has a unique sequence;
+        # offsets stay well within any test model's vocab_size.
+        tokens = [t + idx for t in range(CHALLENGE_K + 4)]
+        commit = _make_commit(tokens=tokens, success=r > 0.5, total_reward=r)
         rollouts.append(
             RolloutSubmission(
                 tokens=commit["tokens"],
@@ -125,6 +128,7 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
         completion_text_fn=lambda rollout: (
             "CORRECT" if rollout.reward > 0.5 else "wrong"
         ),
+        hash_set=None,
     )
     kwargs.update(overrides)
     return GrpoWindowBatcher(**kwargs)
@@ -809,3 +813,68 @@ def test_valid_submission_has_rollout_hashes_field():
         merkle_root_bytes=b"\x00" * 32,
     )
     assert s.rollout_hashes == []
+
+
+def test_hash_dup_rejects_replay_from_persistent_set():
+    """A rollout whose tokens are already in the shared hash_set is rejected."""
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+
+    hs = RolloutHashSet(retention_windows=50)
+    # Seed the set with the hash of the rollout the test will resubmit.
+    req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
+    h = compute_rollout_hash(req.rollouts[0].commit["tokens"])
+    hs.add(h, window=499)
+
+    b = _make_batcher(hash_set=hs)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.HASH_DUPLICATE
+
+
+def test_hash_dup_intra_submission_collision_rejects():
+    """Two rollouts in the same submission with identical tokens → reject."""
+    from reliquary.validator.dedup import RolloutHashSet
+
+    hs = RolloutHashSet(retention_windows=50)
+    # Build a request whose 8 rollouts all share identical commit["tokens"].
+    rollouts = []
+    for i in range(M_ROLLOUTS):
+        commit = _make_commit(success=(i < 4), total_reward=(1.0 if i < 4 else 0.0))
+        rollouts.append(
+            RolloutSubmission(
+                tokens=commit["tokens"], reward=(1.0 if i < 4 else 0.0),
+                commit=commit,
+            )
+        )
+    req = BatchSubmissionRequest(
+        miner_hotkey="hk", prompt_idx=42, window_start=500,
+        merkle_root="00" * 32, rollouts=rollouts, checkpoint_hash="sha256:test",
+    )
+
+    b = _make_batcher(hash_set=hs)
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.HASH_DUPLICATE
+
+
+def test_hash_dup_none_set_disables_check():
+    """Passing hash_set=None disables the check (back-compat for tests)."""
+    b = _make_batcher(hash_set=None)
+    req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+
+def test_hash_dup_accept_when_not_in_set():
+    """Fresh content with no prior hash entry passes."""
+    from reliquary.validator.dedup import RolloutHashSet
+
+    hs = RolloutHashSet(retention_windows=50)
+    b = _make_batcher(hash_set=hs)
+    req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+    # rollout_hashes populated on the stored ValidSubmission
+    stored = b.valid_submissions()[0]
+    assert len(stored.rollout_hashes) == M_ROLLOUTS
+    assert all(isinstance(h, bytes) and len(h) == 32 for h in stored.rollout_hashes)
