@@ -799,3 +799,13 @@ def test_rejected_submissions_capped_per_hotkey(monkeypatch):
     b.accept_submission(other_req)
     assert len(b.rejected_submissions) == REJECTED_LIST_CAP_PER_HOTKEY + 1
     assert b.rejected_submissions[-1].hotkey == "hk_other"
+
+
+def test_valid_submission_has_rollout_hashes_field():
+    """ValidSubmission exposes a per-rollout hash list (default empty)."""
+    from reliquary.validator.batcher import ValidSubmission
+    s = ValidSubmission(
+        hotkey="hk", prompt_idx=42,
+        merkle_root_bytes=b"\x00" * 32,
+    )
+    assert s.rollout_hashes == []

@@ -71,6 +71,7 @@ class ValidSubmission:
     # Miner-claimed checkpoint hash at submit time — useful for post-hoc
     # forensic analysis of who lied about their checkpoint.
     claimed_checkpoint_hash: str = ""
+    rollout_hashes: list[bytes] = field(default_factory=list)
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
