@@ -16,7 +16,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-from reliquary.constants import VALIDATOR_HTTP_PORT
+from reliquary.constants import (
+    MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
+    VALIDATOR_HTTP_PORT,
+)
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -47,8 +50,16 @@ class ValidatorServer:
         self._current_state: WindowState = WindowState.READY
         self._current_checkpoint = None  # ManifestEntry | None
         self._late_drop_callback: Callable[[str, str], None] | None = None
+        # Per-hotkey submission counter. Reset every time the active
+        # batcher swaps (= window boundary). Read in /submit before any
+        # heavier check so a saturated miner trip the rate limit on the
+        # cheapest possible path.
+        self._per_window_counts: dict[str, int] = {}
 
     def set_active_batcher(self, batcher: GrpoWindowBatcher | None) -> None:
+        # New batcher → new window → reset per-hotkey counters.
+        if batcher is not self.active_batcher:
+            self._per_window_counts = {}
         self.active_batcher = batcher
 
     def set_current_state(self, state) -> None:
@@ -81,6 +92,17 @@ class ValidatorServer:
         @app.post("/submit", response_model=BatchSubmissionResponse)
         async def submit(request: BatchSubmissionRequest) -> BatchSubmissionResponse:
             from reliquary.protocol.submission import WindowState
+            # Rate limit FIRST — cheapest reject before any state/queue work.
+            hk = request.miner_hotkey
+            n = self._per_window_counts.get(hk, 0)
+            if n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
+                if self._late_drop_callback is not None:
+                    self._late_drop_callback(hk, "rate_limited")
+                return BatchSubmissionResponse(
+                    accepted=False, reason=RejectReason.RATE_LIMITED,
+                )
+            self._per_window_counts[hk] = n + 1
+
             # v2.1: reject if state != OPEN
             if self._current_state != WindowState.OPEN:
                 if self._late_drop_callback is not None:

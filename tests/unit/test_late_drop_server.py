@@ -64,6 +64,70 @@ def test_no_callback_does_not_crash_when_state_not_open():
     assert resp.json()["accepted"] is False
 
 
+def test_rate_limit_caps_per_hotkey_per_window():
+    """After MAX submissions from the same hotkey, /submit returns RATE_LIMITED."""
+    from reliquary.constants import MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+
+    s = ValidatorServer()
+    s.set_current_state(WindowState.TRAINING)  # any state — rate limit fires first
+    captured: list[tuple[str, str]] = []
+    s.set_late_drop_callback(lambda hk, reason: captured.append((hk, reason)))
+
+    with TestClient(s.app) as client:
+        # First N submissions go through (and get WINDOW_NOT_ACTIVE because state)
+        for _ in range(MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW):
+            r = client.post("/submit", json=_submission(hotkey="hkA"))
+            assert r.json()["reason"] == RejectReason.WINDOW_NOT_ACTIVE.value
+        # N+1th gets RATE_LIMITED instead.
+        r = client.post("/submit", json=_submission(hotkey="hkA"))
+        assert r.json()["reason"] == RejectReason.RATE_LIMITED.value
+
+    # The callback was invoked N times with "window_not_active" then once with
+    # "rate_limited".
+    assert captured[-1] == ("hkA", "rate_limited")
+    n_rate = sum(1 for _, r in captured if r == "rate_limited")
+    assert n_rate == 1
+
+
+def test_rate_limit_independent_across_hotkeys():
+    """Each hotkey has its own counter — one saturated hotkey doesn't lock out others."""
+    from reliquary.constants import MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+
+    s = ValidatorServer()
+    s.set_current_state(WindowState.TRAINING)
+    with TestClient(s.app) as client:
+        # hkA saturates
+        for _ in range(MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW + 1):
+            client.post("/submit", json=_submission(hotkey="hkA"))
+        # hkB's first submission must still go through (not rate-limited yet).
+        r = client.post("/submit", json=_submission(hotkey="hkB"))
+        assert r.json()["reason"] == RejectReason.WINDOW_NOT_ACTIVE.value
+
+
+def test_rate_limit_resets_on_batcher_swap():
+    """Window boundary (set_active_batcher with a different batcher) clears
+    the per-hotkey counter so the same hotkey can submit again next window."""
+    from reliquary.constants import MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW
+
+    s = ValidatorServer()
+    s.set_current_state(WindowState.TRAINING)
+    with TestClient(s.app) as client:
+        # Saturate hkA on window N
+        for _ in range(MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW + 1):
+            client.post("/submit", json=_submission(hotkey="hkA"))
+        last = client.post("/submit", json=_submission(hotkey="hkA")).json()
+        assert last["reason"] == RejectReason.RATE_LIMITED.value
+
+        # New batcher → window swap → counter reset
+        new_batcher = MagicMock()
+        new_batcher.window_start = 99999
+        s.set_active_batcher(new_batcher)
+
+        # hkA's first submission on the new window goes through again.
+        r = client.post("/submit", json=_submission(hotkey="hkA"))
+        assert r.json()["reason"] == RejectReason.WINDOW_NOT_ACTIVE.value
+
+
 def test_callback_fires_on_worker_drop():
     """When the submit worker finds the batcher has been swapped out, the
     callback is invoked with ``worker_dropped`` for that hotkey."""
