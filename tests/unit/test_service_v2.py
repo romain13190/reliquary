@@ -173,3 +173,58 @@ def test_service_constructs_hash_set_with_cooldown_retention():
     # Retention horizon equals the cooldown horizon (we reuse the constant).
     assert svc._hash_set._retention_windows == BATCH_PROMPT_COOLDOWN_WINDOWS
 
+
+@pytest.mark.asyncio
+async def test_rebuild_hashes_from_history_populates_set():
+    """_rebuild_hashes_from_history reads R2 archives and seeds the hash set."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from reliquary.validator.dedup import compute_rollout_hash
+    from reliquary.validator.service import ValidationService
+
+    class _FakeEnv:
+        name = "fake"
+        def __len__(self): return 100
+        def get_problem(self, i): return {"prompt": "p", "ground_truth": "a"}
+        def compute_reward(self, p, c): return 0.0
+
+    class _FakeWallet:
+        class _Hk:
+            ss58_address = "5FHk"
+            @staticmethod
+            def sign(d): return b"sig"
+        hotkey = _Hk()
+
+    fake_tok = MagicMock()
+    fake_tok.eos_token_id = 99
+    svc = ValidationService(
+        wallet=_FakeWallet(), model=MagicMock(), tokenizer=fake_tok,
+        env=_FakeEnv(), netuid=99,
+    )
+    svc._window_n = 110
+
+    # Two archive entries, one with explicit hash, one compat (tokens only).
+    h_explicit = compute_rollout_hash([10, 20, 30]).hex()
+    archives = [
+        {
+            "window_start": 100,
+            "batch": [
+                {
+                    "prompt_idx": 7,
+                    "rollouts": [
+                        {"tokens": [10, 20, 30], "hash": h_explicit},
+                        {"tokens": [40, 50, 60]},  # compat: no hash key
+                    ],
+                }
+            ],
+        }
+    ]
+    with patch(
+        "reliquary.infrastructure.storage.list_recent_datasets",
+        new=AsyncMock(return_value=archives),
+    ):
+        await svc._rebuild_hashes_from_history()
+
+    assert bytes.fromhex(h_explicit) in svc._hash_set
+    assert compute_rollout_hash([40, 50, 60]) in svc._hash_set
+

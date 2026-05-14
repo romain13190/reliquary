@@ -636,6 +636,7 @@ class ValidationService:
         await self._apply_resume_from()                  # ← resume before bootstrap
         await self._bootstrap_state_from_external()
         await self._rebuild_cooldown_from_history()
+        await self._rebuild_hashes_from_history()
 
         # Start the background archive-upload worker. It scans the queue
         # directory for any pending payloads (from before this restart
@@ -814,6 +815,33 @@ class ValidationService:
         except Exception:
             logger.exception(
                 "Failed to rebuild cooldown from history; starting with empty state"
+            )
+
+    async def _rebuild_hashes_from_history(self) -> None:
+        """Rebuild ``self._hash_set`` from the last cooldown-horizon archives.
+
+        Mirror of ``_rebuild_cooldown_from_history`` — same archives, same
+        horizon. The dedup is operational from the first window post-
+        deploy because the compat path in ``RolloutHashSet.rebuild_from_history``
+        recomputes hashes from archived ``tokens`` when the new ``hash``
+        field is absent.
+        """
+        try:
+            current_window = self._window_n
+            archives = await storage.list_recent_datasets(
+                current_window=current_window + 1,
+                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
+            )
+            self._hash_set.rebuild_from_history(
+                archives, current_window=current_window,
+            )
+            logger.info(
+                "Rebuilt hash set from %d archive windows (current=%d, size=%d)",
+                len(archives), current_window, len(self._hash_set),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to rebuild hash set from history; starting empty"
             )
 
     async def _derive_randomness(self, subtensor, target_window: int) -> str:
