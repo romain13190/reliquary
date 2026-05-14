@@ -108,3 +108,78 @@ def test_hashset_prune_zero_retention_drops_everything():
     s.add(h, window=100)
     s.prune(current_window=100)
     assert h not in s
+
+
+def test_rebuild_from_history_indexes_hash_field():
+    """When archives carry an explicit `hash` field per rollout, use it."""
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+    s = RolloutHashSet(retention_windows=50)
+    h_a = compute_rollout_hash([1, 2, 3]).hex()
+    h_b = compute_rollout_hash([4, 5, 6]).hex()
+    archives = [
+        {
+            "window_start": 100,
+            "batch": [
+                {
+                    "prompt_idx": 42,
+                    "rollouts": [
+                        {"tokens": [1, 2, 3], "hash": h_a, "reward": 1.0},
+                        {"tokens": [4, 5, 6], "hash": h_b, "reward": 0.0},
+                    ],
+                }
+            ],
+        }
+    ]
+    s.rebuild_from_history(archives, current_window=110)
+    assert bytes.fromhex(h_a) in s
+    assert bytes.fromhex(h_b) in s
+    assert len(s) == 2
+
+
+def test_rebuild_from_history_recomputes_when_hash_missing():
+    """Backwards-compat: pre-feature archives have only `tokens`, no `hash`."""
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+    s = RolloutHashSet(retention_windows=50)
+    archives = [
+        {
+            "window_start": 100,
+            "batch": [
+                {
+                    "prompt_idx": 42,
+                    "rollouts": [
+                        {"tokens": [7, 8, 9], "reward": 1.0},  # no hash key
+                    ],
+                }
+            ],
+        }
+    ]
+    s.rebuild_from_history(archives, current_window=110)
+    assert compute_rollout_hash([7, 8, 9]) in s
+
+
+def test_rebuild_from_history_skips_expired_windows():
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+    s = RolloutHashSet(retention_windows=50)
+    archives = [
+        {
+            "window_start": 40,  # expired at current=100 (50 horizon)
+            "batch": [{"prompt_idx": 1, "rollouts": [{"tokens": [9, 9]}]}],
+        },
+        {
+            "window_start": 90,
+            "batch": [{"prompt_idx": 2, "rollouts": [{"tokens": [8, 8]}]}],
+        },
+    ]
+    s.rebuild_from_history(archives, current_window=100)
+    assert compute_rollout_hash([9, 9]) not in s
+    assert compute_rollout_hash([8, 8]) in s
+
+
+def test_rebuild_from_history_clears_previous_state():
+    from reliquary.validator.dedup import RolloutHashSet, compute_rollout_hash
+    s = RolloutHashSet(retention_windows=50)
+    stale = compute_rollout_hash([1])
+    s.add(stale, window=100)
+    s.rebuild_from_history([], current_window=110)
+    assert stale not in s
+    assert len(s) == 0

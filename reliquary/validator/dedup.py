@@ -70,3 +70,33 @@ class RolloutHashSet:
         self._entries = {
             h: w for h, w in self._entries.items() if w > horizon
         }
+
+    def rebuild_from_history(
+        self, archives: list[dict], current_window: int,
+    ) -> None:
+        """Replace state from a list of archived window payloads.
+
+        Each archive must carry ``window_start`` (int) and ``batch`` (list
+        of submissions). Each submission must carry ``rollouts`` (list of
+        dicts). Each rollout either has an explicit ``hash`` (hex string)
+        — used directly — or only ``tokens`` (list[int]), in which case
+        the hash is recomputed via :func:`compute_rollout_hash`.
+
+        Archives whose ``window_start`` is older than the retention horizon
+        relative to ``current_window`` are skipped — same semantics as
+        :meth:`prune`.
+        """
+        self._entries.clear()
+        horizon = current_window - self._retention_windows
+        for archive in archives:
+            w = int(archive["window_start"])
+            if w <= horizon:
+                continue
+            for sub in archive.get("batch", []):
+                for rollout in sub.get("rollouts", []):
+                    h_hex = rollout.get("hash")
+                    if h_hex is not None:
+                        h = bytes.fromhex(h_hex)
+                    else:
+                        h = compute_rollout_hash(rollout["tokens"])
+                    self.add(h, w)
