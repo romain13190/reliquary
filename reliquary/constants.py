@@ -194,6 +194,14 @@ TOP_K_PROTO = 0
 # the policy has time to shift between reuses.
 BATCH_PROMPT_COOLDOWN_WINDOWS = 200
 
+# Per-rollout content dedup horizon. Independent of and strictly longer
+# than the prompt cooldown: cooldown lets a prompt come back for fresh
+# content, the hash set blacklists the specific (tokens) of every rollout
+# already trained on. 10000 windows ≈ 3.5 days at 5 blocks/window. After
+# that, natural model drift between training steps is large enough that
+# stale generations fall through the distribution / logprob filters.
+HASH_DEDUP_RETENTION_WINDOWS = 10000
+
 # Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
 # relaxed thresholds to keep the batch filling while miner pop + env
 # coverage are thin.
