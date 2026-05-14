@@ -170,10 +170,14 @@ def test_service_has_separate_verify_and_train_models():
         assert torch.equal(p_t, p_v)
 
 
-def test_service_constructs_hash_set_with_cooldown_retention():
-    """ValidationService owns a RolloutHashSet sized to BATCH_PROMPT_COOLDOWN_WINDOWS."""
+def test_service_constructs_hash_set_with_dedup_retention():
+    """ValidationService owns a RolloutHashSet sized to HASH_DEDUP_RETENTION_WINDOWS,
+    decoupled from the prompt cooldown horizon so the dedup outlives cooldown."""
     from unittest.mock import MagicMock
-    from reliquary.constants import BATCH_PROMPT_COOLDOWN_WINDOWS
+    from reliquary.constants import (
+        BATCH_PROMPT_COOLDOWN_WINDOWS,
+        HASH_DEDUP_RETENTION_WINDOWS,
+    )
     from reliquary.validator.dedup import RolloutHashSet
     from reliquary.validator.service import ValidationService
 
@@ -197,8 +201,11 @@ def test_service_constructs_hash_set_with_cooldown_retention():
         env=_FakeEnv(), netuid=99,
     )
     assert isinstance(svc._hash_set, RolloutHashSet)
-    # Retention horizon equals the cooldown horizon (we reuse the constant).
-    assert svc._hash_set._retention_windows == BATCH_PROMPT_COOLDOWN_WINDOWS
+    assert svc._hash_set._retention_windows == HASH_DEDUP_RETENTION_WINDOWS
+    # Sanity: hash retention strictly exceeds cooldown — that is the whole
+    # point of the decoupling (cooldown lets prompts come back, hash blocks
+    # the specific rollout tokens for a longer horizon).
+    assert HASH_DEDUP_RETENTION_WINDOWS > BATCH_PROMPT_COOLDOWN_WINDOWS
 
 
 @pytest.mark.asyncio

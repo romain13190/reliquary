@@ -15,6 +15,7 @@ from reliquary.constants import (
     CHECKPOINT_STAGING_DIR_DEFAULT,
     DEFAULT_HF_REPO_ID,
     GRAD_CLIP_NORM,
+    HASH_DEDUP_RETENTION_WINDOWS,
     KL_BETA,
     LEARNING_RATE,
     LR_COSINE_MAX_WINDOWS,
@@ -224,7 +225,7 @@ class ValidationService:
             cooldown_windows=BATCH_PROMPT_COOLDOWN_WINDOWS
         )
         self._hash_set = RolloutHashSet(
-            retention_windows=BATCH_PROMPT_COOLDOWN_WINDOWS,
+            retention_windows=HASH_DEDUP_RETENTION_WINDOWS,
         )
         self._late_drops: dict[str, dict[str, int]] = {}
 
@@ -840,19 +841,16 @@ class ValidationService:
             )
 
     async def _rebuild_hashes_from_history(self) -> None:
-        """Rebuild ``self._hash_set`` from the last cooldown-horizon archives.
-
-        Mirror of ``_rebuild_cooldown_from_history`` — same archives, same
-        horizon. The dedup is operational from the first window post-
-        deploy because the compat path in ``RolloutHashSet.rebuild_from_history``
-        recomputes hashes from archived ``tokens`` when the new ``hash``
-        field is absent.
+        """Rebuild ``self._hash_set`` from the last HASH_DEDUP_RETENTION_WINDOWS
+        archives. Horizon is independent of cooldown — see constants docstring.
+        Compat path covers pre-feature archives (no ``hash`` field) by
+        recomputing from ``tokens``.
         """
         try:
             current_window = self._window_n
             archives = await storage.list_recent_datasets(
                 current_window=current_window + 1,
-                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
+                n=HASH_DEDUP_RETENTION_WINDOWS,
             )
             self._hash_set.rebuild_from_history(
                 archives, current_window=current_window,
