@@ -112,9 +112,26 @@ curl http://localhost:8080/health
 
 # State (trainer only — weight-only doesn't expose HTTP)
 curl http://localhost:8080/state
+
+# Real-time per-submission verdicts for a given miner hotkey (trainer only).
+# Use to confirm a specific miner is being accepted (or what reject reason
+# they're hitting) without waiting for the post-window R2 archive upload.
+curl 'http://localhost:8080/verdicts/<miner_hotkey_ss58>?since=0'
+# → {"verdicts":[{"merkle_root":"...","window_n":N,"accepted":true,"reason":"accepted","ts":...}, ...]}
 ```
 
 For the weight-only mode, the only signal that things are working is the log line `Submitting weights: N miners …` once per subnet epoch (~30 minutes on netuid 81).
+
+### `/verdicts/{hotkey}` — what to expect
+
+The trainer exposes the last `VERDICT_CAP_PER_HOTKEY = 200` per-submission verdicts per miner hotkey via a small in-memory ring buffer. Every code path that decides accept/reject records to it:
+
+- HTTP-level early rejects (`rate_limited`, `window_not_active`, `batch_filled`)
+- Worker-level rejects after GRAIL (`grail_fail`, `wrong_randomness`, `logprob_mismatch`, `out_of_zone`, `hash_duplicate`, `bad_termination`, etc.)
+- Worker drains on window swap (`worker_dropped`)
+- Inline accepts under TestClient (`accepted`)
+
+This is the cheapest way for operators to debug "why is miner X not making the batch" without grep'ing the validator's own logs or pulling R2 archives. Public read by design — same trust model as the R2 archive. Memory cost is ~2.5 MB for a 50-hotkey subnet.
 
 ---
 

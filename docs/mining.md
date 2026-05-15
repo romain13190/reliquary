@@ -121,21 +121,24 @@ See [docs/concepts.md](concepts.md#economic-model) for the full economic model.
 
 The validator emits one of the following reasons on every failed submission. Each is published per-submission in the window archive's `rejected[]` array (capped at 5 entries per hotkey per window). Definitions live in `reliquary/protocol/submission.py::RejectReason`.
 
-**Rejected synchronously at HTTP enqueue:**
+**Rejected synchronously at HTTP enqueue (the `/submit` response carries the reason directly):**
 
 | Reason | Meaning | Action |
 |---|---|---|
-| `WINDOW_NOT_ACTIVE` | Window is in `TRAINING` or `PUBLISHING` | Sleep ~1 s and re-poll `/state` |
+| `WINDOW_NOT_ACTIVE` | Window is in `TRAINING`, `PUBLISHING`, or `READY` — not accepting submissions | Sleep and re-poll `/state` until `state == "open"` |
+| `RATE_LIMITED` | You exceeded `MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8` submissions in this window | Throttle locally; the counter resets at every window boundary |
+| `BATCH_FILLED` | The batcher already accepted `B_BATCH = 8` distinct non-cooldown valid submissions — your submission can never displace one, so it's rejected before GRAIL runs (PR #22) | Fire earlier next window, or accept that this window is closed |
+| `WINDOW_MISMATCH` | `window_start` in your request doesn't match the active batcher | Refresh `/state` and retry with the current `window_n` |
 
-**Rejected asynchronously by the worker (surfaces in the R2 archive after the window seals):**
+**Rejected asynchronously by the worker (look up via `GET /verdicts/{hotkey}` or the R2 archive):**
 
 | Reason | Meaning | Action |
 |---|---|---|
 | `WRONG_CHECKPOINT` | `checkpoint_hash` does not match the active HF revision | Re-poll `/state`, update revision, retry. Most common transient reject — happens briefly after every new checkpoint publish. |
-| `WINDOW_MISMATCH` | `window_start` in request is stale | Refresh `/state` and retry |
+| `WRONG_RANDOMNESS` | `commit.beacon.randomness` doesn't match the validator's per-window seed derived from `block_hash(window_n) + drand(round_for_window)` (PR #23). Almost always caused by reusing a sketch built for an earlier window after the window advanced. | Derive randomness per-window from chain + drand; tag each sketch with the window it was built for and discard before firing if the window has advanced. |
 | `BAD_PROMPT_IDX` | `prompt_idx` out of range for the active environment | Use the env's prompt-index space (`0..N-1`) |
 | `PROMPT_IN_COOLDOWN` | `prompt_idx` was in the active cooldown set (a prompt that entered a batch is cooled for `BATCH_PROMPT_COOLDOWN_WINDOWS = 72` windows) | Read `cooldown_prompts[]` from `/state` **before each pick** and skip anything in the list. This is the #1 cause of persistent self-inflicted rejection. |
-| `SUPERSEDED` / `hash_duplicate` | Another miner already won this `prompt_idx` for the current window (or your group is bit-identical to one already accepted) | Pick a different `prompt_idx` or arrive earlier |
+| `SUPERSEDED` / `HASH_DUPLICATE` | Another miner already won this `prompt_idx` for the current window, or your group is bit-identical to one already accepted in the last `HASH_DEDUP_RETENTION_WINDOWS = 10000` | Pick a different `prompt_idx` or arrive earlier |
 | `OUT_OF_ZONE` | σ of your 8 rewards is below threshold (`SIGMA_MIN = 0.43` steady, `0.33` during the first `BOOTSTRAP_WINDOWS = 100` windows) | Pick a prompt where your model gets 2–6 / 8 correct — not 0/8 or 8/8 |
 | `REWARD_MISMATCH` | Your claimed rewards don't match the validator's recompute under `env.compute_reward` | Confirm env + model + tokenizer match the validator |
 | `GRAIL_FAIL` | Sketch differs from the validator's forward pass by more than `PROOF_SKETCH_TOLERANCE_BASE + PROOF_SKETCH_TOLERANCE_GROWTH × √position` (currently `5000 + 5 × √P`) | Same checkpoint + `attn_implementation=flash_attention_2` + matching CUDA/torch + same GPU class as validator (H200 today) |
@@ -146,8 +149,74 @@ The validator emits one of the following reasons on every failed submission. Eac
 | `BAD_SCHEMA` / `BAD_TOKENS` | Submission payload malformed | Validate against the protocol schema |
 | `PROMPT_MISMATCH` | Canonical prompt tokens for `prompt_idx` don't match the request | Re-derive prompt tokens from the env's deterministic mapping |
 | `BAD_SIGNATURE` | GRAIL commit signature failed | Check wallet hotkey and signing code |
+| `WORKER_DROPPED` | Your submission was queued before the active batcher swapped (e.g. window advanced while sitting in the worker queue). The submission was dropped without running GRAIL because re-archiving into a sealed window is impossible. | Fire sooner inside the window; under sustained `worker_dropped` the validator is back-pressured — back off briefly. |
 
 `PROMPT_IN_COOLDOWN` is the most common **persistent** rejection caused by miner code: if your picker doesn't read `cooldown_prompts[]` before each pick, you will repeatedly submit prompts the validator has already cooled. Read the field — it's small and refreshes every `/state` call. The dashboard surfaces this directly on the miner drawer.
+
+### Real-time verdict feedback (`/verdicts/{hotkey}`)
+
+Under the production worker path the `/submit` response carries only a provisional sentinel — `accepted=True reason="submitted"` — that means "queued for verification", **not** "passed verification". The real verdict (`ACCEPTED` / `GRAIL_FAIL` / `WRONG_RANDOMNESS` / etc.) is only known after the worker drains the submission and runs the full pipeline (~5–25 s of GRAIL per item). If your miner logs every `/submit` response as `ACCEPTED`, it is lying — those logs include submissions that the worker silently rejected.
+
+The validator exposes the real per-submission verdicts via:
+
+```
+GET http://<validator-host>:8080/verdicts/{your_hotkey}?since=<unix_ts>
+```
+
+Response (`VerdictsResponse` in `reliquary/protocol/submission.py`):
+
+```json
+{
+  "verdicts": [
+    {"merkle_root": "ab12...64hex", "window_n": 1858, "accepted": true,  "reason": "accepted",         "ts": 1747353600.5},
+    {"merkle_root": "ef56...64hex", "window_n": 1858, "accepted": false, "reason": "grail_fail",       "ts": 1747353601.1},
+    {"merkle_root": "gh90...64hex", "window_n": 1858, "accepted": false, "reason": "wrong_randomness", "ts": 1747353601.4}
+  ]
+}
+```
+
+Properties:
+
+- **Per-hotkey ring buffer** of the last `VERDICT_CAP_PER_HOTKEY = 200` verdicts. Older entries roll off silently.
+- **Ordered by `ts` ascending.** Pass the highest `ts` you've seen as `?since=<ts>` to get only newer entries — strict `>` filter, so the same `ts` is excluded.
+- **Empty list for unseen hotkeys** (200, not 404).
+- **Public read.** Same trust model as the R2 archive; anyone can query any hotkey's verdicts.
+- **Lock-free.** Doesn't compete with the submit worker for the batcher lock.
+
+Recommended miner integration (~20 lines):
+
+```python
+last_seen_ts = 0.0
+
+async def poll_verdicts(client, hotkey, validator_url):
+    global last_seen_ts
+    while True:
+        try:
+            r = await client.get(
+                f"{validator_url}/verdicts/{hotkey}",
+                params={"since": last_seen_ts},
+                timeout=5.0,
+            )
+            for v in r.json()["verdicts"]:
+                if v["accepted"]:
+                    logger.info(
+                        "verdict ACCEPTED win=%d mr=%s",
+                        v["window_n"], v["merkle_root"][:12],
+                    )
+                else:
+                    logger.warning(
+                        "verdict REJECTED win=%d mr=%s reason=%s",
+                        v["window_n"], v["merkle_root"][:12], v["reason"],
+                    )
+                last_seen_ts = max(last_seen_ts, v["ts"])
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+```
+
+Then change your fire-time log from `ACCEPTED ...` to something honest like `SUBMITTED window=N mr=<short_merkle>`. The real verdict will land 5–15 s later via the poller. Without this, you cannot tell `submitted to queue` apart from `passed GRAIL`, which makes debugging "why is my slot share dropping" much harder than it needs to be.
+
+This endpoint is purely additive — existing miners that don't poll it keep working exactly as before; they just continue to mislabel their logs.
 
 ---
 
