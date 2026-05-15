@@ -16,9 +16,9 @@ Operational guide for running a miner on Bittensor subnet 81. For conceptual bac
 
 The boot query ensures a miner joining an already-running subnet lands directly on the current model, skipping an initial reject cycle.
 
-## What a miner does (v2.1)
+## What a miner does (v2.2)
 
-Windows are event-driven, not time-based. A window seals the instant `B_BATCH = 16` valid distinct-prompt submissions land; there is no fixed 60-second cadence.
+Windows are event-driven, not time-based. A window seals the instant `B_BATCH = 8` valid distinct-prompt submissions land; there is no fixed 60-second cadence. A safety-net timeout (`WINDOW_TIMEOUT_SECONDS = 7200`) auto-seals the window if fewer than 8 valid submissions land in that window.
 
 Every miner runs a continuous poll-submit loop:
 
@@ -36,7 +36,39 @@ Every miner runs a continuous poll-submit loop:
 
 6. **Submits.** POSTs a `BatchSubmissionRequest` to `/submit` containing: `miner_hotkey`, `prompt_idx`, `window_start` (from the last `/state`), 8 rollouts, local rewards, GRAIL commits, `merkle_root`, and `checkpoint_hash` (the HF revision from the last `/state` response). Submission ordering is by validator-side TCP arrival — there is no miner-supplied round or timestamp field.
 
-The validator processes submissions in real time. Only the first `B_BATCH = 16` accepted submissions with distinct `prompt_idx` values that pass all checks form the training batch.
+The validator processes submissions in real time. Only the first `B_BATCH = 8` accepted submissions with distinct `prompt_idx` values that pass all checks form the training batch.
+
+## Submission lifecycle — where your rollout actually ends up
+
+The most common miner question is *"the validator returned `accepted=True`, but the dashboard says my submission was rejected — what's going on?"* There are **two distinct accept events** in the pipeline, ~seconds apart.
+
+```
+miner                    validator HTTP                 validator worker
+─────                    ──────────────                 ────────────────
+generate 8 rollouts ──▶  enqueue submission              dequeue submission
+                         ◀── reason="submitted"          run GRAIL + zone + reward checks
+                            (HTTP-accepted)              ──▶ batch[]       if all checks pass
+                                                         ──▶ runners_up[]  if valid but B already filled
+                                                         ──▶ rejected[]    if any check fails
+                                                         ──▶ dropped       if window sealed before pickup
+```
+
+1. **HTTP enqueue.** The validator's HTTP layer accepts your POST and returns `accepted=True reason="submitted"`. This is what `submitted ... accepted=True` in your miner log means. **It does NOT mean the validator accepted your work.** It means the submission is in the worker queue.
+
+2. **Worker verification.** A background worker dequeues each submission and runs the full validation pipeline. One of four things happens:
+   - **`batch[]`** — first 8 valid distinct-prompt submissions go here. You earn weight share on these.
+   - **`runners_up[]`** — valid but lost the FIFO race to fill the batch. No emission, but the validator records you.
+   - **`rejected[]`** — failed at least one check. Reason + the failing GRAIL diagnostic value are published.
+   - **dropped late** — the batch sealed before the worker reached your queued submission. Not surfaced in the archive; only visible in validator logs.
+
+The R2 archive (`reliquary/dataset/window-<N>.json.gz`) contains the first three buckets. The public dashboard reads it.
+
+### How to look up your specific submission
+
+Per submission you have `(window_n, prompt_idx)`. Two lookup paths:
+
+- **Dashboard drawer.** Click your hotkey row on `https://reliqua.ai/dashboard`. The drawer's "last 5w" table shows `sub / acc / soft / hard` counts per window for your hotkey, and when `hard > 0` it lists every rejection with its `prompt_idx`, reason, and the actual GRAIL diagnostic values (`sketch_diff`, `lp_dev`, `dist_q10`) that pushed it over threshold.
+- **Raw archive.** `GET https://reliqua.ai/api/r2/window/<N>` returns the full window archive for any cached window. Search `batch[]`, `runners_up[]`, `rejected[]` for your `prompt_idx`. If it's in none of them, the submission was dropped late.
 
 ### Prompt selection strategy
 
@@ -87,19 +119,35 @@ See [docs/concepts.md](concepts.md#economic-model) for the full economic model.
 
 ### Rejection reasons
 
+The validator emits one of the following reasons on every failed submission. Each is published per-submission in the window archive's `rejected[]` array (capped at 5 entries per hotkey per window). Definitions live in `reliquary/protocol/submission.py::RejectReason`.
+
+**Rejected synchronously at HTTP enqueue:**
+
 | Reason | Meaning | Action |
 |---|---|---|
-| `WINDOW_NOT_ACTIVE` | Window is in `TRAINING` or `PUBLISHING` | Wait and re-poll `/state` |
+| `WINDOW_NOT_ACTIVE` | Window is in `TRAINING` or `PUBLISHING` | Sleep ~1 s and re-poll `/state` |
+
+**Rejected asynchronously by the worker (surfaces in the R2 archive after the window seals):**
+
+| Reason | Meaning | Action |
+|---|---|---|
+| `WRONG_CHECKPOINT` | `checkpoint_hash` does not match the active HF revision | Re-poll `/state`, update revision, retry. Most common transient reject — happens briefly after every new checkpoint publish. |
 | `WINDOW_MISMATCH` | `window_start` in request is stale | Refresh `/state` and retry |
-| `WRONG_CHECKPOINT` | `checkpoint_hash` does not match the active revision | Re-poll `/state`, update revision, retry |
-| `PROMPT_IN_COOLDOWN` | `prompt_idx` is in the active cooldown set | Retry with a different `prompt_idx` |
-| `SUPERSEDED` | Another miner already claimed this `prompt_idx` for the current window | Submit faster next window, or pick a different `prompt_idx` |
-| `OUT_OF_ZONE` | σ below threshold (0.43 steady / 0.33 bootstrap) | Pick a different prompt |
-| `REWARD_MISMATCH` | Claimed reward does not match validator's `env.compute_reward` | Check env and model version alignment |
-| `GRAIL_FAIL` | Sketch does not match validator's forward pass | Check checkpoint, `attn_implementation`, and CUDA version |
+| `BAD_PROMPT_IDX` | `prompt_idx` out of range for the active environment | Use the env's prompt-index space (`0..N-1`) |
+| `PROMPT_IN_COOLDOWN` | `prompt_idx` was in the active cooldown set (a prompt that entered a batch is cooled for `BATCH_PROMPT_COOLDOWN_WINDOWS = 72` windows) | Read `cooldown_prompts[]` from `/state` **before each pick** and skip anything in the list. This is the #1 cause of persistent self-inflicted rejection. |
+| `SUPERSEDED` / `hash_duplicate` | Another miner already won this `prompt_idx` for the current window (or your group is bit-identical to one already accepted) | Pick a different `prompt_idx` or arrive earlier |
+| `OUT_OF_ZONE` | σ of your 8 rewards is below threshold (`SIGMA_MIN = 0.43` steady, `0.33` during the first `BOOTSTRAP_WINDOWS = 100` windows) | Pick a prompt where your model gets 2–6 / 8 correct — not 0/8 or 8/8 |
+| `REWARD_MISMATCH` | Your claimed rewards don't match the validator's recompute under `env.compute_reward` | Confirm env + model + tokenizer match the validator |
+| `GRAIL_FAIL` | Sketch differs from the validator's forward pass by more than `PROOF_SKETCH_TOLERANCE_BASE + PROOF_SKETCH_TOLERANCE_GROWTH × √position` (currently `5000 + 5 × √P`) | Same checkpoint + `attn_implementation=flash_attention_2` + matching CUDA/torch + same GPU class as validator (H200 today) |
+| `LOGPROB_MISMATCH` | Per-token log-prob deviation from validator's recompute exceeds `LOGPROB_IS_EPS = 0.10` | Same root cause as `GRAIL_FAIL` — quantization, attention kernel, or precision drift |
+| `BAD_TERMINATION` | A rollout did not end on EOS or hit `MIN_EOS_PROBABILITY = 0.01` correctly | Confirm generation config matches protocol (max-tokens, EOS handling) |
+| `DISTRIBUTION_SUSPICIOUS` | Reward distribution heuristics flagged the group as low-entropy / cheater-like | Submit all 8 rollouts honestly at `T_PROTO = 0.9` — no pre-screening |
+| `WRONG_ROLLOUT_COUNT` | Group has fewer or more than `M_ROLLOUTS = 8` rollouts | Always submit exactly 8 |
+| `BAD_SCHEMA` / `BAD_TOKENS` | Submission payload malformed | Validate against the protocol schema |
+| `PROMPT_MISMATCH` | Canonical prompt tokens for `prompt_idx` don't match the request | Re-derive prompt tokens from the env's deterministic mapping |
 | `BAD_SIGNATURE` | GRAIL commit signature failed | Check wallet hotkey and signing code |
 
-`WRONG_CHECKPOINT` is the most common transient rejection — it happens briefly after the validator publishes a new checkpoint. The miner's next `/state` poll will carry the updated revision, and submissions will succeed again.
+`PROMPT_IN_COOLDOWN` is the most common **persistent** rejection caused by miner code: if your picker doesn't read `cooldown_prompts[]` before each pick, you will repeatedly submit prompts the validator has already cooled. Read the field — it's small and refreshes every `/state` call. The dashboard surfaces this directly on the miner drawer.
 
 ---
 

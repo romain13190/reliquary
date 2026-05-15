@@ -134,6 +134,61 @@ For deeper protocol-level issues (high `GRAIL_FAIL`, batches not sealing, EMA dr
 
 ---
 
+## What the validator actually enforces
+
+These are the live thresholds the trainer applies on every submission. The same constants are explained from the miner's perspective in [mining.md](mining.md#rejection-reasons).
+
+| Constant | Value | Effect |
+|---|---|---|
+| `B_BATCH` | 8 | Number of valid distinct-prompt submissions that seal a window |
+| `M_ROLLOUTS` | 8 | Required rollout count per submission |
+| `T_PROTO` | 0.9 | Protocol-fixed sampling temperature (validator's recompute uses this) |
+| `SIGMA_MIN` (steady) | 0.43 | Zone filter: groups below this are rejected `OUT_OF_ZONE` |
+| `BOOTSTRAP_SIGMA_MIN` | 0.33 | Relaxed zone filter during first `BOOTSTRAP_WINDOWS = 100` windows |
+| `BATCH_PROMPT_COOLDOWN_WINDOWS` | 72 | A batched prompt is ineligible for 72 windows after entering a batch |
+| `PROOF_SKETCH_TOLERANCE_BASE` | 5000 | GRAIL sketch tolerance — actual threshold = `5000 + 5 × √position` |
+| `PROOF_SKETCH_TOLERANCE_GROWTH` | 5.0 | Per-position sqrt growth |
+| `LOGPROB_IS_EPS` | 0.10 | Per-token log-prob deviation max — exceeding triggers `LOGPROB_MISMATCH` |
+| `MIN_EOS_PROBABILITY` | 0.01 | Required EOS token probability for proper termination |
+| `WINDOW_TIMEOUT_SECONDS` | 7200 | Safety-net auto-seal if fewer than B submissions arrive in 2 h |
+| `EMA_ALPHA` | ≈0.0274 | Weight-update smoothing (`2/(72+1)` — ~25-window half-life) |
+| `REJECTED_LIST_CAP_PER_HOTKEY` | 5 | Max rejected samples retained per hotkey per window archive |
+
+Source of truth: `reliquary/constants.py`. If any of these change, this table and `concepts.md` need a sync.
+
+### Submission pipeline
+
+Every `/submit` flows through this sequence on the validator. The first rejection short-circuits the rest.
+
+```
+HTTP enqueue          worker dequeue → verify
+─────────────         ─────────────────────────
+WINDOW_NOT_ACTIVE? → reject     →    WRONG_CHECKPOINT? → reject
+queue submission                     WINDOW_MISMATCH?  → reject
+return reason="submitted"            BAD_PROMPT_IDX?   → reject
+                                     PROMPT_IN_COOLDOWN? → reject
+                                     SUPERSEDED?       → reject
+                                     BAD_SCHEMA / BAD_TOKENS / PROMPT_MISMATCH? → reject
+                                     BAD_SIGNATURE?    → reject
+                                     REWARD_MISMATCH?  → reject
+                                     OUT_OF_ZONE?      → reject
+                                     WRONG_ROLLOUT_COUNT? → reject
+                                     DISTRIBUTION_SUSPICIOUS? → reject
+                                     BAD_TERMINATION?  → reject
+                                     GRAIL_FAIL?       → reject
+                                     LOGPROB_MISMATCH? → reject
+                                     ─────────────────
+                                     → batch[] (first 8 valid distinct prompts)
+                                     → runners_up[] (valid but B already filled)
+
+window seals → R2 archive published at reliquary/dataset/window-<N>.json.gz
+             → /set_weights at next epoch boundary
+```
+
+Submissions that get HTTP-accepted but reach the worker after the window seals are **dropped late**. They appear in container logs (`INFO | dropping late submission prompt=N hotkey=...`) but not in any R2-archive bucket. The public dashboard surfaces aggregate queue pressure (batch saturation %) as a proxy; per-hotkey late-drop counts are intentionally not exposed publicly.
+
+---
+
 ## Security notes on the wallet mount
 
 The compose files mount your wallet directory **read-only** at `/root/.bittensor/wallets`. Even if the container were compromised, it could not write to that path.
