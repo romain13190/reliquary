@@ -181,6 +181,66 @@ def test_pre_queue_rejects_recorded_as_verdicts():
     assert verdicts[0]["reason"] == RejectReason.WRONG_CHECKPOINT.value
 
 
+def test_reject_order_matches_accept_locked():
+    """When a submission trips multiple cheap checks at once, the handler
+    must return the SAME reason the worker's _accept_locked would have
+    returned. Order pinned: WRONG_CHECKPOINT > drand_round >
+    BAD_PROMPT_IDX > PROMPT_IN_COOLDOWN > PROMPT_FULL."""
+    # WRONG_CHECKPOINT trips first even if drand_round + cooldown also fail.
+    s, _ = _setup(
+        current_checkpoint_hash="sha256:current",
+        cooldown_prompts=[42],
+        drand_round_check_enabled=True,
+        validate_round_returns=RejectReason.STALE_ROUND,
+    )
+    payload = _submission(prompt_idx=42, checkpoint_hash="sha256:stale", drand_round=99)
+    _assert_pre_queue_reject(s, payload, RejectReason.WRONG_CHECKPOINT)
+
+    # When checkpoint passes, drand_round trips next.
+    s, _ = _setup(
+        current_checkpoint_hash="sha256:current",
+        cooldown_prompts=[42],
+        drand_round_check_enabled=True,
+        validate_round_returns=RejectReason.STALE_ROUND,
+    )
+    payload = _submission(prompt_idx=42, checkpoint_hash="sha256:current", drand_round=99)
+    _assert_pre_queue_reject(s, payload, RejectReason.STALE_ROUND)
+
+    # When checkpoint + drand pass, BAD_PROMPT_IDX trips before cooldown.
+    s, _ = _setup(
+        env_len=100,
+        cooldown_prompts=[500],
+    )
+    payload = _submission(prompt_idx=500)  # both > env_len AND in cooldown
+    _assert_pre_queue_reject(s, payload, RejectReason.BAD_PROMPT_IDX)
+
+
+def test_cheap_reject_logs_warning():
+    """Each cheap reject emits a WARNING log line matching the worker's
+    format. Without this, operators lose the ``grep stale_round`` flow
+    they use to identify non-conformant miners after a v2.3 deploy."""
+    import logging
+    s, _ = _setup(current_checkpoint_hash="sha256:current")
+    payload = _submission(hotkey="hkL", checkpoint_hash="sha256:stale")
+
+    # Capture WARNING logs from the server module.
+    server_logger = logging.getLogger("reliquary.validator.server")
+    records = []
+    handler = logging.Handler()
+    handler.setLevel(logging.WARNING)
+    handler.emit = records.append
+    server_logger.addHandler(handler)
+    try:
+        with TestClient(s.app) as client:
+            client.post("/submit", json=payload)
+    finally:
+        server_logger.removeHandler(handler)
+
+    reject_lines = [r for r in records if "rejected prompt" in r.getMessage()
+                    and "wrong_checkpoint" in r.getMessage()]
+    assert reject_lines, "WARNING log missing for cheap WRONG_CHECKPOINT reject"
+
+
 def test_cheap_reject_does_not_burn_rate_limit_budget():
     """Cheap rejects DO consume the per-hotkey counter (rate_limit increments
     happen before the cheap rejects, intentionally — a spammer flooding bad
