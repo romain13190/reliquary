@@ -692,6 +692,7 @@ class ValidationService:
             while True:
                 try:
                     self._open_window()
+                    await self._wait_for_next_drand_boundary()
                     await self._set_window_randomness(subtensor)
                     self._activate_window()
                     try:
@@ -872,21 +873,46 @@ class ValidationService:
                 "Failed to rebuild hash set from history; starting empty"
             )
 
-    async def _derive_randomness(self, subtensor, target_window: int) -> str:
-        """v2.3+: drand-only seed for the per-window GRAIL randomness.
+    async def _wait_for_next_drand_boundary(self) -> None:
+        """Align window OPEN to the next drand round boundary.
 
-        Dropped the ``chain.get_block_hash`` call that v2.2 mixed into the
-        seed. Drand quicknet provides threshold-BLS unpredictability that
-        doesn't need a chain-anchored mix to be secure, and the substrate
-        WebSocket fetch was the bottleneck that stalled window OPEN under
-        finney 503s. ``subtensor`` is kept in the signature for the legacy
-        test path that disables drand (mock seeding off block_hash).
+        Called between ``_open_window`` (which prepares the batcher) and
+        ``_set_window_randomness`` (which fetches σ_R for the round that
+        publishes at — or just after — the boundary). Aligning here means
+        ``randomness_grail`` is bound to a round that didn't exist when
+        miners might have tried to pre-generate. Closes the v30-style
+        pre-spam exploit.
+        """
+        if not self.use_drand:
+            return
+        import time
+        from reliquary.infrastructure.drand import get_current_chain
+        ci = get_current_chain()
+        delay = chain.seconds_until_next_drand_boundary(
+            time.time(), ci["genesis_time"], ci["period"],
+        )
+        if delay > 0:
+            logger.info(
+                "Window %d: waiting %.2fs for next drand boundary before OPEN",
+                self._window_n, delay,
+            )
+            await asyncio.sleep(delay)
+
+    async def _derive_randomness(self, subtensor, target_window: int) -> str:
+        """v2.3+: drand-only seed bound to the round publishing AT window OPEN.
+
+        Called after ``_wait_for_next_drand_boundary`` so the wall-clock-
+        current drand round corresponds to the one whose σ just became
+        publicly available. Miners cannot pre-fetch this σ because it
+        didn't exist a few seconds ago. ``subtensor``/``target_window``
+        are kept in the signature for the legacy mock-only path.
         """
         if self.use_drand:
+            import time
             from reliquary.infrastructure.drand import get_beacon, get_current_chain
             chain_info = get_current_chain()
-            drand_round = chain.compute_drand_round_for_window(
-                target_window, chain_info["genesis_time"], chain_info["period"],
+            drand_round = chain.compute_current_drand_round(
+                time.time(), chain_info["genesis_time"], chain_info["period"],
             )
             beacon = get_beacon(round_id=str(drand_round), use_drand=True)
             return chain.compute_window_randomness(

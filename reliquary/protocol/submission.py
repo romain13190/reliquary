@@ -139,6 +139,12 @@ class GrpoBatchState(BaseModel):
     checkpoint_n: int = Field(..., ge=0)
     checkpoint_repo_id: str | None = None
     checkpoint_revision: str | None = None
+    # v2.3: drand beacon randomness for this window. Empty string between
+    # OPEN and the first successful _set_window_randomness; miners loop on
+    # empty until populated. Miners derive GRAIL commitments off this
+    # value rather than recomputing locally, which guarantees byte-for-byte
+    # agreement with the validator's verify path.
+    randomness: str = ""
 
 
 class ModelInfo(BaseModel):

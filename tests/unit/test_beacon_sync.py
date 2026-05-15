@@ -96,3 +96,25 @@ class TestCurrentDrandRound:
         r1 = compute_current_drand_round(1001.0, 1000, 3)
         r2 = compute_current_drand_round(1001.999, 1000, 3)
         assert r1 == r2 == 1
+
+
+class TestNextDrandBoundary:
+    def test_at_boundary_returns_zero(self):
+        """At t = genesis_time + N*period exactly, no wait."""
+        from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
+        assert seconds_until_next_drand_boundary(1000, 1000, 3) == 0.0
+        assert seconds_until_next_drand_boundary(1003, 1000, 3) == 0.0
+        assert seconds_until_next_drand_boundary(1006, 1000, 3) == 0.0
+
+    def test_mid_round_returns_remaining(self):
+        from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
+        # 1s into a 3s round → 2s remaining.
+        assert seconds_until_next_drand_boundary(1001, 1000, 3) == 2
+        # 2s into a 3s round → 1s remaining.
+        assert seconds_until_next_drand_boundary(1002, 1000, 3) == 1
+        # 0.5s into a 3s round → 2.5s remaining.
+        assert abs(seconds_until_next_drand_boundary(1000.5, 1000, 3) - 2.5) < 1e-9
+
+    def test_before_genesis_waits_for_genesis(self):
+        from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
+        assert seconds_until_next_drand_boundary(950, 1000, 3) == 50.0

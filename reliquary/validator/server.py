@@ -174,6 +174,7 @@ class ValidatorServer:
                 checkpoint_n=cp.checkpoint_n if cp else 0,
                 checkpoint_repo_id=cp.repo_id if cp else None,
                 checkpoint_revision=cp.revision if cp else None,
+                randomness=batcher.randomness,
             )
 
         @app.get("/checkpoint")

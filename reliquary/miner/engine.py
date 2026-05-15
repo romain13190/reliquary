@@ -219,9 +219,11 @@ class MiningEngine:
             metagraph = await chain.get_metagraph(subtensor, chain.NETUID)
             url = discover_validator_url(metagraph)
 
-        # Compute randomness (once — v2.1 uses it only for GRAIL sketch seed)
-        randomness = await self._compute_randomness(subtensor, 0, use_drand)
-
+        # v2.3: randomness is fetched per-window from /state instead of
+        # recomputed locally. The validator aligns window OPEN to a drand
+        # boundary and binds randomness to the round publishing at that
+        # boundary — a value that didn't exist a few seconds earlier, so
+        # nothing to pre-fetch. The miner just reads what /state reports.
         rng = random.Random()
         results = []
         local_n = 0
@@ -253,6 +255,14 @@ class MiningEngine:
 
                 if state.state != WindowState.OPEN:
                     await asyncio.sleep(1)
+                    continue
+
+                # v2.3: trust the validator's per-window randomness rather
+                # than recomputing locally. Empty string means the validator
+                # hasn't yet finished _set_window_randomness — wait briefly.
+                randomness = state.randomness
+                if not randomness:
+                    await asyncio.sleep(0.1)
                     continue
 
                 # Pick prompt, generate, submit.

@@ -191,9 +191,29 @@ def compute_current_drand_round(
     """Drand round currently in progress at the given UNIX timestamp.
 
     Validator calls this at submit-receipt time with `time.time()` to
-    decide whether the round attached by the miner is in [current - 1,
-    current] — the acceptable jitter window for design A'.
+    decide whether the round attached by the miner equals the round
+    publishing at receipt — the v2.3 zero-tolerance check.
     """
     if timestamp_seconds < genesis_time:
         return 1
     return 1 + int((timestamp_seconds - genesis_time) // period)
+
+
+def seconds_until_next_drand_boundary(
+    timestamp_seconds: float, genesis_time: int, period: int,
+) -> float:
+    """Seconds remaining until the next drand round publishes.
+
+    Returns 0.0 if ``timestamp_seconds`` is exactly at a round boundary.
+    Otherwise returns ``period - (timestamp_seconds - genesis_time) % period``.
+    Used by the validator to align window OPEN to a drand round boundary,
+    so the randomness round about to publish is not pre-fetchable by
+    miners (which is what enables the v30 pre-spam exploit).
+    """
+    if timestamp_seconds < genesis_time:
+        return float(genesis_time - timestamp_seconds)
+    elapsed = timestamp_seconds - genesis_time
+    rem = elapsed % period
+    if rem == 0:
+        return 0.0
+    return period - rem
