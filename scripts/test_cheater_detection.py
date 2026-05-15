@@ -282,7 +282,7 @@ def main():
     p.add_argument("--validator-revision", required=True,
                    help="HF commit SHA of the validator's current published ckpt")
     p.add_argument("--randomness", default="0123456789abcdef" * 4)
-    p.add_argument("--env", default="math")
+    p.add_argument("--env", default="openmathinstruct")
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--n-attempts", type=int, default=20,
                    help="Max prompts to try before giving up on finding an in-zone one")

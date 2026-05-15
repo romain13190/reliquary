@@ -5,7 +5,7 @@ concrete environments by name.
 """
 
 from reliquary.environment.base import Environment
-from reliquary.environment.math import MATHEnvironment
+from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
 
 
 def load_environment(name: str) -> Environment:
@@ -14,8 +14,8 @@ def load_environment(name: str) -> Environment:
     Raises:
         ValueError: if *name* is not a recognised environment.
     """
-    if name == "math":
-        return MATHEnvironment()
+    if name == "openmathinstruct":
+        return OpenMathInstructEnvironment()
     raise ValueError(f"Unknown environment: {name}")
 
 

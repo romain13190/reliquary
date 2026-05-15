@@ -129,6 +129,11 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
             "CORRECT" if rollout.reward > 0.5 else "wrong"
         ),
         hash_set=None,
+        # The vast majority of legacy tests construct requests without an
+        # attached drand_round (default 0). Disable the check by default
+        # in the test helper; tests that exercise the drand timing gate
+        # explicitly override `drand_round_check_enabled=True`.
+        drand_round_check_enabled=False,
     )
     kwargs.update(overrides)
     b = GrpoWindowBatcher(**kwargs)
@@ -222,31 +227,40 @@ def test_reject_reward_mismatch():
 
 def test_seal_batch_empty_pool_returns_empty():
     b = _make_batcher()
-    assert b.seal_batch() == []
+    batch, rewards = b.seal_batch()
+    assert batch == [] and rewards == {}
 
 
-def test_seal_batch_fifo_across_many_submissions():
-    """v2.2: ordering is by ``arrived_at`` (validator-side TCP arrival)."""
+def test_seal_batch_chronological_by_drand_round():
+    """v2.3 (design A'): submissions in earlier drand rounds fill the batch
+    first, regardless of TCP arrival order."""
     b = _make_batcher()
-    for i in range(B_BATCH):
-        req = _request(
-            prompt_idx=i, hotkey=f"hk{i}",
-        )
-        resp = b.accept_submission(req)
-        assert resp.accepted, f"unexpected reject for {i}: {resp.reason}"
-    batch = b.seal_batch()
-    assert len(batch) == B_BATCH
-    arrivals = [s.arrived_at for s in batch]
-    assert arrivals == sorted(arrivals), "batch must be ordered by arrived_at"
+    # Both submissions accepted; round 1 must come out first at seal time
+    # even though round 2 arrived first (insertion order below).
+    req_late = _request(prompt_idx=42, hotkey="late")
+    req_early = _request(prompt_idx=7, hotkey="early")
+    assert b.accept_submission(req_late).accepted
+    assert b.accept_submission(req_early).accepted
+    # Stamp the rounds after acceptance (the test helper accepts with the
+    # check disabled, so drand_round on the request defaults to 0; we set
+    # them here to drive the seal-time ordering deterministically).
+    b._valid[0].drand_round = 2  # late: round 2
+    b._valid[1].drand_round = 1  # early: round 1
+    batch, _ = b.seal_batch()
+    assert len(batch) == 2
+    assert batch[0].hotkey == "early"
+    assert batch[1].hotkey == "late"
 
 
 def test_seal_batch_cooldown_recorded():
     b = _make_batcher()
     req = _request(prompt_idx=42)
     b.accept_submission(req)
-    batch = b.seal_batch()
+    batch, rewards = b.seal_batch()
     assert len(batch) == 1
     assert b._cooldown.is_in_cooldown(42, b.window_start + 1) is True
+    # Each slot pays pool / B_BATCH. One slot filled, K_p=1 → 1/8.
+    assert abs(rewards["hk"] - 1 / B_BATCH) < 1e-9
 
 
 def test_sealed_batch_respects_cooldown_from_previous_window():
@@ -274,14 +288,20 @@ def test_state_endpoint_exposes_cooldown():
 
 
 def test_distinct_prompts_in_batch_only():
+    """One submission per winning prompt enters the training batch, even
+    when multiple miners successfully submitted on the same prompt."""
     b = _make_batcher()
     b.accept_submission(_request(prompt_idx=42, hotkey="alice"))
     b.accept_submission(_request(prompt_idx=42, hotkey="bob"))
     b.accept_submission(_request(prompt_idx=7, hotkey="carol"))
-    batch = b.seal_batch()
+    batch, rewards = b.seal_batch()
     assert len(batch) == 2
-    hotkeys = {s.hotkey for s in batch}
-    assert hotkeys == {"alice", "carol"}
+    assert {s.prompt_idx for s in batch} == {42, 7}
+    # Each slot pays pool / B_BATCH = 1/8. Prompt 42 has 2 miners
+    # splitting 1/8 → 1/16 each. Prompt 7 has 1 miner taking 1/8.
+    assert abs(rewards["alice"] - 1 / 16) < 1e-9
+    assert abs(rewards["bob"] - 1 / 16) < 1e-9
+    assert abs(rewards["carol"] - 1 / 8) < 1e-9
 
 
 # --- v2.1 seal_event + checkpoint_hash gating ---
@@ -496,53 +516,47 @@ def test_no_canonical_fn_disables_check():
 
 
 # ---------------------------------------------------------------------------
-# FIFO short-circuit (SUPERSEDED)
+# Per-prompt multi-miner acceptance (v2.3+)
 # ---------------------------------------------------------------------------
 #
-# v2.2: ordering is by validator-side TCP arrival (``arrived_at``). The first
-# submission to clear the full pipeline for a given ``prompt_idx`` claims
-# the slot; every subsequent submission for the same prompt is rejected
-# SUPERSEDED before the heavy reward + GRAIL forward pass (~3s GPU).
+# Drand-anchored ordering at seal time replaced the FIFO SUPERSEDED short-
+# circuit. Multiple miners may submit on the same prompt within a window,
+# capped at MAX_SUBMISSIONS_PER_PROMPT. Each pays its own GRAIL verify; the
+# cap is the only thing bounding worst-case validator GPU load.
 
 
-def test_supersede_blocks_same_miner_duplicate_spam():
-    """Same-miner spamming the same prompt is short-circuited: the second
-    submission must be rejected SUPERSEDED before any heavy validation."""
+def test_same_prompt_multi_miner_accepted():
+    """v2.3: two different miners on the same prompt both pass verification.
+    The first does not 'claim' the prompt — emission is split at seal time."""
     b = _make_batcher()
-    first = _request_v21(
-        prompt_idx=42, hotkey="A", checkpoint_hash="",
-    )
-    second = _request_v21(
-        prompt_idx=42, hotkey="A", checkpoint_hash="",
-    )
+    first = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    second = _request_v21(prompt_idx=42, hotkey="B", checkpoint_hash="")
     assert b.accept_submission(first).accepted is True
     r2 = b.accept_submission(second)
-    assert r2.accepted is False
-    assert r2.reason == RejectReason.SUPERSEDED
+    assert r2.accepted is True
+    assert len(b._valid) == 2
+    assert len(b._submissions_per_prompt[42]) == 2
 
 
-def test_second_arrival_for_same_prompt_is_short_circuited():
-    """v2.2: any subsequent submission for an already-claimed prompt is
-    rejected SUPERSEDED before any heavy validation — no fall-through,
-    no second entry in _valid."""
+def test_prompt_full_rejected_at_cap():
+    """Beyond MAX_SUBMISSIONS_PER_PROMPT submissions on a prompt, further
+    arrivals are rejected PROMPT_FULL before any heavy verify."""
+    from reliquary.constants import MAX_SUBMISSIONS_PER_PROMPT
     b = _make_batcher()
-    incumbent = _request_v21(
-        prompt_idx=42, hotkey="B", checkpoint_hash="",
-    )
-    challenger = _request_v21(
-        prompt_idx=42, hotkey="A", checkpoint_hash="",
-    )
-    assert b.accept_submission(incumbent).accepted is True
-    r2 = b.accept_submission(challenger)
-    assert r2.accepted is False
-    assert r2.reason == RejectReason.SUPERSEDED
-    # Only the first arrival is in _valid.
-    assert len(b._valid) == 1
-    assert b._valid[0].hotkey == "B"
+    for i in range(MAX_SUBMISSIONS_PER_PROMPT):
+        req = _request_v21(prompt_idx=42, hotkey=f"hk{i}", checkpoint_hash="")
+        assert b.accept_submission(req).accepted is True, f"miner {i} should fit"
+    overflow = _request_v21(prompt_idx=42, hotkey="overflow", checkpoint_hash="")
+    resp = b.accept_submission(overflow)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.PROMPT_FULL
+    # The PROMPT_FULL reject did not enter _valid.
+    assert len(b._valid) == MAX_SUBMISSIONS_PER_PROMPT
 
 
 def test_different_prompts_tracked_independently():
-    """SUPERSEDED is per-prompt — accepting prompt 42 must not block prompt 43."""
+    """Each prompt has its own bucket — filling prompt 42 must not affect
+    prompt 43's acceptance budget."""
     b = _make_batcher()
     r_a = b.accept_submission(_request_v21(
         prompt_idx=42, hotkey="A", checkpoint_hash="",
@@ -553,14 +567,12 @@ def test_different_prompts_tracked_independently():
     assert r_a.accepted is True
     assert r_b.accepted is True
     assert len(b._valid) == 2
-    assert b._claimed_prompts == {42, 43}
+    assert set(b._submissions_per_prompt) == {42, 43}
 
 
-def test_supersede_only_records_after_full_success():
-    """If a submission gets rejected mid-pipeline (e.g. GRAIL fail), it must
-    NOT mark the prompt as claimed — otherwise an honest later submission
-    for the same prompt would be wrongly rejected as SUPERSEDED."""
-    # Use an always-failing GRAIL so the submission is rejected post-cheap-checks.
+def test_failed_submission_does_not_consume_bucket_slot():
+    """A submission rejected mid-pipeline (GRAIL fail) must not occupy a
+    PROMPT_FULL slot — otherwise dishonest spam could starve honest miners."""
     b = _make_batcher(verify_commitment_proofs_fn=_always_false_grail)
     first_fails = _request_v21(
         prompt_idx=42, hotkey="A", checkpoint_hash="",
@@ -568,15 +580,69 @@ def test_supersede_only_records_after_full_success():
     r1 = b.accept_submission(first_fails)
     assert r1.accepted is False
     assert r1.reason == RejectReason.GRAIL_FAIL
-    # No claim recorded for prompt 42.
-    assert 42 not in b._claimed_prompts
-    # A subsequent honest submission for prompt 42 must NOT be wrongly
-    # rejected as SUPERSEDED.
+    # No bucket entry for prompt 42 — the rejected submission did not count.
+    assert 42 not in b._submissions_per_prompt
+    # A subsequent honest submission for prompt 42 is still accepted.
     b._verify_commitment = _always_true_grail
     r2 = b.accept_submission(_request_v21(
         prompt_idx=42, hotkey="B", checkpoint_hash="",
     ))
     assert r2.accepted is True
+    assert len(b._submissions_per_prompt[42]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Drand-round timing gate (v2.3 design A')
+# ---------------------------------------------------------------------------
+
+def _make_batcher_with_drand_check(*, fixed_round: int = 100, **overrides):
+    """Helper: batcher with the drand timing gate ENABLED and a stable
+    chain info so we can reason about exact round numbers in tests."""
+    # Pin wall clock so current_round = fixed_round.
+    # genesis_time=1000, period=3 → current_round at wall_clock = 1000 +
+    # (fixed_round - 1) * 3 = 1000 + (fixed_round - 1) * 3.
+    wall = 1000 + (fixed_round - 1) * 3 + 1.0  # +1s into the round
+    overrides.setdefault("drand_round_check_enabled", True)
+    overrides.setdefault("wall_clock_fn", lambda: wall)
+    overrides.setdefault(
+        "drand_chain_info", {"genesis_time": 1000, "period": 3},
+    )
+    return _make_batcher(**overrides)
+
+
+def test_drand_round_current_accepted():
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 100
+    assert b.accept_submission(req).accepted is True
+
+
+def test_drand_round_one_behind_stale():
+    """v2.3: tolerance 0 — even one round behind is rejected."""
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 99
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.STALE_ROUND
+
+
+def test_drand_round_two_behind_stale():
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 98
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.STALE_ROUND
+
+
+def test_drand_round_future_rejected():
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 101
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.FUTURE_ROUND
 
 
 def test_constructor_accepts_tokenizer():
@@ -897,7 +963,7 @@ def test_seal_batch_populates_hash_set():
     resp = b.accept_submission(req)
     assert resp.accepted is True
 
-    batch = b.seal_batch()
+    batch, _ = b.seal_batch()
     assert len(batch) == 1
     for sub in batch:
         assert len(sub.rollout_hashes) == M_ROLLOUTS
@@ -928,5 +994,5 @@ def test_seal_batch_with_none_hash_set_is_noop():
     b = _make_batcher(hash_set=None)
     req = _request(prompt_idx=42, rewards=[1.0] * 4 + [0.0] * 4)
     b.accept_submission(req)
-    batch = b.seal_batch()
+    batch, _ = b.seal_batch()
     assert len(batch) == 1  # behaviour unchanged

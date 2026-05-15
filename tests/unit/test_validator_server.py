@@ -68,6 +68,8 @@ def _batcher(window_start=500, cooldown_map=None):
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
         completion_text_fn=lambda r: "CORRECT" if r.reward > 0.5 else "wrong",
+        # Server tests post legacy requests without drand_round; disable the gate.
+        drand_round_check_enabled=False,
     )
     batcher.current_checkpoint_hash = "sha256:test"
     # Match the per-window randomness used by ``_make_commit`` so the

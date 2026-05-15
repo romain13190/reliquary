@@ -52,7 +52,7 @@ from reliquary.constants import (
     TOP_K_PROTO,
     TOP_P_PROTO,
 )
-from reliquary.environment.math import MATHEnvironment
+from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
 from reliquary.protocol.crypto import indices_from_root
 from reliquary.protocol.grail_verifier import GRAILVerifier
 from reliquary.protocol.submission import RolloutSubmission
@@ -467,7 +467,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    env = MATHEnvironment()
+    env = OpenMathInstructEnvironment()
 
     all_rows = []
     for run in range(args.n_runs):

@@ -144,7 +144,7 @@ def _patch_open_grpo_window(svc):
     real_open = svc_mod.open_grpo_window
 
     def _mock_open(window_start, env, model, *, cooldown_map, hash_set, tokenizer, bootstrap=False):
-        return GrpoWindowBatcher(
+        b = GrpoWindowBatcher(
             window_start=window_start,
             env=env,
             model=model,
@@ -156,7 +156,14 @@ def _patch_open_grpo_window(svc):
             verify_signature_fn=lambda c, h: True,
             # Decode via reward: FakeEnv.compute_reward returns 1.0 for "WIN".
             completion_text_fn=lambda rollout: "WIN" if rollout.reward > 0.5 else "",
+            # Integration tests don't drive wall clock; disable the drand
+            # timing gate so submissions with drand_round=0 still accept.
+            drand_round_check_enabled=False,
         )
+        # Match the per-window randomness used in ``_make_commit`` so the
+        # WRONG_RANDOMNESS check from PR #23 accepts the test requests.
+        b.randomness = "cd" * 16
+        return b
 
     return patch.object(svc_mod, "open_grpo_window", side_effect=_mock_open)
 
@@ -219,6 +226,7 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
+            drand_round_check_enabled=False,
         )
 
     with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):
@@ -262,7 +270,7 @@ async def test_verify_model_refreshed_only_after_publish(monkeypatch):
         svc._open_window()
     svc._active_batcher.seal_event.set()
     # Pretend the seal produced a full batch so trained=True.
-    svc._active_batcher.seal_batch = MagicMock(return_value=[MagicMock()] * 100)
+    svc._active_batcher.seal_batch = MagicMock(return_value=([MagicMock()] * 100, {}))
 
     await svc._train_and_publish()
 
@@ -302,7 +310,7 @@ async def test_verify_model_NOT_refreshed_when_publish_skipped(monkeypatch):
     with _patch_open_grpo_window(svc):
         svc._open_window()  # bumps to 6
     svc._active_batcher.seal_event.set()
-    svc._active_batcher.seal_batch = MagicMock(return_value=[MagicMock()] * 100)
+    svc._active_batcher.seal_batch = MagicMock(return_value=([MagicMock()] * 100, {}))
 
     await svc._train_and_publish()
 

@@ -9,6 +9,7 @@ from typing import Any
 
 from reliquary.constants import (
     BATCH_PROMPT_COOLDOWN_WINDOWS,
+    COOLDOWN_REBUILD_LOOKBACK,
     B_BATCH,
     BOOTSTRAP_WINDOWS,
     CHECKPOINT_PUBLISH_INTERVAL_WINDOWS,
@@ -432,7 +433,11 @@ class ValidationService:
             return
 
         self._set_state(WindowState.TRAINING)
-        batch = self._active_batcher.seal_batch()
+        # v2.3: seal_batch orders by the per-submission drand_round attached
+        # by miners (see design A'). The validator does no post-close drand
+        # fetch — all timing info is already attached to the submissions.
+        batch, rewards = self._active_batcher.seal_batch()
+        self._active_batcher.rewards_by_hotkey = rewards
         # Note: miners earn slots regardless of training. Their contribution
         # is reflected in the next ``_submit_weights`` call, which replays
         # the EMA from R2 archives written by ``_archive_window`` below.
@@ -636,6 +641,10 @@ class ValidationService:
             "runners_up": runners_up,
             "reject_summary": dict(getattr(batcher, "reject_counts", {})),
             "rejected": rejected_entries,
+            # v2.3: per-hotkey emission share from select_batch_and_distribute.
+            # All miners whose prompt landed in the winning set appear here,
+            # even if their specific submission wasn't picked for training.
+            "rewards_by_hotkey": dict(getattr(batcher, "rewards_by_hotkey", {})),
             "late_drops": {
                 hk: dict(counts) for hk, counts in self._late_drops.items()
             },
@@ -684,6 +693,7 @@ class ValidationService:
             while True:
                 try:
                     self._open_window()
+                    await self._wait_for_next_drand_boundary()
                     await self._set_window_randomness(subtensor)
                     self._activate_window()
                     try:
@@ -883,7 +893,7 @@ class ValidationService:
 
     async def _rebuild_cooldown_from_history(self) -> None:
         """At startup, reconstruct CooldownMap from the last
-        BATCH_PROMPT_COOLDOWN_WINDOWS archived windows on R2.
+        COOLDOWN_REBUILD_LOOKBACK archived windows on R2 (bounded cap; not BATCH_PROMPT_COOLDOWN_WINDOWS which is now astronomical for one-shot semantics).
 
         R2 is the durable source of truth — each window's sealed batch is
         uploaded by ``_archive_window``. Rebuilding from that history means:
@@ -897,7 +907,7 @@ class ValidationService:
             current_window = self._window_n
             archives = await storage.list_recent_datasets(
                 current_window=current_window + 1,
-                n=BATCH_PROMPT_COOLDOWN_WINDOWS,
+                n=COOLDOWN_REBUILD_LOOKBACK,
             )
             self._cooldown_map.rebuild_from_history(
                 archives, current_window=current_window,
@@ -935,18 +945,54 @@ class ValidationService:
                 "Failed to rebuild hash set from history; starting empty"
             )
 
+    async def _wait_for_next_drand_boundary(self) -> None:
+        """Align window OPEN to the next drand round boundary.
+
+        Called between ``_open_window`` (which prepares the batcher) and
+        ``_set_window_randomness`` (which fetches σ_R for the round that
+        publishes at — or just after — the boundary). Aligning here means
+        ``randomness_grail`` is bound to a round that didn't exist when
+        miners might have tried to pre-generate. Closes the v30-style
+        pre-spam exploit.
+        """
+        if not self.use_drand:
+            return
+        import time
+        from reliquary.infrastructure.drand import get_current_chain
+        ci = get_current_chain()
+        delay = chain.seconds_until_next_drand_boundary(
+            time.time(), ci["genesis_time"], ci["period"],
+        )
+        if delay > 0:
+            logger.info(
+                "Window %d: waiting %.2fs for next drand boundary before OPEN",
+                self._window_n, delay,
+            )
+            await asyncio.sleep(delay)
+
     async def _derive_randomness(self, subtensor, target_window: int) -> str:
-        block_hash = await chain.get_block_hash(subtensor, target_window)
+        """v2.3+: drand-only seed bound to the round publishing AT window OPEN.
+
+        Called after ``_wait_for_next_drand_boundary`` so the wall-clock-
+        current drand round corresponds to the one whose σ just became
+        publicly available. Miners cannot pre-fetch this σ because it
+        didn't exist a few seconds ago. ``subtensor``/``target_window``
+        are kept in the signature for the legacy mock-only path.
+        """
         if self.use_drand:
+            import time
             from reliquary.infrastructure.drand import get_beacon, get_current_chain
             chain_info = get_current_chain()
-            drand_round = chain.compute_drand_round_for_window(
-                target_window, chain_info["genesis_time"], chain_info["period"],
+            drand_round = chain.compute_current_drand_round(
+                time.time(), chain_info["genesis_time"], chain_info["period"],
             )
             beacon = get_beacon(round_id=str(drand_round), use_drand=True)
             return chain.compute_window_randomness(
-                block_hash, beacon["randomness"], drand_round=beacon["round"],
+                None, beacon["randomness"], drand_round=beacon["round"],
             )
+        # Legacy mock-only path: still uses block_hash so tests that
+        # disable drand keep working without a live drand fetch.
+        block_hash = await chain.get_block_hash(subtensor, target_window)
         return chain.compute_window_randomness(block_hash)
 
 

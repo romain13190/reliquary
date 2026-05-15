@@ -47,7 +47,7 @@ from reliquary.constants import (
     TOP_K_PROTO,
     TOP_P_PROTO,
 )
-from reliquary.environment.math import MATHEnvironment
+from reliquary.environment.openmathinstruct import OpenMathInstructEnvironment
 from reliquary.protocol.crypto import indices_from_root
 from reliquary.protocol.grail_verifier import GRAILVerifier, adaptive_sketch_tolerance
 from reliquary.shared.forward import forward_single_layer
@@ -240,7 +240,7 @@ def main():
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    env = MATHEnvironment()
+    env = OpenMathInstructEnvironment()
 
     rows = []
     for k, rev in enumerate(revs):

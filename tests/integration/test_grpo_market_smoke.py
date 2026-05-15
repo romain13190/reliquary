@@ -87,7 +87,7 @@ def _always_true_proof(commit, model, randomness):
 
 
 def _make_batcher(window, cooldown):
-    return GrpoWindowBatcher(
+    b = GrpoWindowBatcher(
         window_start=window,
         env=FakeEnv(),
         model=_ModelStub(),
@@ -95,7 +95,13 @@ def _make_batcher(window, cooldown):
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
         completion_text_fn=lambda r: "WIN" if r.reward > 0.5 else "",
+        # Smoke tests don't drive wall clock; disable the drand timing gate.
+        drand_round_check_enabled=False,
     )
+    # Match the per-window randomness used in ``_make_commit`` so the
+    # WRONG_RANDOMNESS check from PR #23 accepts the test requests.
+    b.randomness = "cd" * 16
+    return b
 
 
 def test_two_windows_with_cooldown():
@@ -118,9 +124,10 @@ def test_two_windows_with_cooldown():
         )
         resp = b0.accept_submission(req)
         assert resp.accepted, f"unexpected reject for hk{i}: {resp.reason}"
-    batch0 = b0.seal_batch()
+    batch0, _ = b0.seal_batch()
     assert len(batch0) == B_BATCH
-    # select_batch sorts by tiebreak hash; any B_BATCH of the submitted prompts may win
+    # v2.3: select_batch_and_distribute drand-orders prompts; any B_BATCH of
+    # the submitted prompts may win for a given seed.
     batched_prompts = {s.prompt_idx for s in batch0}
     assert len(batched_prompts) == B_BATCH
     assert batched_prompts.issubset(set(range(n_submissions)))
