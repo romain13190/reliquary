@@ -231,6 +231,25 @@ MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
 # MAX_SUBMISSIONS_PER_PROMPT × min(|env|, MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW × n_hotkeys).
 MAX_SUBMISSIONS_PER_PROMPT = 10
 
+# How many drand-quicknet rounds backward of the validator's current round
+# the batcher accepts on the ``drand_round`` field. Original v2.3 design
+# was zero-tolerance ("the round currently in progress at receipt"), but
+# empirical prod data after the v2.3 deploy showed that any HTTP RTT or
+# small clock skew between miner and validator that crosses a 3 s drand
+# boundary turns into a STALE_ROUND rejection. PR #30 hoists the check
+# pre-queue so worker-side latency no longer compounds the problem, but
+# the boundary-crossing class of failure remains — a miner firing at
+# t=2.9 s of round R lands at the validator at t=3.0 s of round R+1.
+#
+# Tolerance = 1 means the miner's attached round may be (current, current-1).
+# Window of forgiveness: one drand period = 3 s. Security cost: an
+# attacker can antedate their submission's chronological bucket by at
+# most one round (3 s of priority). That's bounded, small, and uniform
+# across all miners — every miner gets the same one-round backward grace.
+# Forward direction stays zero (FUTURE_ROUND is unrecoverable: a miner
+# that attaches round R+1 hasn't seen σ_{R+1} yet, so they're cheating).
+DRAND_ROUND_BACKWARD_TOLERANCE = 1
+
 # Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use
 # relaxed thresholds to keep the batch filling while miner pop + env
 # coverage are thin.

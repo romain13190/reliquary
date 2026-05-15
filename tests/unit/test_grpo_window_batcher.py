@@ -617,17 +617,23 @@ def test_drand_round_current_accepted():
     assert b.accept_submission(req).accepted is True
 
 
-def test_drand_round_one_behind_stale():
-    """v2.3: tolerance 0 — even one round behind is rejected."""
+def test_drand_round_one_behind_accepted_with_default_tolerance():
+    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 1`` absorbs one-round
+    drift caused by HTTP RTT or small clock skew between miner and
+    validator. ``drand_round = current - 1`` MUST NOT be STALE_ROUND on a
+    default-configured batcher — the v2.3 zero-tolerance design produced
+    near-total throughput collapse in prod.
+    """
     b = _make_batcher_with_drand_check(fixed_round=100)
     req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
     req.drand_round = 99
     resp = b.accept_submission(req)
-    assert resp.accepted is False
-    assert resp.reason == RejectReason.STALE_ROUND
+    assert resp.accepted is True
 
 
-def test_drand_round_two_behind_stale():
+def test_drand_round_two_behind_still_stale_under_default_tolerance():
+    """Tolerance = 1 means [current - 1, current] is the accepted window.
+    Round = current - 2 is outside that window and MUST be STALE_ROUND."""
     b = _make_batcher_with_drand_check(fixed_round=100)
     req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
     req.drand_round = 98
@@ -637,12 +643,62 @@ def test_drand_round_two_behind_stale():
 
 
 def test_drand_round_future_rejected():
+    """Forward direction is always zero-tolerance: a future round means
+    the miner claims to have seen a beacon that hasn't been signed yet."""
     b = _make_batcher_with_drand_check(fixed_round=100)
     req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
     req.drand_round = 101
     resp = b.accept_submission(req)
     assert resp.accepted is False
     assert resp.reason == RejectReason.FUTURE_ROUND
+
+
+def test_drand_round_zero_tolerance_one_behind_stale():
+    """Explicit ``drand_round_backward_tolerance = 0`` restores the
+    original v2.3 zero-tolerance spec (useful for stress-test fixtures
+    or future tighter-grain enforcement). One round behind is STALE."""
+    b = _make_batcher_with_drand_check(
+        fixed_round=100, drand_round_backward_tolerance=0,
+    )
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 99
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.STALE_ROUND
+
+
+def test_drand_round_default_backward_tolerance_is_one():
+    """Pin the default. Changing this in constants is a deliberate
+    protocol-tuning decision, not an incidental refactor — make any
+    drift loud."""
+    from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
+    assert DRAND_ROUND_BACKWARD_TOLERANCE == 1
+
+
+def test_drand_round_explicit_tolerance_three_allows_three_behind():
+    """Tolerance is a per-batcher knob — operators can dial it up when
+    drand network jitter or validator-side queue lag pushes typical
+    submissions further behind ``current_round``."""
+    b = _make_batcher_with_drand_check(
+        fixed_round=100, drand_round_backward_tolerance=3,
+    )
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 97  # current - 3
+    resp = b.accept_submission(req)
+    assert resp.accepted is True
+
+
+def test_drand_round_explicit_tolerance_three_rejects_four_behind():
+    """Tolerance = 3 still rejects four rounds behind — the gate is a
+    hard cliff at ``current - tolerance``, not a soft penalty."""
+    b = _make_batcher_with_drand_check(
+        fixed_round=100, drand_round_backward_tolerance=3,
+    )
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 96  # current - 4
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.STALE_ROUND
 
 
 def test_constructor_accepts_tokenizer():
