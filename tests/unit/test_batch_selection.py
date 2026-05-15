@@ -1,6 +1,5 @@
-"""Drand-anchored batch selection + emission distribution tests."""
+"""Drand-round-anchored batch selection + emission distribution tests."""
 
-from collections import defaultdict
 from dataclasses import dataclass
 
 from reliquary.validator.batch_selection import select_batch_and_distribute
@@ -11,226 +10,195 @@ from reliquary.validator.cooldown import CooldownMap
 class FakeSubmission:
     hotkey: str
     prompt_idx: int
+    drand_round: int
     merkle_root: bytes = b"\x00" * 32
 
 
-def _sub(hotkey, prompt_idx, merkle_root=None):
+def _sub(hotkey, prompt_idx, drand_round, merkle_root=None):
     return FakeSubmission(
         hotkey=hotkey,
         prompt_idx=prompt_idx,
+        drand_round=drand_round,
         merkle_root=merkle_root or hotkey.encode().ljust(32, b"\x00"),
     )
-
-
-def _by_prompt(subs):
-    out: dict[int, list] = defaultdict(list)
-    for s in subs:
-        out[s.prompt_idx].append(s)
-    return dict(out)
-
-
-SEED = b"\x42" * 32
-OTHER_SEED = b"\x99" * 32
 
 
 def test_empty_pool_returns_empty():
     cd = CooldownMap(cooldown_windows=50)
     batch, rewards = select_batch_and_distribute(
-        submissions_by_prompt={}, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
+        submissions=[], b=8, cooldown_map=cd, current_window=100,
     )
     assert batch == [] and rewards == {}
 
 
-def test_fills_up_to_b_distinct_prompts():
+def test_round_1_prompts_win_over_round_2():
+    """Earlier drand rounds fill the batch first — that's the whole point."""
     cd = CooldownMap(cooldown_windows=50)
-    subs = [_sub(f"hk{i}", prompt_idx=i) for i in range(12)]
+    subs = [
+        _sub("late_a", prompt_idx=1, drand_round=2),
+        _sub("late_b", prompt_idx=2, drand_round=2),
+        _sub("early_a", prompt_idx=3, drand_round=1),
+        _sub("early_b", prompt_idx=4, drand_round=1),
+    ]
     batch, rewards = select_batch_and_distribute(
-        submissions_by_prompt=_by_prompt(subs), b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100, pool=1.0,
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+    # All 4 fit (b=8, only 4 distinct (round, prompt)). Each is its own slot.
+    assert len(batch) == 4
+    assert all(abs(rewards[hk] - 1/8) < 1e-9 for hk in rewards)
+    # Burned pool = 4 unfilled slots × 1/8 = 0.5. Distributed = 0.5.
+    assert abs(sum(rewards.values()) - 0.5) < 1e-9
+
+
+def test_fills_8_slots_chronologically():
+    """Two rounds, 10 distinct prompts. First 8 by round order fill the batch."""
+    cd = CooldownMap(cooldown_windows=50)
+    subs = []
+    # Round 1: prompts 0-4 (5 slots)
+    for p in range(5):
+        subs.append(_sub(f"r1_p{p}", prompt_idx=p, drand_round=1))
+    # Round 2: prompts 5-9 (5 slots, only first 3 should fit)
+    for p in range(5, 10):
+        subs.append(_sub(f"r2_p{p}", prompt_idx=p, drand_round=2))
+    batch, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
     )
     assert len(batch) == 8
-    # Each unique prompt has 1 miner → each miner gets 1/8.
+    # All round 1 prompts must win.
+    batched_prompts = {s.prompt_idx for s in batch}
+    assert {0, 1, 2, 3, 4}.issubset(batched_prompts)
+    # Pool sums to 8 × 1/8 = 1.0 (full pool used).
     assert abs(sum(rewards.values()) - 1.0) < 1e-9
-    assert all(abs(v - 1/8) < 1e-9 for v in rewards.values())
 
 
-def test_ordering_is_independent_of_arrival():
-    """Two different insertion orders into submissions_by_prompt produce
-    the same winning prompts (latency-independent ordering)."""
+def test_within_slot_split_K_miners():
+    """K miners on the same (round, prompt) split that slot's share."""
     cd = CooldownMap(cooldown_windows=50)
-    prompts = list(range(20))
-    subs = [_sub(f"hk{p}", prompt_idx=p) for p in prompts]
-
-    by_prompt_a = _by_prompt(subs)
-    by_prompt_b = _by_prompt(list(reversed(subs)))
-
-    batch_a, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt_a, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
+    subs = [
+        _sub("alice", prompt_idx=42, drand_round=1),
+        _sub("bob", prompt_idx=42, drand_round=1),
+        _sub("carol", prompt_idx=42, drand_round=1),
+        _sub("dave", prompt_idx=7, drand_round=1),
+    ]
+    batch, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
     )
-    batch_b, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt_b, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
-    )
-    assert {s.prompt_idx for s in batch_a} == {s.prompt_idx for s in batch_b}
+    # 2 distinct (round, prompt) slots, each worth 1/8.
+    assert len(batch) == 2
+    # Prompt 42 slot: 3 miners split 1/8 → 1/24 each.
+    assert abs(rewards["alice"] - 1/24) < 1e-9
+    assert abs(rewards["bob"] - 1/24) < 1e-9
+    assert abs(rewards["carol"] - 1/24) < 1e-9
+    # Prompt 7 slot: 1 miner takes 1/8.
+    assert abs(rewards["dave"] - 1/8) < 1e-9
 
 
-def test_ordering_changes_with_seed():
-    """Different drand seeds produce different winning sets (in general)."""
+def test_same_prompt_different_rounds_first_wins():
+    """When the same prompt appears in multiple rounds, only the earliest
+    round's slot is claimed; later rounds' submissions earn nothing."""
     cd = CooldownMap(cooldown_windows=50)
-    subs = [_sub(f"hk{p}", prompt_idx=p) for p in range(20)]
-    by_prompt = _by_prompt(subs)
-
-    batch_a, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
+    subs = [
+        _sub("early", prompt_idx=42, drand_round=1),
+        _sub("late", prompt_idx=42, drand_round=2),
+    ]
+    batch, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
     )
-    batch_b, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt, b=8, ordering_seed=OTHER_SEED,
-        cooldown_map=cd, current_window=100,
-    )
-    # With 20 prompts and a different seed, the top 8 must differ for at
-    # least one element with overwhelming probability under SHA256.
-    assert {s.prompt_idx for s in batch_a} != {s.prompt_idx for s in batch_b}
+    assert len(batch) == 1
+    assert batch[0].hotkey == "early"
+    assert "late" not in rewards
+    assert abs(rewards["early"] - 1/8) < 1e-9
 
 
-def test_cooldown_excludes_prompt_from_winners():
+def test_cooldown_excludes_prompt():
     cd = CooldownMap(cooldown_windows=50)
     cd.record_batched(prompt_idx=42, window=100)
-    subs = [_sub("hk", prompt_idx=42), _sub("hk2", prompt_idx=7)]
+    subs = [
+        _sub("a", prompt_idx=42, drand_round=1),  # cooldown'd
+        _sub("b", prompt_idx=7, drand_round=1),
+    ]
     batch, rewards = select_batch_and_distribute(
-        submissions_by_prompt=_by_prompt(subs), b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=110,
+        submissions=subs, b=8, cooldown_map=cd, current_window=110, pool=1.0,
     )
     assert [s.prompt_idx for s in batch] == [7]
-    assert set(rewards) == {"hk2"} and abs(rewards["hk2"] - 1.0) < 1e-9
+    assert "a" not in rewards
+    assert abs(rewards["b"] - 1/8) < 1e-9
 
 
 def test_cooldown_not_mutated_by_select():
     cd = CooldownMap(cooldown_windows=50)
-    subs = [_sub("hk", prompt_idx=42)]
+    subs = [_sub("hk", prompt_idx=42, drand_round=1)]
     select_batch_and_distribute(
-        submissions_by_prompt=_by_prompt(subs), b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
+        submissions=subs, b=8, cooldown_map=cd, current_window=100,
     )
     assert cd.is_in_cooldown(42, 100) is False
 
 
-def test_partial_fill_when_all_cooldown_blocked():
+def test_unfilled_slots_burn_share():
+    """If only 5 slots fill, pool * 5/8 is distributed, 3/8 is burned."""
     cd = CooldownMap(cooldown_windows=50)
-    for idx in (1, 2, 3):
-        cd.record_batched(idx, window=100)
-    subs = [_sub(f"hk{i}", prompt_idx=i) for i in (1, 2, 3)]
+    subs = [_sub(f"hk{i}", prompt_idx=i, drand_round=1) for i in range(5)]
     batch, rewards = select_batch_and_distribute(
-        submissions_by_prompt=_by_prompt(subs), b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=110,
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
     )
-    assert batch == [] and rewards == {}
+    assert len(batch) == 5
+    total = sum(rewards.values())
+    assert abs(total - 5/8) < 1e-9
 
 
-def test_multi_miner_per_prompt_splits_slot():
-    """K miners on the same winning prompt each get slot_share / K."""
+def test_sybil_neutral_on_same_round_same_prompt():
+    """N sybils on the same (round, prompt) earn the same total as 1 hotkey."""
     cd = CooldownMap(cooldown_windows=50)
-    subs = [
-        _sub("alice", prompt_idx=1),
-        _sub("bob", prompt_idx=1),
-        _sub("carol", prompt_idx=1),
-        _sub("dave", prompt_idx=2),
+
+    # Case A: lone attacker.
+    lone = [
+        _sub("attacker", prompt_idx=42, drand_round=1),
+        _sub("honest", prompt_idx=7, drand_round=1),
     ]
-    batch, rewards = select_batch_and_distribute(
-        submissions_by_prompt=_by_prompt(subs), b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100, pool=1.0,
-    )
-    # Two winning prompts, slot_share = 0.5 each.
-    # Prompt 1: 3 miners → 0.5/3 = 1/6 each.
-    # Prompt 2: 1 miner → 0.5.
-    assert abs(rewards["alice"] - 1/6) < 1e-9
-    assert abs(rewards["bob"] - 1/6) < 1e-9
-    assert abs(rewards["carol"] - 1/6) < 1e-9
-    assert abs(rewards["dave"] - 0.5) < 1e-9
-    # Training picks one submission per winning prompt.
-    assert len(batch) == 2
-
-
-def test_sybil_neutral_on_same_prompt():
-    """Total attacker payout when N sybils target the same prompt equals
-    the payout of a single hotkey winning that prompt alone."""
-    cd = CooldownMap(cooldown_windows=50)
-
-    # Case A: lone attacker on prompt 1, honest miner on prompt 2.
-    lone = [_sub("attacker", prompt_idx=1), _sub("honest", prompt_idx=2)]
     _, rewards_a = select_batch_and_distribute(
-        submissions_by_prompt=_by_prompt(lone), b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100, pool=1.0,
+        submissions=lone, b=8, cooldown_map=cd, current_window=100, pool=1.0,
     )
 
-    # Case B: 5 attacker sybils on prompt 1, honest miner on prompt 2.
-    sybils = [_sub(f"sybil{i}", prompt_idx=1) for i in range(5)]
-    sybils.append(_sub("honest", prompt_idx=2))
+    # Case B: 5 sybils on the same prompt-round.
+    sybils = [
+        _sub(f"sybil{i}", prompt_idx=42, drand_round=1) for i in range(5)
+    ]
+    sybils.append(_sub("honest", prompt_idx=7, drand_round=1))
     _, rewards_b = select_batch_and_distribute(
-        submissions_by_prompt=_by_prompt(sybils), b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100, pool=1.0,
+        submissions=sybils, b=8, cooldown_map=cd, current_window=100, pool=1.0,
     )
 
     attacker_a = rewards_a["attacker"]
     attacker_b_total = sum(v for k, v in rewards_b.items() if k.startswith("sybil"))
     assert abs(attacker_a - attacker_b_total) < 1e-9
-
-    # And the honest miner is unaffected by the sybil flood on the other prompt.
+    # The honest miner on a different prompt is unaffected.
     assert abs(rewards_a["honest"] - rewards_b["honest"]) < 1e-9
 
 
-def test_training_pick_deterministic_per_seed():
-    """Same seed + same submissions → same training picks across calls."""
+def test_canonical_representative_deterministic_across_input_order():
+    """Validators with different network-arrival orders pick the same
+    representative submission for each (round, prompt) slot."""
     cd = CooldownMap(cooldown_windows=50)
-    subs = [_sub(f"hk{i}", prompt_idx=1) for i in range(5)]
-    by_prompt = _by_prompt(subs)
-
-    batch_1, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
-    )
-    batch_2, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
-    )
-    assert [s.hotkey for s in batch_1] == [s.hotkey for s in batch_2]
-
-
-def test_training_pick_canonical_across_input_order():
-    """Same seed + same submissions in DIFFERENT in-memory order → same pick.
-    Required for multi-validator consensus where _valid order differs."""
-    cd = CooldownMap(cooldown_windows=50)
-    subs = [_sub(f"hk{i}", prompt_idx=1) for i in range(5)]
-
-    by_prompt_a = {1: list(subs)}
-    by_prompt_b = {1: list(reversed(subs))}
+    subs = [_sub(f"hk{i}", prompt_idx=1, drand_round=1) for i in range(5)]
 
     batch_a, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt_a, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
+        submissions=list(subs), b=8, cooldown_map=cd, current_window=100,
     )
     batch_b, _ = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt_b, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100,
+        submissions=list(reversed(subs)), b=8, cooldown_map=cd, current_window=100,
     )
     assert [s.hotkey for s in batch_a] == [s.hotkey for s in batch_b]
 
 
 def test_pool_scaling():
-    """Pool scales rewards linearly."""
     cd = CooldownMap(cooldown_windows=50)
-    subs = [_sub(f"hk{i}", prompt_idx=i) for i in range(4)]
-    by_prompt = _by_prompt(subs)
+    subs = [_sub(f"hk{i}", prompt_idx=i, drand_round=1) for i in range(4)]
 
     _, rewards_1 = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100, pool=1.0,
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
     )
     _, rewards_100 = select_batch_and_distribute(
-        submissions_by_prompt=by_prompt, b=8, ordering_seed=SEED,
-        cooldown_map=cd, current_window=100, pool=100.0,
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=100.0,
     )
     for hk in rewards_1:
         assert abs(rewards_100[hk] - rewards_1[hk] * 100.0) < 1e-7

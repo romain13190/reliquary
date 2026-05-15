@@ -95,6 +95,8 @@ def _make_batcher(window, cooldown):
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
         completion_text_fn=lambda r: "WIN" if r.reward > 0.5 else "",
+        # Smoke tests don't drive wall clock; disable the drand timing gate.
+        drand_round_check_enabled=False,
     )
 
 

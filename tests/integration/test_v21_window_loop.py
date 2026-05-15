@@ -156,6 +156,9 @@ def _patch_open_grpo_window(svc):
             verify_signature_fn=lambda c, h: True,
             # Decode via reward: FakeEnv.compute_reward returns 1.0 for "WIN".
             completion_text_fn=lambda rollout: "WIN" if rollout.reward > 0.5 else "",
+            # Integration tests don't drive wall clock; disable the drand
+            # timing gate so submissions with drand_round=0 still accept.
+            drand_round_check_enabled=False,
         )
 
     return patch.object(svc_mod, "open_grpo_window", side_effect=_mock_open)
@@ -219,6 +222,7 @@ async def test_open_window_passes_verify_model_to_batcher(monkeypatch):
             verify_commitment_proofs_fn=_always_true_proof,
             verify_signature_fn=lambda c, h: True,
             completion_text_fn=lambda r: "",
+            drand_round_check_enabled=False,
         )
 
     with patch.object(svc_mod, "open_grpo_window", side_effect=_capture_open):

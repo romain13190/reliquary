@@ -6,7 +6,7 @@ import logging
 import os
 from typing import Any
 
-from reliquary.constants import BLOCK_TIME_SECONDS, WINDOW_LENGTH
+from reliquary.constants import BLOCK_TIME_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -185,26 +185,15 @@ def compute_window_randomness(
     return block_hash.replace("0x", "")
 
 
-def compute_drand_round_for_ordering(
-    window_start_block: int,
-    genesis_time: int,
-    period: int,
-    window_length_blocks: int = WINDOW_LENGTH,
-    margin_seconds: int = 1,
+def compute_current_drand_round(
+    timestamp_seconds: float, genesis_time: int, period: int,
 ) -> int:
-    """Drand round whose σ_R publishes AFTER the window's nominal close.
+    """Drand round currently in progress at the given UNIX timestamp.
 
-    Used by the validator at seal time to seed batch ordering and emission
-    split. Because round_time(R) > window_close + margin, σ_R is unknown
-    to miners during the submission window — making the ordering uncheatable.
-
-    Derived from chain timing (block * BLOCK_TIME_SECONDS) so all validators
-    sharing the same chain params agree on R without coordinating clocks.
+    Validator calls this at submit-receipt time with `time.time()` to
+    decide whether the round attached by the miner is in [current - 1,
+    current] — the acceptable jitter window for design A'.
     """
-    close_ts = (window_start_block + window_length_blocks) * BLOCK_TIME_SECONDS
-    target_ts = close_ts + margin_seconds
-    if target_ts < genesis_time:
+    if timestamp_seconds < genesis_time:
         return 1
-    # round R such that round_time(R) > target_ts. round_at_time returns
-    # the round in progress at t (round_time ≤ t), so +1 gives strictly future.
-    return 2 + (target_ts - genesis_time) // period
+    return 1 + int((timestamp_seconds - genesis_time) // period)

@@ -76,6 +76,9 @@ class ValidSubmission:
     # forensic analysis of who lied about their checkpoint.
     claimed_checkpoint_hash: str = ""
     rollout_hashes: list[bytes] = field(default_factory=list)
+    # v2.3: drand round attached by the miner at submit time. Determines
+    # the submission's chronological position at seal time.
+    drand_round: int = 0
 
     def __post_init__(self):
         self.merkle_root = self.merkle_root_bytes
@@ -123,6 +126,9 @@ class GrpoWindowBatcher:
         verify_commitment_proofs_fn: Callable[..., Any] | None = None,
         verify_signature_fn: Callable[[dict, str], bool] | None = None,
         time_fn: Callable[[], float] | None = None,
+        wall_clock_fn: Callable[[], float] | None = None,
+        drand_round_check_enabled: bool = True,
+        drand_chain_info: dict | None = None,
     ) -> None:
         import time
 
@@ -132,6 +138,14 @@ class GrpoWindowBatcher:
         self.tokenizer = tokenizer
         self.bootstrap = bootstrap
         self._completion_text = completion_text_fn
+        # Wall clock (UNIX seconds) used to compute the current drand round
+        # at submit-receipt time. Distinct from ``_time_fn`` (monotonic)
+        # which is used for response_time bookkeeping.
+        self._wall_clock = wall_clock_fn or time.time
+        self._drand_round_check_enabled = drand_round_check_enabled
+        # Lazy: fetched on first use if not injected (tests inject a fixed
+        # {"genesis_time", "period"} dict to avoid live HTTP calls).
+        self._drand_chain_info = drand_chain_info
         # Returns the canonical prompt tokens for a given prompt_idx — used to
         # bind the miner's claimed prompt_idx to the actual tokens they ran the
         # forward pass on. ``None`` disables the binding check (test convenience
@@ -242,6 +256,30 @@ class GrpoWindowBatcher:
         with self._lock:
             return self._accept_locked(request)
 
+    def _validate_drand_round(self, drand_round: int) -> RejectReason | None:
+        """Return the appropriate reject reason if ``drand_round`` is outside
+        ``[current_round - 1, current_round]``, else None.
+
+        ``current_round`` is derived from the validator's wall clock and the
+        cached drand chain params (genesis_time + period). Tolerance of one
+        round backward absorbs inter-continent network latency; attaching a
+        future round is rejected outright since the miner cannot legitimately
+        know σ_R for a round not yet published.
+        """
+        if self._drand_chain_info is None:
+            from reliquary.infrastructure.drand import get_current_chain
+            self._drand_chain_info = get_current_chain()
+        ci = self._drand_chain_info
+        from reliquary.infrastructure.chain import compute_current_drand_round
+        current = compute_current_drand_round(
+            self._wall_clock(), ci["genesis_time"], ci["period"],
+        )
+        if drand_round > current:
+            return RejectReason.FUTURE_ROUND
+        if drand_round < current - 1:
+            return RejectReason.STALE_ROUND
+        return None
+
     def _accept_locked(
         self, request: BatchSubmissionRequest
     ) -> BatchSubmissionResponse:
@@ -253,6 +291,16 @@ class GrpoWindowBatcher:
         # (pre-first-publish or test convenience).
         if self.current_checkpoint_hash and request.checkpoint_hash != self.current_checkpoint_hash:
             return self._reject(RejectReason.WRONG_CHECKPOINT, hotkey=hk, prompt_idx=pi)
+        # v2.3: drand round timing gate. The miner must attach the round
+        # currently in progress at submit time, with one round of tolerance
+        # backward for network jitter. Attaching an older round attempts
+        # to claim an earlier chronological slot than the submission
+        # actually earned; attaching a future round is impossible without
+        # having seen σ_R (so always rejected).
+        if self._drand_round_check_enabled:
+            round_check = self._validate_drand_round(request.drand_round)
+            if round_check is not None:
+                return self._reject(round_check, hotkey=hk, prompt_idx=pi)
         if request.prompt_idx >= len(self.env):
             return self._reject(RejectReason.BAD_PROMPT_IDX, hotkey=hk, prompt_idx=pi)
         if self._cooldown.is_in_cooldown(request.prompt_idx, self.window_start):
@@ -458,6 +506,7 @@ class GrpoWindowBatcher:
             dist_q10_min=dist_q10_min,
             claimed_checkpoint_hash=request.checkpoint_hash,
             rollout_hashes=rollout_hashes,
+            drand_round=request.drand_round,
         )
         self._valid.append(new_sub)
         self._submissions_per_prompt.setdefault(
@@ -521,26 +570,19 @@ class GrpoWindowBatcher:
             return list(self._valid)
 
     def seal_batch(
-        self, ordering_seed: bytes | None = None, pool: float = 1.0
+        self, pool: float = 1.0
     ) -> tuple[list[ValidSubmission], dict[str, float]]:
         """Pick the training batch and compute the reward distribution.
 
-        ``ordering_seed`` must be the drand-derived seed for the post-close
-        round (see ``compute_drand_round_for_ordering``). Defaults to a
-        zero-seed for tests that don't care about cross-validator
-        determinism; production callers always pass a real seed.
-
         Returns (training_batch, rewards_by_hotkey). Cooldown and hash-set
         bookkeeping is applied to every winning prompt — not just the one
-        submission picked for training — because all of them get emission
+        submission picked for training — because all of them earn emission
         and were therefore "used" by this window.
         """
         with self._lock:
-            seed = ordering_seed if ordering_seed is not None else b"\x00" * 32
             batch, rewards = select_batch_and_distribute(
-                submissions_by_prompt=self._submissions_per_prompt,
+                submissions=self._valid,
                 b=B_BATCH,
-                ordering_seed=seed,
                 cooldown_map=self._cooldown,
                 current_window=self.window_start,
                 pool=pool,

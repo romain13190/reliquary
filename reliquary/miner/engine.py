@@ -136,6 +136,21 @@ def _compute_merkle_root(rollouts) -> str:
     return leaves[0].hex()
 
 
+def _current_drand_round_at_send() -> int:
+    """Drand quicknet round currently in progress at wall-clock now.
+
+    Called just before POSTing /submit so the attached round matches what
+    the validator sees at receipt (modulo the 1-round tolerance). Uses
+    chain params cached at process start; one drand period of skew is
+    tolerated by the validator.
+    """
+    from reliquary.infrastructure.chain import compute_current_drand_round
+    from reliquary.infrastructure.drand import get_current_chain
+
+    ci = get_current_chain()
+    return compute_current_drand_round(time.time(), ci["genesis_time"], ci["period"])
+
+
 class MiningEngine:
     """Two-GPU mining: vLLM (GPU 0) for generation, HF (GPU 1) for proofs."""
 
@@ -264,6 +279,11 @@ class MiningEngine:
                 ]
                 merkle_root = _compute_merkle_root(rollout_submissions)
 
+                # v2.3 design A': fetch the drand round just before the POST.
+                # The attached round determines the submission's chronological
+                # slot at seal time. Miss this and the validator rejects with
+                # STALE_ROUND or FUTURE_ROUND.
+                current_round = _current_drand_round_at_send()
                 request = BatchSubmissionRequest(
                     miner_hotkey=self.wallet.hotkey.ss58_address,
                     prompt_idx=prompt_idx,
@@ -271,6 +291,7 @@ class MiningEngine:
                     merkle_root=merkle_root,
                     rollouts=rollout_submissions,
                     checkpoint_hash=local_hash,
+                    drand_round=current_round,
                 )
                 try:
                     resp = await submit_batch_v2(url, request, client=client)
@@ -428,8 +449,13 @@ class MiningEngine:
     async def _compute_randomness(
         self, subtensor, window_start: int, use_drand: bool
     ) -> str:
-        """Derive window randomness from block hash (+ optional drand beacon)."""
-        block_hash = await chain.get_block_hash(subtensor, window_start)
+        """Derive window randomness from the drand beacon (v2.3+: drand-only).
+
+        Matches the validator's ``service._derive_randomness``: block_hash is
+        no longer mixed in, so the miner does not need a substrate roundtrip
+        for the GRAIL seed. The legacy ``use_drand=False`` path remains for
+        offline tests and uses block_hash as a single-source seed.
+        """
         if use_drand:
             from reliquary.infrastructure.drand import get_beacon, get_current_chain
 
@@ -439,8 +465,9 @@ class MiningEngine:
             )
             beacon = get_beacon(round_id=str(drand_round), use_drand=True)
             return chain.compute_window_randomness(
-                block_hash, beacon["randomness"], drand_round=beacon["round"]
+                None, beacon["randomness"], drand_round=beacon["round"]
             )
+        block_hash = await chain.get_block_hash(subtensor, window_start)
         return chain.compute_window_randomness(block_hash)
 
     def _build_grail_commit(self, generation: dict, randomness: str) -> dict:

@@ -61,6 +61,8 @@ class RejectReason(str, Enum):
     BAD_TOKENS = "bad_tokens"
     BAD_TERMINATION = "bad_termination"
     WRONG_CHECKPOINT = "wrong_checkpoint"
+    STALE_ROUND = "stale_round"
+    FUTURE_ROUND = "future_round"
 
 
 class WindowState(str, Enum):
@@ -96,6 +98,14 @@ class BatchSubmissionRequest(BaseModel):
     # publishes its first checkpoint (checkpoint_n=0, revision=None) miners
     # have no hash to cite. The batcher disables the gate in that case.
     checkpoint_hash: str = Field(..., min_length=0)
+    # v2.3: drand quicknet round in progress when the miner sent the
+    # submission. Validator rejects if this is not in
+    # [current_round_at_receipt - 1, current_round_at_receipt]. The
+    # accepted round bucket determines the submission's chronological
+    # position at seal time. Default 0 = pre-v2.3 sentinel; the batcher
+    # rejects 0 as STALE_ROUND in production but tests can still
+    # construct legacy requests for the cooldown / cheap-check paths.
+    drand_round: int = Field(default=0, ge=0)
 
     @field_validator("rollouts")
     @classmethod

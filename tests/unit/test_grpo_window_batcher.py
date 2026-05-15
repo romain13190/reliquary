@@ -129,6 +129,11 @@ def _make_batcher(**overrides) -> GrpoWindowBatcher:
             "CORRECT" if rollout.reward > 0.5 else "wrong"
         ),
         hash_set=None,
+        # The vast majority of legacy tests construct requests without an
+        # attached drand_round (default 0). Disable the check by default
+        # in the test helper; tests that exercise the drand timing gate
+        # explicitly override `drand_round_check_enabled=True`.
+        drand_round_check_enabled=False,
     )
     kwargs.update(overrides)
     return GrpoWindowBatcher(**kwargs)
@@ -219,19 +224,25 @@ def test_seal_batch_empty_pool_returns_empty():
     assert batch == [] and rewards == {}
 
 
-def test_seal_batch_drand_ordered_deterministic():
-    """v2.3: ordering is by drand-seeded hash, not TCP arrival. Two
-    identical states + same seed must produce the same batch."""
-    b1 = _make_batcher()
-    b2 = _make_batcher()
-    for i in range(B_BATCH):
-        b1.accept_submission(_request(prompt_idx=i, hotkey=f"hk{i}"))
-        b2.accept_submission(_request(prompt_idx=i, hotkey=f"hk{i}"))
-    seed = b"\xab" * 32
-    batch1, _ = b1.seal_batch(ordering_seed=seed)
-    batch2, _ = b2.seal_batch(ordering_seed=seed)
-    assert len(batch1) == B_BATCH
-    assert [s.prompt_idx for s in batch1] == [s.prompt_idx for s in batch2]
+def test_seal_batch_chronological_by_drand_round():
+    """v2.3 (design A'): submissions in earlier drand rounds fill the batch
+    first, regardless of TCP arrival order."""
+    b = _make_batcher()
+    # Both submissions accepted; round 1 must come out first at seal time
+    # even though round 2 arrived first (insertion order below).
+    req_late = _request(prompt_idx=42, hotkey="late")
+    req_early = _request(prompt_idx=7, hotkey="early")
+    assert b.accept_submission(req_late).accepted
+    assert b.accept_submission(req_early).accepted
+    # Stamp the rounds after acceptance (the test helper accepts with the
+    # check disabled, so drand_round on the request defaults to 0; we set
+    # them here to drive the seal-time ordering deterministically).
+    b._valid[0].drand_round = 2  # late: round 2
+    b._valid[1].drand_round = 1  # early: round 1
+    batch, _ = b.seal_batch()
+    assert len(batch) == 2
+    assert batch[0].hotkey == "early"
+    assert batch[1].hotkey == "late"
 
 
 def test_seal_batch_cooldown_recorded():
@@ -241,8 +252,8 @@ def test_seal_batch_cooldown_recorded():
     batch, rewards = b.seal_batch()
     assert len(batch) == 1
     assert b._cooldown.is_in_cooldown(42, b.window_start + 1) is True
-    # Default pool=1.0, single winning prompt with 1 miner → reward = 1.0.
-    assert abs(rewards["hk"] - 1.0) < 1e-9
+    # Each slot pays pool / B_BATCH. One slot filled, K_p=1 → 1/8.
+    assert abs(rewards["hk"] - 1 / B_BATCH) < 1e-9
 
 
 def test_sealed_batch_respects_cooldown_from_previous_window():
@@ -279,11 +290,11 @@ def test_distinct_prompts_in_batch_only():
     batch, rewards = b.seal_batch()
     assert len(batch) == 2
     assert {s.prompt_idx for s in batch} == {42, 7}
-    # All three miners earn emission (prompt 42 has 2 miners splitting 0.5,
-    # prompt 7 has 1 miner taking 0.5).
-    assert abs(rewards["alice"] - 0.25) < 1e-9
-    assert abs(rewards["bob"] - 0.25) < 1e-9
-    assert abs(rewards["carol"] - 0.5) < 1e-9
+    # Each slot pays pool / B_BATCH = 1/8. Prompt 42 has 2 miners
+    # splitting 1/8 → 1/16 each. Prompt 7 has 1 miner taking 1/8.
+    assert abs(rewards["alice"] - 1 / 16) < 1e-9
+    assert abs(rewards["bob"] - 1 / 16) < 1e-9
+    assert abs(rewards["carol"] - 1 / 8) < 1e-9
 
 
 # --- v2.1 seal_event + checkpoint_hash gating ---
@@ -571,6 +582,58 @@ def test_failed_submission_does_not_consume_bucket_slot():
     ))
     assert r2.accepted is True
     assert len(b._submissions_per_prompt[42]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Drand-round timing gate (v2.3 design A')
+# ---------------------------------------------------------------------------
+
+def _make_batcher_with_drand_check(*, fixed_round: int = 100, **overrides):
+    """Helper: batcher with the drand timing gate ENABLED and a stable
+    chain info so we can reason about exact round numbers in tests."""
+    # Pin wall clock so current_round = fixed_round.
+    # genesis_time=1000, period=3 → current_round at wall_clock = 1000 +
+    # (fixed_round - 1) * 3 = 1000 + (fixed_round - 1) * 3.
+    wall = 1000 + (fixed_round - 1) * 3 + 1.0  # +1s into the round
+    overrides.setdefault("drand_round_check_enabled", True)
+    overrides.setdefault("wall_clock_fn", lambda: wall)
+    overrides.setdefault(
+        "drand_chain_info", {"genesis_time": 1000, "period": 3},
+    )
+    return _make_batcher(**overrides)
+
+
+def test_drand_round_current_accepted():
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 100
+    assert b.accept_submission(req).accepted is True
+
+
+def test_drand_round_one_behind_accepted():
+    """Tolerance of one round backward for network jitter."""
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 99
+    assert b.accept_submission(req).accepted is True
+
+
+def test_drand_round_two_behind_stale():
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 98
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.STALE_ROUND
+
+
+def test_drand_round_future_rejected():
+    b = _make_batcher_with_drand_check(fixed_round=100)
+    req = _request_v21(prompt_idx=42, hotkey="A", checkpoint_hash="")
+    req.drand_round = 101
+    resp = b.accept_submission(req)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.FUTURE_ROUND
 
 
 def test_constructor_accepts_tokenizer():
