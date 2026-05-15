@@ -83,6 +83,12 @@ def _batcher(window_start: int = 500) -> GrpoWindowBatcher:
         verify_commitment_proofs_fn=_always_true_proof,
         verify_signature_fn=lambda c, h: True,
         completion_text_fn=lambda r: "CORRECT" if r.reward > 0.5 else "wrong",
+        # v2.3: requests in this suite default to ``drand_round=0`` (the
+        # legacy/sentinel value). The drand-round timing gate would reject
+        # them all as STALE_ROUND before the rest of the pipeline ever
+        # runs, hiding what these tests actually exercise. Disable here;
+        # the gate is independently covered by test_grpo_window_batcher.
+        drand_round_check_enabled=False,
     )
     b.current_checkpoint_hash = "sha256:test"
     b.randomness = "cd" * 16  # match _make_commit's beacon

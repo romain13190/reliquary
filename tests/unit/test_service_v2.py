@@ -202,10 +202,17 @@ def test_service_constructs_hash_set_with_dedup_retention():
     )
     assert isinstance(svc._hash_set, RolloutHashSet)
     assert svc._hash_set._retention_windows == HASH_DEDUP_RETENTION_WINDOWS
-    # Sanity: hash retention strictly exceeds cooldown — that is the whole
-    # point of the decoupling (cooldown lets prompts come back, hash blocks
-    # the specific rollout tokens for a longer horizon).
-    assert HASH_DEDUP_RETENTION_WINDOWS > BATCH_PROMPT_COOLDOWN_WINDOWS
+    # v2.3+: with ``BATCH_PROMPT_COOLDOWN_WINDOWS`` bumped to 1_000_000
+    # (one-shot prompts on the 14M-prompt OpenMathInstruct env), cooldown
+    # is now effectively unbounded for the lifetime of a training run.
+    # The pre-v2.3 invariant "hash retention > cooldown" no longer holds
+    # by design — a prompt that won a slot will never come back within
+    # cooldown, so the hash horizon doesn't need to outlive cooldown.
+    # What MUST still hold: hash retention is positive and finite, so the
+    # in-memory hash set doesn't grow without bound (R2 archive replay
+    # bounds it to HASH_DEDUP_RETENTION_WINDOWS recent windows).
+    assert HASH_DEDUP_RETENTION_WINDOWS > 0
+    assert HASH_DEDUP_RETENTION_WINDOWS < 1_000_000_000
 
 
 @pytest.mark.asyncio
