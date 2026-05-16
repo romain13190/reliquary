@@ -232,34 +232,43 @@ MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
 MAX_SUBMISSIONS_PER_PROMPT = 10
 
 # How many drand-quicknet rounds backward of the validator's current round
-# the batcher accepts on the ``drand_round`` field. Default = 1 (3 s):
-# enough to absorb the one residual case after the arrival-time
-# refactor — a miner firing at t=2.9 s of round R lands at the
-# validator at t=3.0 s of round R+1 because of the network RTT crossing
-# the drand boundary. The miner attached R, the validator's middleware
-# stamps t_arrival in R+1, mismatch by exactly 1.
+# the batcher accepts on the ``drand_round`` field. Default = 0: strict
+# equality. The miner must attach the drand round currently in progress
+# at HTTP arrival.
 #
-# Why this used to be 10
-# ----------------------
-# Before the arrival-time refactor (commits 6ff21d0 + f157002), the
-# drand check ran TWICE: once on HTTP arrival, once on worker dequeue.
-# The worker re-check used ``time.time()`` at dequeue, which on a
-# saturated GRAIL queue could be minutes after arrival. The wide
-# tolerance of 10 (30 s) was set to absorb that worker-side lag.
+# Why zero is safe now
+# --------------------
+# The two reasons the tolerance was widened in earlier iterations are
+# both eliminated by the v2.3 fixes on this branch:
 #
-# Now the worker doesn't re-check. ``server.py``'s cheap-reject is the
-# single drand site and uses the middleware-stamped ``t_arrival``, so
-# the only residual mismatch is the genuine network-RTT boundary
-# crossing — a 1-round window covers it. Operators can override via the
-# ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var if their cross-continent
-# RTT profile justifies a wider band (e.g. validators in EU serving
-# miners in AU may want 2-3); tests pin specific values explicitly via
+#   * Worker-side dequeue lag (PR #31 → tol=10). The seal/drand re-check
+#     used to run on the worker, minutes after arrival under GRAIL queue
+#     backpressure. Removed by the arrival-time refactor — drand is now
+#     checked only once at HTTP arrival, against the middleware-stamped
+#     ``t_arrival``.
+#   * RTT boundary crossing (commit 8b7f483 → tol=1). A miner firing at
+#     t=2.99 s of round R would land at the validator at t=3.00 s of
+#     R+1. Honest miners on this branch use
+#     ``RELIQUARY_DRAND_BOUNDARY_SAFETY_S = 0.5`` (miner-priv default)
+#     which makes the miner sleep past the boundary if its corrected
+#     clock is within 500 ms of one. With both sides NTP-synced and the
+#     miner respecting the safety window, no honest submission should
+#     land in the wrong drand round.
+#
+# Anything > 0 here opens an antedating window: an attacker could claim
+# a slightly-earlier chronological tier than they actually earned. With
+# zero, the only path to a slot is to actually be there in time —
+# matches the original v2.3 design intent. Operators can re-widen via
+# the ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var if their cross-continent
+# RTT profile justifies it (e.g. validators in EU serving miners in AU
+# may need 1-2 to absorb 100-300 ms RTT spillover around a boundary).
+# Tests pin specific values explicitly via
 # ``GrpoWindowBatcher(drand_round_backward_tolerance=...)``.
 #
 # Forward direction stays zero (FUTURE_ROUND is unrecoverable: a miner
 # that attaches round R+1 hasn't seen σ_{R+1} yet, so they're cheating).
 DRAND_ROUND_BACKWARD_TOLERANCE = int(
-    _os.environ.get("DRAND_ROUND_BACKWARD_TOLERANCE", "1")
+    _os.environ.get("DRAND_ROUND_BACKWARD_TOLERANCE", "0")
 )
 
 # Bootstrap phase: first BOOTSTRAP_WINDOWS of a new subnet/checkpoint use

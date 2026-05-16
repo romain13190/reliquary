@@ -624,25 +624,17 @@ def test_drand_round_current_accepted():
     assert b.validate_drand_round(100) is None
 
 
-def test_drand_round_one_behind_accepted_with_default_tolerance():
-    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 1`` covers the one
-    residual case after the arrival-time refactor: a miner firing near
-    the end of round R lands at the validator just past the R→R+1
-    boundary because of network RTT. ``drand_round = current - 1`` is
-    exactly that case and MUST be accepted.
+def test_drand_round_one_behind_stale_under_default_tolerance():
+    """Default ``DRAND_ROUND_BACKWARD_TOLERANCE = 0`` is strict equality:
+    a miner whose attached round is even one behind the validator's
+    current is STALE_ROUND. Honest miners use the miner-side boundary-
+    safety check (``RELIQUARY_DRAND_BOUNDARY_SAFETY_S``) to ensure they
+    don't fire right on a drand-round boundary, so RTT can't push them
+    across. Anything one behind at the validator is either a clock-lag
+    miner or an antedating attempt.
     """
     b = _make_batcher_with_drand_check(fixed_round=100)
-    assert b.validate_drand_round(99) is None
-
-
-def test_drand_round_two_behind_stale_under_default_tolerance():
-    """Tolerance = 1 means [current - 1, current] is accepted. Round =
-    current - 2 is outside that window and MUST be STALE_ROUND — the
-    gate is a hard cliff. Anything older than one round is either a
-    miner mis-timing (their clock is way off) or a genuine antedating
-    attempt, neither of which the protocol should absorb."""
-    b = _make_batcher_with_drand_check(fixed_round=100)
-    assert b.validate_drand_round(98) == RejectReason.STALE_ROUND  # current-2
+    assert b.validate_drand_round(99) == RejectReason.STALE_ROUND
 
 
 def test_drand_round_future_rejected():
@@ -653,30 +645,44 @@ def test_drand_round_future_rejected():
 
 
 def test_drand_round_zero_tolerance_one_behind_stale():
-    """Explicit ``drand_round_backward_tolerance = 0`` restores the
-    original v2.3 zero-tolerance spec. One round behind is STALE."""
+    """Explicit ``drand_round_backward_tolerance = 0`` matches the
+    default — one round behind is STALE. Kept as an explicit pin for
+    readability (so a future widening of the default doesn't silently
+    break the zero-tolerance contract callers rely on)."""
     b = _make_batcher_with_drand_check(
         fixed_round=100, drand_round_backward_tolerance=0,
     )
     assert b.validate_drand_round(99) == RejectReason.STALE_ROUND
 
 
-def test_drand_round_default_backward_tolerance_is_one():
+def test_drand_round_explicit_tolerance_one_allows_one_behind():
+    """Operators with cross-continent RTT profiles can override the
+    tolerance via the env var or per-batcher kwarg. Pin that an
+    explicit ``tolerance = 1`` accepts the previous-round case so
+    operators have a documented escape hatch."""
+    b = _make_batcher_with_drand_check(
+        fixed_round=100, drand_round_backward_tolerance=1,
+    )
+    assert b.validate_drand_round(99) is None  # within explicit tol=1
+
+
+def test_drand_round_default_backward_tolerance_is_zero():
     """Pin the default. Changing this in constants is a deliberate
     protocol-tuning decision, not an incidental refactor — make any
     drift loud.
 
-    History: bumped 1 → 10 by PR #31 to absorb worker-side dequeue lag
-    when ``_accept_locked`` re-validated drand_round against
-    ``time.time()`` at dequeue (which could be minutes after arrival
-    under GRAIL queue backpressure). The arrival-time refactor + the
-    worker-side check removal (commits 6ff21d0 + f157002) eliminated
-    that source of lag entirely, so the wide tolerance was no longer
-    paying for itself. Tightening back to 1 restores meaningful
-    chronological ordering (3 s antedate cap vs the 30 s under
-    tolerance 10). Operators can re-widen via the
-    ``DRAND_ROUND_BACKWARD_TOLERANCE`` env var if their cross-continent
-    RTT profile demands it.
+    History:
+      * v2.3 original spec: 0 (strict equality).
+      * commit 8b7f483: 1 (absorb RTT boundary crossing).
+      * PR #31 (1f5d4e7): 10 (absorb worker-side dequeue lag during
+        GRAIL queue backpressure).
+      * commit 62cbf3f: 1 (worker re-check removed, only RTT remains).
+      * This commit: 0 (arrival-time stamping + seal extension + drain
+        wait + miner-side boundary safety eliminate the remaining
+        legitimate sources of STALE for honest miners).
+
+    Operators can re-widen via the ``DRAND_ROUND_BACKWARD_TOLERANCE``
+    env var if their cross-continent RTT profile demands it.
     """
     import os
     # Pin the *unset* default — env-var override would skew the test.
@@ -685,7 +691,7 @@ def test_drand_round_default_backward_tolerance_is_one():
         import importlib
         import reliquary.constants
         importlib.reload(reliquary.constants)
-        assert reliquary.constants.DRAND_ROUND_BACKWARD_TOLERANCE == 1
+        assert reliquary.constants.DRAND_ROUND_BACKWARD_TOLERANCE == 0
     finally:
         if prior is not None:
             os.environ["DRAND_ROUND_BACKWARD_TOLERANCE"] = prior
