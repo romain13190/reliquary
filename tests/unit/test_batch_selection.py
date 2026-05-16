@@ -202,3 +202,219 @@ def test_pool_scaling():
     )
     for hk in rewards_1:
         assert abs(rewards_100[hk] - rewards_1[hk] * 100.0) < 1e-7
+
+
+# ---------------------------------------------------------------------------
+# Boundary-round fair split
+# ---------------------------------------------------------------------------
+
+def test_boundary_round_fair_split_distinct_prompts():
+    """One slot left at the boundary, 10 miners on 10 different prompts in
+    that round. Old algorithm gave the slot to ONE prompt by canonical hash;
+    the other 9 miners earned zero despite arriving in the same drand bucket.
+    New behaviour: per_prompt = 1 × slot_share / 10 = slot_share/10, each
+    miner gets slot_share/10 (K=1). Total paid in boundary round = slot_share.
+    """
+    cd = CooldownMap(cooldown_windows=50)
+    subs = []
+    # Round 1: 7 prompts, all win full slots → 7 slots consumed, 1 left.
+    for p in range(7):
+        subs.append(_sub(f"r1_p{p}", prompt_idx=p, drand_round=1))
+    # Round 2 is the boundary: 10 miners on 10 distinct prompts.
+    for p in range(10, 20):
+        subs.append(_sub(f"r2_p{p}", prompt_idx=p, drand_round=2))
+
+    batch, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+
+    slot_share = 1.0 / 8
+    # Each round-1 miner: full slot share.
+    for p in range(7):
+        assert abs(rewards[f"r1_p{p}"] - slot_share) < 1e-9, (
+            f"r1_p{p} should keep its full slot"
+        )
+    # Each round-2 miner: per_prompt × (1/K=1) = 1 × slot_share / 10.
+    expected_per_r2 = 1 * slot_share / 10
+    for p in range(10, 20):
+        assert abs(rewards[f"r2_p{p}"] - expected_per_r2) < 1e-9, (
+            f"r2_p{p} should earn fair share at boundary, got {rewards.get(f'r2_p{p}')}"
+        )
+    # Conservation: total reward = 7 × slot_share + 1 × slot_share = pool.
+    assert abs(sum(rewards.values()) - 1.0) < 1e-9
+
+
+def test_boundary_round_all_miners_same_prompt():
+    """10 miners all on the same prompt in the boundary round. The K-way
+    split keeps total per-prompt payout = per_prompt_boundary. With 1 slot
+    left and 1 distinct prompt, per_prompt = slot_share, each miner gets
+    slot_share/10 (sybil-neutral)."""
+    cd = CooldownMap(cooldown_windows=50)
+    subs = [_sub(f"r1_p{p}", prompt_idx=p, drand_round=1) for p in range(7)]
+    # 10 miners on the same prompt 99 in round 2 — boundary round.
+    subs.extend(
+        _sub(f"sybil{i}", prompt_idx=99, drand_round=2) for i in range(10)
+    )
+
+    batch, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+
+    slot_share = 1.0 / 8
+    # Each round-1 miner: full slot share.
+    for p in range(7):
+        assert abs(rewards[f"r1_p{p}"] - slot_share) < 1e-9
+    # 10 sybils on one prompt: per_prompt = slot_share, K=10 split.
+    expected_per_sybil = slot_share / 10
+    for i in range(10):
+        assert abs(rewards[f"sybil{i}"] - expected_per_sybil) < 1e-9
+    # Total = pool (no burn at boundary if anything fits).
+    assert abs(sum(rewards.values()) - 1.0) < 1e-9
+
+
+def test_boundary_round_mixed_K():
+    """Mix of prompts at boundary: some single-miner, some multi-miner.
+    Each prompt earns per_prompt = remaining × slot_share / N_prompts;
+    within a prompt, K-way split applies. Total still equals slot_share ×
+    remaining."""
+    cd = CooldownMap(cooldown_windows=50)
+    subs = [_sub(f"r1_p{p}", prompt_idx=p, drand_round=1) for p in range(6)]
+    # Boundary round: 4 prompts, with K = [1, 1, 3, 5] miners.
+    subs.append(_sub("alice", prompt_idx=10, drand_round=2))
+    subs.append(_sub("bob", prompt_idx=11, drand_round=2))
+    for i in range(3):
+        subs.append(_sub(f"trio{i}", prompt_idx=12, drand_round=2))
+    for i in range(5):
+        subs.append(_sub(f"quint{i}", prompt_idx=13, drand_round=2))
+
+    batch, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+
+    slot_share = 1.0 / 8
+    remaining = 8 - 6  # 2 slots left at boundary
+    n_prompts = 4
+    per_prompt = remaining * slot_share / n_prompts  # = 2/32 = 1/16
+
+    assert abs(rewards["alice"] - per_prompt) < 1e-9  # K=1
+    assert abs(rewards["bob"] - per_prompt) < 1e-9    # K=1
+    for i in range(3):
+        assert abs(rewards[f"trio{i}"] - per_prompt / 3) < 1e-9  # K=3
+    for i in range(5):
+        assert abs(rewards[f"quint{i}"] - per_prompt / 5) < 1e-9  # K=5
+
+    # Sum per prompt independent of K (conservation):
+    trio_total = sum(rewards[f"trio{i}"] for i in range(3))
+    quint_total = sum(rewards[f"quint{i}"] for i in range(5))
+    assert abs(trio_total - per_prompt) < 1e-9
+    assert abs(quint_total - per_prompt) < 1e-9
+
+    # Round 1 unchanged.
+    for p in range(6):
+        assert abs(rewards[f"r1_p{p}"] - slot_share) < 1e-9
+
+    # Total: 6 slot_share + 4 × per_prompt = 6/8 + 4/16 = 6/8 + 2/8 = 8/8 = 1.
+    assert abs(sum(rewards.values()) - 1.0) < 1e-9
+
+
+def test_boundary_round_sybil_same_prompt_neutral():
+    """Same-prompt sybil attack at the boundary round: K hotkeys on one
+    prompt earn the same total as 1 hotkey alone on that prompt. Cancels
+    the multi-prompt sybil-multiplier loophole at the boundary that the
+    old algorithm would have created if naive per-miner splits were used.
+    """
+    cd = CooldownMap(cooldown_windows=50)
+
+    # Round 1: 7 slots filled by r1_p0..r1_p6.
+    base = [_sub(f"r1_p{p}", prompt_idx=p, drand_round=1) for p in range(7)]
+
+    # Case A: lone honest miner takes the boundary prompt 99.
+    case_a = base + [_sub("honest", prompt_idx=99, drand_round=2)]
+    _, rewards_a = select_batch_and_distribute(
+        submissions=case_a, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+
+    # Case B: 5 sybils all on prompt 99 in the boundary round, no one else.
+    case_b = base + [
+        _sub(f"sybil{i}", prompt_idx=99, drand_round=2) for i in range(5)
+    ]
+    _, rewards_b = select_batch_and_distribute(
+        submissions=case_b, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+
+    honest_a = rewards_a["honest"]
+    sybil_b_total = sum(v for k, v in rewards_b.items() if k.startswith("sybil"))
+    assert abs(honest_a - sybil_b_total) < 1e-9, (
+        f"sybil on same boundary prompt should split, total {sybil_b_total} "
+        f"vs lone honest {honest_a}"
+    )
+
+
+def test_boundary_round_later_rounds_get_zero():
+    """After the boundary round consumes all remaining slot value, any
+    submission in a later round earns nothing — the boundary distribution
+    is final."""
+    cd = CooldownMap(cooldown_windows=50)
+    subs = [_sub(f"r1_p{p}", prompt_idx=p, drand_round=1) for p in range(6)]
+    # Round 2 boundary: 4 prompts.
+    subs.extend(
+        _sub(f"r2_p{p}", prompt_idx=10 + p, drand_round=2) for p in range(4)
+    )
+    # Round 3: a forlorn miner.
+    subs.append(_sub("toolate", prompt_idx=999, drand_round=3))
+
+    _, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+    assert "toolate" not in rewards
+    # Conservation across the rounds that did fire:
+    assert abs(sum(rewards.values()) - 1.0) < 1e-9
+
+
+def test_boundary_round_training_batch_capped_at_b():
+    """Even when more prompts are rewarded than slots remaining, the
+    training batch never exceeds B. The boundary distribution is purely
+    economic — the training step always runs at most B forward passes."""
+    cd = CooldownMap(cooldown_windows=50)
+    # Round 1 takes 5 slots, boundary round has 20 distinct prompts.
+    subs = [_sub(f"r1_p{p}", prompt_idx=p, drand_round=1) for p in range(5)]
+    subs.extend(
+        _sub(f"r2_p{p}", prompt_idx=100 + p, drand_round=2) for p in range(20)
+    )
+
+    batch, rewards = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+    assert len(batch) == 8  # exactly B, not 5 + 20
+    # But 25 miners earn (5 round-1 + 20 round-2):
+    assert len(rewards) == 25
+    # Conservation:
+    assert abs(sum(rewards.values()) - 1.0) < 1e-9
+
+
+def test_boundary_round_picks_canonical_prompts_for_training():
+    """Training-batch prompts at the boundary are the lowest canonical-hash
+    ones — deterministic across validators. Reward distribution is
+    independent of which subset gets picked for training."""
+    import hashlib
+    cd = CooldownMap(cooldown_windows=50)
+
+    candidate_prompts = [100, 101, 102, 103, 104, 105]
+    # Compute canonical hash order of these prompts:
+    expected_order = sorted(
+        candidate_prompts,
+        key=lambda p: hashlib.sha256(p.to_bytes(8, "big", signed=False)).digest(),
+    )
+
+    # Round 1 takes 6 slots, leaving 2 for the boundary with 6 prompts.
+    subs = [_sub(f"r1_p{p}", prompt_idx=p, drand_round=1) for p in range(6)]
+    for p in candidate_prompts:
+        subs.append(_sub(f"r2_p{p}", prompt_idx=p, drand_round=2))
+
+    batch, _ = select_batch_and_distribute(
+        submissions=subs, b=8, cooldown_map=cd, current_window=100, pool=1.0,
+    )
+
+    trained_boundary = [s.prompt_idx for s in batch if s.drand_round == 2]
+    # First 2 by canonical hash order.
+    assert trained_boundary == expected_order[:2]

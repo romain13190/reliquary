@@ -92,6 +92,40 @@ def select_batch_and_distribute(
         - rewards_by_hotkey: dict hotkey → float. Sums to (slots_filled / b)
           × pool, with unfilled slots burned.
 
+    Boundary-round fair split
+    -------------------------
+    When iterating rounds in ascending order, the round that first brings
+    ``len(training_batch)`` past ``b`` is the "boundary round". Earlier
+    code stopped the moment ``b`` was reached, which meant: within the
+    boundary round, only the prompts with the smallest canonical hashes
+    got slots, and every other miner in that same drand-3-s bucket
+    earned zero. That's unfair — those miners arrived at the same
+    chronological tier; the canonical hash is just a tiebreaker, not a
+    priority.
+
+    The boundary round now distributes its share fairly across ALL
+    prompts in it:
+
+      per_prompt_boundary = remaining_slots × slot_share / N_prompts_in_round
+      per_miner_on_prompt = per_prompt_boundary / K_p
+
+    Total emission paid in the boundary round equals
+    ``remaining_slots × slot_share`` (= exactly what the boundary round
+    is "worth"). The training batch still trains on
+    ``remaining_slots`` prompts (canonical hash order) — that's just an
+    implementation cap on training cost, not an economic statement.
+
+    Sybil invariants preserved:
+      * Same-prompt sybil neutral: K hotkeys on one prompt split the
+        per_prompt share K-way, total payout per prompt is fixed
+        independent of K.
+      * Different-prompt sybil tax: K hotkeys on K different prompts in
+        the boundary round each earn per_prompt_boundary, registration
+        burn is the tax.
+      * Conservation: total reward paid in boundary round equals what
+        a full non-boundary round would have paid for the same slot
+        count.
+
     Does NOT mutate ``cooldown_map`` — the caller records post-selection.
     """
     if b <= 0 or not submissions:
@@ -113,27 +147,56 @@ def select_batch_and_distribute(
     claimed_prompts: set[int] = set()
     rounds_ascending = sorted(by_round)
     for round_no in rounds_ascending:
-        if len(training_batch) >= b:
+        remaining = b - len(training_batch)
+        if remaining <= 0:
             break
         prompts_in_round = by_round[round_no]
-        # Order prompts within the same round canonically — two validators
-        # with different network-arrival orders still pick the same prompts.
-        prompts_ordered = sorted(
-            prompts_in_round, key=_prompt_canonical_key,
-        )
-        for prompt_idx in prompts_ordered:
-            if len(training_batch) >= b:
-                break
-            if prompt_idx in claimed_prompts:
-                continue
-            slot_subs = prompts_in_round[prompt_idx]
-            claimed_prompts.add(prompt_idx)
-            k_p = len(slot_subs)
-            per_miner = slot_share / k_p
-            for sub in slot_subs:
-                rewards[sub.hotkey] = rewards.get(sub.hotkey, 0.0) + per_miner
-            # Canonical pick for the training step.
-            representative = min(slot_subs, key=_within_slot_key)
-            training_batch.append(representative)
+        # Filter to prompts not yet claimed by an earlier round (a
+        # prompt gets at most one slot across all rounds; the earliest
+        # round wins).
+        available = {
+            p: subs
+            for p, subs in prompts_in_round.items()
+            if p not in claimed_prompts
+        }
+        if not available:
+            continue
+        num_prompts = len(available)
+
+        if num_prompts <= remaining:
+            # Full-inclusion case: every prompt in this round gets its
+            # own slot. Same as the original algorithm.
+            for prompt_idx in sorted(available, key=_prompt_canonical_key):
+                slot_subs = available[prompt_idx]
+                k_p = len(slot_subs)
+                per_miner = slot_share / k_p
+                for sub in slot_subs:
+                    rewards[sub.hotkey] = rewards.get(sub.hotkey, 0.0) + per_miner
+                representative = min(slot_subs, key=_within_slot_key)
+                training_batch.append(representative)
+                claimed_prompts.add(prompt_idx)
+        else:
+            # Boundary round: more candidate prompts than remaining
+            # slots. Spread the remaining slot value across every prompt
+            # in this round (fair within the drand bucket), still split
+            # K-way within each prompt (same-prompt sybil neutral).
+            per_prompt = remaining * slot_share / num_prompts
+            for prompt_idx, slot_subs in available.items():
+                k_p = len(slot_subs)
+                per_miner = per_prompt / k_p
+                for sub in slot_subs:
+                    rewards[sub.hotkey] = rewards.get(sub.hotkey, 0.0) + per_miner
+            # Training step still trains on at most ``remaining`` prompts.
+            # Pick them by canonical hash order (deterministic across
+            # validators); the unpicked prompts are paid out above but
+            # don't go through the forward pass.
+            chosen = sorted(available, key=_prompt_canonical_key)[:remaining]
+            for prompt_idx in chosen:
+                representative = min(available[prompt_idx], key=_within_slot_key)
+                training_batch.append(representative)
+                claimed_prompts.add(prompt_idx)
+            # Boundary round consumes all remaining slot value, so any
+            # later round contributes zero — stop iterating.
+            break
 
     return training_batch, rewards
