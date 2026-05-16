@@ -9,11 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import defaultdict
 from typing import Any
 
 from reliquary.constants import (
-    B_BATCH,
     EMA_ALPHA,
     EPOCH_SUBMIT_LEAD_BLOCKS,
     POLL_INTERVAL_SECONDS,
@@ -152,15 +150,40 @@ class WeightOnlyValidator:
 
     @staticmethod
     def _replay_ema(archives: list[dict]) -> dict[str, float]:
+        """Replay the per-window emission distribution into an EMA.
+
+        Reads ``rewards_by_hotkey`` from each archive — the single source of
+        truth for what each miner earned that window, computed by
+        ``select_batch_and_distribute`` at seal time. The dict's values are
+        already in units of ``pool`` (≤ 1.0 per window), so they map
+        directly onto the EMA fraction with no further normalization.
+
+        Why this matters: the emission distribution has three properties
+        the older "count entries in ``batch``" approach did not preserve
+        on-chain:
+
+          * K-way same-prompt split. K miners on one winning prompt each
+            earn ``slot_share / K`` in ``rewards_by_hotkey``. The old code
+            only counted the canonical training representative, which
+            collapsed K sybils' total reward onto the rep — the K-way
+            split existed in the archive but never reached the chain.
+          * Boundary-round fair split. When the round that crosses
+            ``B_BATCH`` has more prompts than remaining slots, every
+            prompt in that round earns its share via
+            ``rewards_by_hotkey`` (see ``select_batch_and_distribute``).
+            The old code only credited the canonical-hash winners in the
+            training batch.
+          * Conservation. ``rewards_by_hotkey`` sums to at most ``pool``
+            per window, with unfilled slots burning their share. The EMA
+            fraction inherits the same bound naturally.
+        """
         ema: dict[str, float] = {}
         alpha = EMA_ALPHA
         for record in sorted(archives, key=lambda r: int(r["window_start"])):
-            window_contribs: dict[str, int] = defaultdict(int)
-            for entry in record.get("batch", []):
-                window_contribs[entry["hotkey"]] += 1
-            all_hotkeys = set(ema) | set(window_contribs)
+            rewards: dict[str, float] = record.get("rewards_by_hotkey", {})
+            all_hotkeys = set(ema) | set(rewards)
             for hk in all_hotkeys:
-                fraction = window_contribs.get(hk, 0) / B_BATCH
+                fraction = rewards.get(hk, 0.0)
                 ema[hk] = alpha * fraction + (1 - alpha) * ema.get(hk, 0.0)
             ema = {hk: v for hk, v in ema.items() if v > 1e-6}
         return ema
