@@ -246,6 +246,40 @@ def test_cheap_reject_logs_warning():
     assert reject_lines, "WARNING log missing for cheap WRONG_CHECKPOINT reject"
 
 
+def test_cheap_reject_log_includes_drand_round():
+    """The WARNING log line for a cheap reject must include
+    ``drand_round=N`` so operators can grep the per-drand-round
+    distribution of rejections (= verify whether miners are burst-firing
+    in the first drand round or spreading their POSTs)."""
+    import logging
+    s, _ = _setup(current_checkpoint_hash="sha256:current")
+    payload = _submission(
+        hotkey="hkD", checkpoint_hash="sha256:stale", drand_round=28700123,
+    )
+
+    server_logger = logging.getLogger("reliquary.validator.server")
+    records = []
+    handler = logging.Handler()
+    handler.setLevel(logging.WARNING)
+    handler.emit = records.append
+    server_logger.addHandler(handler)
+    try:
+        with TestClient(s.app) as client:
+            client.post("/submit", json=payload)
+    finally:
+        server_logger.removeHandler(handler)
+
+    reject_lines = [
+        r for r in records
+        if "rejected prompt" in r.getMessage()
+        and "drand_round=28700123" in r.getMessage()
+    ]
+    assert reject_lines, (
+        "cheap-reject log must surface the submission's drand_round; "
+        f"got messages: {[r.getMessage() for r in records]}"
+    )
+
+
 def test_validate_drand_round_called_with_arrival_timestamp():
     """The HTTP cheap-reject must forward the middleware-stamped
     ``t_arrival`` into ``batcher.validate_drand_round``. Without this,

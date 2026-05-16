@@ -257,8 +257,9 @@ class ValidatorServer:
 
             def _cheap_reject(reason: RejectReason) -> BatchSubmissionResponse:
                 logger.warning(
-                    "rejected prompt=%d hotkey=%s reason=%s rewards=%s",
-                    request.prompt_idx, hk[:12], reason.value,
+                    "rejected prompt=%d hotkey=%s drand_round=%d reason=%s rewards=%s",
+                    request.prompt_idx, hk[:12], request.drand_round,
+                    reason.value,
                     [r.reward for r in request.rollouts],
                 )
                 self.record_verdict(
@@ -417,9 +418,9 @@ class ValidatorServer:
             if batcher is not self.active_batcher:
                 logger.info(
                     "dropping late submission prompt=%d hotkey=%s "
-                    "(batcher window=%d no longer active)",
+                    "drand_round=%d (batcher window=%d no longer active)",
                     request.prompt_idx, request.miner_hotkey[:12],
-                    batcher.window_start,
+                    request.drand_round, batcher.window_start,
                 )
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(
@@ -443,9 +444,9 @@ class ValidatorServer:
             if batcher.is_sealed():
                 logger.info(
                     "dropping post-seal queue item prompt=%d hotkey=%s "
-                    "(batcher window=%d already filled)",
+                    "drand_round=%d (batcher window=%d already filled)",
                     request.prompt_idx, request.miner_hotkey[:12],
-                    batcher.window_start,
+                    request.drand_round, batcher.window_start,
                 )
                 if self._late_drop_callback is not None:
                     self._late_drop_callback(
@@ -463,15 +464,17 @@ class ValidatorServer:
                 )
                 if response.accepted:
                     logger.info(
-                        "accepted prompt=%d hotkey=%s",
+                        "accepted prompt=%d hotkey=%s drand_round=%d",
                         request.prompt_idx, request.miner_hotkey[:12],
+                        request.drand_round,
                     )
                 else:
                     rewards = [r.reward for r in request.rollouts]
                     logger.warning(
-                        "rejected prompt=%d hotkey=%s reason=%s rewards=%s",
+                        "rejected prompt=%d hotkey=%s drand_round=%d "
+                        "reason=%s rewards=%s",
                         request.prompt_idx, request.miner_hotkey[:12],
-                        response.reason.value, rewards,
+                        request.drand_round, response.reason.value, rewards,
                     )
                 # The verdict the /submit response *didn't* carry, now
                 # observable to the miner via /verdicts.
