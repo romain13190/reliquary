@@ -38,6 +38,12 @@ class RejectReason(str, Enum):
     ACCEPTED = "accepted"
     SUBMITTED = "submitted"
     BAD_SIGNATURE = "bad_signature"
+    # Envelope-level signature failed verification, or the envelope was
+    # unsigned. Recorded BEFORE the per-hotkey rate-limit increment so an
+    # attacker spoofing ``miner_hotkey`` can't exhaust a victim's quota
+    # by submitting unsigned packets. See ``build_envelope_binding`` in
+    # protocol/signatures.py.
+    BAD_ENVELOPE_SIGNATURE = "bad_envelope_signature"
     BAD_PROMPT_IDX = "bad_prompt_idx"
     PROMPT_MISMATCH = "prompt_mismatch"
     DISTRIBUTION_SUSPICIOUS = "distribution_suspicious"
@@ -108,6 +114,22 @@ class BatchSubmissionRequest(BaseModel):
     # rejects 0 as STALE_ROUND in production but tests can still
     # construct legacy requests for the cooldown / cheap-check paths.
     drand_round: int = Field(default=0, ge=0)
+    # Caller-chosen freshness nonce. Bound into the envelope signature
+    # so a precomputed signature cannot be reused for a different
+    # logical submission. The validator does not (currently) dedupe on
+    # nonce — the merkle_root+hotkey+window pair already deduplicates at
+    # the batcher level — but binding it here closes the trivial replay
+    # vector against the rate-limit counter. Empty string is permitted
+    # for back-compat with pre-envelope clients that the validator may
+    # accept while the ``enforce_envelope_signature`` flag is off.
+    nonce: str = Field(default="", max_length=128)
+    # sr25519 hex signature of the canonical envelope binding (see
+    # ``reliquary.protocol.signatures.build_envelope_binding``). Verified
+    # at the TOP of /submit, before the per-hotkey rate-limit counter is
+    # touched. Empty string is permitted as a back-compat sentinel; the
+    # validator's ``enforce_envelope_signature`` flag decides whether an
+    # empty sig is rejected as BAD_ENVELOPE_SIGNATURE or silently accepted.
+    envelope_signature: str = Field(default="", pattern=r"^[0-9a-fA-F]*$")
 
     @field_validator("rollouts")
     @classmethod

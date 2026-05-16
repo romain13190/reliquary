@@ -223,6 +223,23 @@ HASH_DEDUP_RETENTION_WINDOWS = 10000
 # — one slot per prompt a hotkey can credibly win in a window.
 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
 
+# When True, /submit verifies ``envelope_signature`` before any per-hotkey
+# rate-limit increment, and rejects unsigned / malformed / wrong-signer
+# requests as BAD_ENVELOPE_SIGNATURE. This closes the trivial DoS where
+# any caller can spam 8 unsigned packets claiming a victim's
+# ``miner_hotkey`` and exhaust the per-window counter — locking the real
+# miner out of the slot for the rest of the window. See
+# ``reliquary.protocol.signatures.build_envelope_binding`` and the PR
+# that introduced this flag for the full vector.
+#
+# Set to False ONLY for a rolling miner upgrade window: once all live
+# miners are publishing envelope sigs, set to True (default). The
+# False path is the pre-PR behaviour and remains DoS-exposed.
+import os as _os
+ENFORCE_ENVELOPE_SIGNATURE = _os.environ.get(
+    "RELIQUARY_ENFORCE_ENVELOPE_SIGNATURE", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
 # Max GRAIL-validated submissions retained per prompt per window. Once this
 # cap is reached for a prompt, further submissions for that prompt are
 # rejected as PROMPT_FULL before the heavy verify. Bounds the validator's
