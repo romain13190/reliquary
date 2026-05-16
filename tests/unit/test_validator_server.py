@@ -1,9 +1,12 @@
 """Validator HTTP server — v2 GRPO market endpoints."""
 
+import os
+import bittensor as bt
 import pytest
 from fastapi.testclient import TestClient
 
 from reliquary.constants import CHALLENGE_K, M_ROLLOUTS
+from reliquary.protocol.signatures import sign_envelope
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     GrpoBatchState,
@@ -13,6 +16,23 @@ from reliquary.protocol.submission import (
 from reliquary.validator.batcher import GrpoWindowBatcher
 from reliquary.validator.cooldown import CooldownMap
 from reliquary.validator.server import ValidatorServer
+
+
+# Persistent test keypair so every ``_request()`` carries a verifiable
+# envelope signature. Built once per module — generating a fresh
+# keypair each call is fine but slows tests.
+_TEST_KEYPAIR = bt.Keypair.create_from_mnemonic(bt.Keypair.generate_mnemonic())
+
+
+class _TestWallet:
+    """Wallet-like shim around ``_TEST_KEYPAIR`` for ``sign_envelope``."""
+
+    class hotkey:
+        ss58_address = _TEST_KEYPAIR.ss58_address
+
+        @staticmethod
+        def sign(msg: bytes) -> bytes:
+            return _TEST_KEYPAIR.sign(msg)
 
 
 class FakeEnv:
@@ -80,7 +100,16 @@ def _batcher(window_start=500, cooldown_map=None):
     return batcher
 
 
-def _request(prompt_idx=42, window_start=500, k=4, checkpoint_hash="sha256:test"):
+def _request(
+    prompt_idx=42,
+    window_start=500,
+    k=4,
+    checkpoint_hash="sha256:test",
+    randomness="cd" * 16,
+):
+    """Build a fully-signed envelope so tests pass the validator's
+    ``ENFORCE_ENVELOPE_SIGNATURE`` gate. ``miner_hotkey`` is bound to
+    ``_TEST_KEYPAIR.ss58_address`` because the signature covers it."""
     rollouts = []
     for i in range(M_ROLLOUTS):
         success = i < k
@@ -93,13 +122,30 @@ def _request(prompt_idx=42, window_start=500, k=4, checkpoint_hash="sha256:test"
                 commit=commit,
             )
         )
+    merkle_root = "00" * 32
+    drand_round = 0
+    nonce = os.urandom(8).hex()
+    sig = sign_envelope(
+        wallet=_TestWallet,
+        miner_hotkey=_TEST_KEYPAIR.ss58_address,
+        window_start=window_start,
+        prompt_idx=prompt_idx,
+        merkle_root=merkle_root,
+        checkpoint_hash=checkpoint_hash,
+        drand_round=drand_round,
+        randomness=randomness,
+        nonce=nonce,
+    ).hex()
     return BatchSubmissionRequest(
-        miner_hotkey="hk",
+        miner_hotkey=_TEST_KEYPAIR.ss58_address,
         prompt_idx=prompt_idx,
         window_start=window_start,
-        merkle_root="00" * 32,
+        merkle_root=merkle_root,
         rollouts=rollouts,
         checkpoint_hash=checkpoint_hash,
+        drand_round=drand_round,
+        nonce=nonce,
+        envelope_signature=sig,
     )
 
 

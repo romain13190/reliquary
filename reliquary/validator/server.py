@@ -26,9 +26,11 @@ from pydantic import BaseModel
 import uvicorn
 
 from reliquary.constants import (
+    ENFORCE_ENVELOPE_SIGNATURE,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     VALIDATOR_HTTP_PORT,
 )
+from reliquary.protocol.signatures import verify_envelope_signature
 from reliquary.protocol.submission import (
     BatchSubmissionRequest,
     BatchSubmissionResponse,
@@ -185,8 +187,73 @@ class ValidatorServer:
             t_arrival = getattr(http_request.state, "t_arrival", None)
             if t_arrival is None:
                 t_arrival = time.time()
-            # Rate limit FIRST — cheapest reject before any state/queue work.
             hk = request.miner_hotkey
+
+            # ENVELOPE SIGNATURE CHECK — runs BEFORE rate-limit increment.
+            #
+            # Without this gate, ``miner_hotkey`` is a plain string and
+            # anyone can spam 8 unsigned requests claiming a victim's
+            # hotkey, exhausting ``_per_window_counts[victim]`` before
+            # the real victim's first submission lands → every honest
+            # submission from the targeted hotkey returns RATE_LIMITED
+            # for the rest of the window. Documented as the
+            # "/submit hotkey-spoof attack" on the operator side.
+            #
+            # The signature is sr25519 over the canonical envelope
+            # (hotkey, window, prompt_idx, merkle_root, checkpoint_hash,
+            # drand_round, validator's window randomness, nonce) — see
+            # ``reliquary.protocol.signatures.build_envelope_binding``.
+            # An attacker can't forge it without the miner's hotkey
+            # private key, and they can't replay a captured signature
+            # because the binding includes the validator's per-window
+            # randomness.
+            #
+            # The counter is touched ONLY after the signature is proven
+            # valid, so a flood of garbage signatures costs O(1) ed25519
+            # verifications per request but does not move any victim's
+            # quota.
+            if ENFORCE_ENVELOPE_SIGNATURE:
+                # We need the validator's window randomness to verify the
+                # binding. Read it from the active batcher if present;
+                # if there's no batcher yet, the envelope signature is
+                # bound against empty randomness (the same value a
+                # pre-OPEN miner would have signed against, since /state
+                # exposes the empty string in that case). That's
+                # consistent with the schema's default.
+                _randomness_for_sig = (
+                    self.active_batcher.randomness
+                    if self.active_batcher is not None
+                    else ""
+                )
+                if not verify_envelope_signature(
+                    miner_hotkey=hk,
+                    window_start=request.window_start,
+                    prompt_idx=request.prompt_idx,
+                    merkle_root=request.merkle_root,
+                    checkpoint_hash=request.checkpoint_hash,
+                    drand_round=request.drand_round,
+                    randomness=_randomness_for_sig,
+                    nonce=request.nonce,
+                    envelope_signature=request.envelope_signature,
+                ):
+                    # NB: we still record the verdict against the
+                    # CLAIMED hotkey — that's what the rejected packet
+                    # carried — but we do NOT increment its rate-limit
+                    # counter. Recording lets a legitimate miner see in
+                    # /verdicts that someone's spoofing them.
+                    self.record_verdict(
+                        hk, request.merkle_root, False,
+                        RejectReason.BAD_ENVELOPE_SIGNATURE,
+                        window_n=request.window_start,
+                    )
+                    return BatchSubmissionResponse(
+                        accepted=False,
+                        reason=RejectReason.BAD_ENVELOPE_SIGNATURE,
+                    )
+
+            # Rate limit AFTER signature verification — the signer is now
+            # cryptographically bound to ``hk``, so this counter cannot
+            # be moved by anyone other than the keypair holder.
             n = self._per_window_counts.get(hk, 0)
             if n >= MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW:
                 if self._late_drop_callback is not None:
