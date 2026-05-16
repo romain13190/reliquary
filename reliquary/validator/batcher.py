@@ -225,21 +225,49 @@ class GrpoWindowBatcher:
         # an aggregate count. Cap protects against single-attacker flooding.
         self.rejected_submissions: list[RejectedSubmission] = []
 
-        # v2.1: seal_event fires the moment the B-th distinct non-cooldown
-        # valid submission lands. Service awaits this to close the window.
-        # Stored as threading.Event for sync-safe set(); the asyncio.Event
-        # is created lazily on first access to bind to the current loop.
+        # v2.1+: seal_event fires once the window is finalized. v2.3+:
+        # firing is delayed past the B-th distinct prompt to absorb the
+        # rest of that submission's drand round — see the "trigger round"
+        # comment in ``_accept_locked``. Stored as ``threading.Event`` for
+        # sync-safe ``set()`` from the worker thread; the asyncio.Event is
+        # lazy-bound to the running loop on first access.
         self._seal_flag: threading.Event = threading.Event()
         self._seal_event: asyncio.Event | None = None
+        # v2.3 seal extension. When the B-th distinct prompt arrives in
+        # drand round R, we record R here and DELAY firing ``_seal_flag``
+        # until the next drand boundary so further submissions in R can
+        # still be accepted (and fairly share the boundary-round emission
+        # via ``select_batch_and_distribute``'s boundary branch). Until
+        # the boundary passes:
+        #   * submissions with ``drand_round == R`` are accepted normally
+        #   * submissions with ``drand_round > R`` are rejected with
+        #     ``BATCH_FILLED`` AND fire the seal immediately (no point
+        #     waiting if a later round has already shown up)
+        # ``_loop`` is captured the first time ``seal_event`` is accessed
+        # from an async context so we can schedule the delayed seal from
+        # the worker thread via ``run_coroutine_threadsafe``. ``None`` in
+        # synchronous test contexts — there the seal fires immediately on
+        # the B-th distinct, matching the pre-v2.3 timing.
+        self._seal_trigger_round: int | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
 
     @property
     def seal_event(self) -> asyncio.Event:
-        """Lazy asyncio.Event bound to whichever loop accesses it first."""
+        """Lazy asyncio.Event bound to whichever loop accesses it first.
+
+        Also captures the loop reference for the v2.3 seal-extension
+        mechanism, which needs to schedule a delayed seal-firing coroutine
+        from the worker thread.
+        """
         if self._seal_event is None:
             self._seal_event = asyncio.Event()
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = None
             if self._seal_flag.is_set():
                 self._seal_event.set()
         return self._seal_event
@@ -362,6 +390,21 @@ class GrpoWindowBatcher:
     ) -> BatchSubmissionResponse:
         hk = request.miner_hotkey
         pi = request.prompt_idx
+        # v2.3 seal extension: once the trigger drand round is recorded
+        # (B-th distinct prompt landed in round R), submissions from a
+        # LATER drand round arrive too late — drop them with BATCH_FILLED
+        # and fire the seal immediately. Submissions in round R itself
+        # continue down the normal path so they can join the boundary
+        # fair-split. See ``self._seal_trigger_round`` for the rationale.
+        if (
+            self._seal_trigger_round is not None
+            and request.drand_round > self._seal_trigger_round
+        ):
+            if not self._seal_flag.is_set():
+                self._seal_flag.set()
+                if self._seal_event is not None:
+                    self._seal_event.set()
+            return self._reject(RejectReason.BATCH_FILLED, hotkey=hk, prompt_idx=pi)
         if request.window_start != self.window_start:
             return self._reject(RejectReason.WINDOW_MISMATCH, hotkey=hk, prompt_idx=pi)
         # v2.1: checkpoint hash gate. Empty string = gate disabled
@@ -613,14 +656,78 @@ class GrpoWindowBatcher:
             s.prompt_idx for s in self._valid
             if not self._cooldown.is_in_cooldown(s.prompt_idx, self.window_start)
         })
-        if distinct_eligible >= B_BATCH and not self._seal_flag.is_set():
-            self._seal_flag.set()
-            if self._seal_event is not None:
-                self._seal_event.set()
+        if distinct_eligible >= B_BATCH and self._seal_trigger_round is None:
+            # B-th distinct prompt just landed. Record the trigger drand
+            # round and DELAY the actual seal until the round expires —
+            # any further submissions in this same drand round can still
+            # be accepted and share the boundary slot value via
+            # ``select_batch_and_distribute``'s boundary branch.
+            #
+            # Two firing paths bring ``_seal_flag`` up:
+            #   1. ``_delayed_seal_at_drand_boundary`` — a coroutine
+            #      scheduled below sleeps until the next drand boundary
+            #      and fires the seal even if no further traffic arrives.
+            #   2. The early-fire above: a submission from a LATER drand
+            #      round arrives → seal fires immediately, the late
+            #      submission is rejected.
+            # Whichever fires first wins; the other path becomes a no-op
+            # because ``_seal_flag.is_set()`` short-circuits.
+            self._seal_trigger_round = request.drand_round
+            if self._loop is not None:
+                # Production path: schedule the delayed fire on the
+                # validator's asyncio loop.
+                asyncio.run_coroutine_threadsafe(
+                    self._delayed_seal_at_drand_boundary(),
+                    self._loop,
+                )
+            else:
+                # Synchronous test path (no running loop): fire seal
+                # immediately, matching the pre-v2.3 timing tests rely on.
+                self._seal_flag.set()
+                if self._seal_event is not None:
+                    self._seal_event.set()
 
         return BatchSubmissionResponse(
             accepted=True, reason=RejectReason.ACCEPTED
         )
+
+    async def _delayed_seal_at_drand_boundary(self) -> None:
+        """Fire ``_seal_flag`` once the trigger drand round expires.
+
+        Called via ``run_coroutine_threadsafe`` from the worker thread
+        when the B-th distinct prompt lands. Sleeps until the next drand
+        boundary plus a small margin, then sets the seal flag so the
+        service can transition the window to TRAINING.
+
+        Idempotent — re-firing ``_seal_flag.set()`` is a no-op. If a
+        late-drand submission arrives between trigger and boundary and
+        early-fires the seal via ``_accept_locked``, this coroutine
+        wakes up and sets an already-set flag.
+
+        Defensive fallback: if the drand chain info isn't available
+        (synchronous tests that disable the drand check, or a cold
+        startup where no /submit has yet populated the cache), fire the
+        seal immediately. The extension is a "nice to have" only when we
+        can compute when the trigger drand round ends; without that, the
+        safe behaviour is to seal at the same instant the pre-v2.3 code
+        would have.
+        """
+        if self._drand_chain_info is None:
+            self._seal_flag.set()
+            if self._seal_event is not None:
+                self._seal_event.set()
+            return
+        from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
+        ci = self._drand_chain_info
+        delay = seconds_until_next_drand_boundary(
+            self._wall_clock(), ci["genesis_time"], ci["period"],
+        )
+        # Small margin past the boundary so a submission sent right at
+        # the boundary still resolves to the trigger round on arrival.
+        await asyncio.sleep(delay + 0.05)
+        self._seal_flag.set()
+        if self._seal_event is not None:
+            self._seal_event.set()
 
     def _reject(
         self,

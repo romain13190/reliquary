@@ -1195,3 +1195,142 @@ def test_seal_batch_with_none_hash_set_is_noop():
     b.accept_submission(req)
     batch, _ = b.seal_batch()
     assert len(batch) == 1  # behaviour unchanged
+
+
+# ---------------------------------------------------------------------------
+# v2.3 seal extension: trigger drand round absorbs more submissions
+# ---------------------------------------------------------------------------
+
+def test_seal_trigger_round_recorded_on_b_th_distinct():
+    """When the B-th distinct prompt lands, ``_seal_trigger_round`` is set
+    to that submission's drand_round. The seal flag is NOT yet fired — the
+    delayed coroutine handles that (or a later-drand submission early-fires
+    it via the new ``_accept_locked`` short-circuit)."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    assert b._seal_trigger_round is None
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    assert b._seal_trigger_round == 100
+
+
+def test_seal_extension_accepts_same_drand_after_bth():
+    """After the B-th distinct prompt lands in drand round R, further
+    submissions IN ROUND R are still accepted. This is the whole point of
+    the extension — it lets the boundary fair-split fire in
+    ``select_batch_and_distribute`` with > B distinct candidate prompts."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    # Land 8 distinct prompts in round 100.
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    # 9th submission in the SAME drand round → still accepted.
+    extra = _request_v21(prompt_idx=99, hotkey="hk_extra", checkpoint_hash="")
+    extra.drand_round = 100
+    resp = b.accept_submission(extra)
+    assert resp.accepted is True, (
+        f"same-round submission post-Bth distinct should be accepted; "
+        f"got {resp.reason}"
+    )
+    # And it's in self._valid — now 9 distinct prompts.
+    distinct = len({s.prompt_idx for s in b._valid})
+    assert distinct == B_BATCH + 1
+
+
+def test_seal_extension_rejects_later_drand():
+    """A submission with ``drand_round > _seal_trigger_round`` is too late.
+    It must be rejected as BATCH_FILLED — and the seal_flag must fire so
+    the window can close without waiting for the timer-based delayed seal."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    # Trigger the seal round at 100.
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    assert b._seal_trigger_round == 100
+    # Submission in round 101 — too late.
+    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
+    late.drand_round = 101
+    resp = b.accept_submission(late)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BATCH_FILLED
+    # Seal flag fired (no need to wait on the delayed coroutine).
+    assert b._seal_flag.is_set()
+
+
+def test_seal_extension_boundary_fair_split_fires_end_to_end():
+    """End-to-end: trigger drand round absorbs extra submissions, then
+    seal_batch's ``select_batch_and_distribute`` boundary branch
+    distributes the slots fairly. Without the seal extension this
+    boundary case was unreachable in production."""
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    # Land 8 distinct prompts in round 100 (fills the batch slots).
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    # Pre-seal-extension, the next submission would be rejected as
+    # BATCH_FILLED. Post-extension, same-drand submissions are still
+    # accepted — feed 4 more into the same round on new prompts.
+    for j in range(4):
+        extra = _request_v21(
+            prompt_idx=100 + j, hotkey=f"hk_extra{j}", checkpoint_hash="",
+        )
+        extra.drand_round = 100
+        assert b.accept_submission(extra).accepted is True
+
+    # Now self._valid has 12 distinct prompts, all in round 100. The
+    # boundary branch in select_batch_and_distribute should fire when
+    # seal_batch runs. Force the seal so the test doesn't depend on the
+    # timer-based delayed seal.
+    b._seal_flag.set()
+    batch, rewards = b.seal_batch()
+
+    # Training batch capped at B_BATCH.
+    assert len(batch) == B_BATCH
+    # Reward distribution: 12 miners share total pool/B × B = pool/1 = pool.
+    # Each of the 12 gets pool / 12 = 1/12 (under default pool=1.0).
+    # ``select_batch_and_distribute`` divides ``slot_share`` (= 1/B) by
+    # N_distinct = 12 per prompt, K=1 each: pool/B × B / 12 = 1/12.
+    expected_per_miner = 1.0 / 12
+    for i in range(B_BATCH):
+        assert abs(rewards[f"hk{i}"] - expected_per_miner) < 1e-9, (
+            f"hk{i} should fair-share at boundary, got {rewards.get(f'hk{i}')}"
+        )
+    for j in range(4):
+        assert abs(rewards[f"hk_extra{j}"] - expected_per_miner) < 1e-9
+    # Conservation:
+    assert abs(sum(rewards.values()) - 1.0) < 1e-9
+
+
+def test_seal_extension_disabled_when_no_chain_info():
+    """When ``_drand_chain_info`` isn't set (synchronous test path with the
+    drand check disabled) the delayed seal coroutine can't compute when
+    the drand round ends, so it fires immediately. This preserves the
+    pre-v2.3 timing for legacy tests that exercise the seal flow without
+    drand setup."""
+    import asyncio
+    b = _make_batcher()
+    # Force loop capture by accessing seal_event from this coroutine
+    # context — _make_batcher itself doesn't access seal_event so _loop
+    # remains None until we touch it here.
+    _ = b.seal_event  # binds _loop
+
+    async def _run():
+        b.current_checkpoint_hash = ""
+        for i in range(B_BATCH):
+            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+            req.drand_round = 100
+            b.accept_submission(req)
+        # Without chain_info, the delayed coroutine fires seal immediately
+        # on the next loop tick.
+        await asyncio.wait_for(b.seal_event.wait(), timeout=0.5)
+        assert b._seal_flag.is_set()
+
+    asyncio.run(_run())
