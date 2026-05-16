@@ -130,6 +130,7 @@ class GrpoWindowBatcher:
         drand_round_check_enabled: bool = True,
         drand_chain_info: dict | None = None,
         drand_round_backward_tolerance: int | None = None,
+        queue_drained_predicate: Callable[[], bool] | None = None,
     ) -> None:
         import time
         from reliquary.constants import DRAND_ROUND_BACKWARD_TOLERANCE
@@ -250,6 +251,16 @@ class GrpoWindowBatcher:
         # the B-th distinct, matching the pre-v2.3 timing.
         self._seal_trigger_round: int | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Optional callback the seal-extension coroutine polls to check
+        # whether the server's submit_queue has finished draining items
+        # queued during the trigger drand round. ``None`` in test
+        # contexts that bypass the HTTP/worker pipeline — in that case
+        # the delayed seal coroutine fires as soon as the drand round
+        # expires (drain phase skipped). Production wires this to
+        # ``lambda: server._submit_queue.empty()`` so every queued
+        # trigger-round submission gets GRAIL-validated before the
+        # batch is sealed.
+        self._queue_drained_predicate = queue_drained_predicate
         # v2.1: checkpoint hash miners must match. Empty string disables
         # the gate (test convenience / pre-first-publish).
         self.current_checkpoint_hash: str = ""
@@ -392,18 +403,17 @@ class GrpoWindowBatcher:
         pi = request.prompt_idx
         # v2.3 seal extension: once the trigger drand round is recorded
         # (B-th distinct prompt landed in round R), submissions from a
-        # LATER drand round arrive too late — drop them with BATCH_FILLED
-        # and fire the seal immediately. Submissions in round R itself
-        # continue down the normal path so they can join the boundary
-        # fair-split. See ``self._seal_trigger_round`` for the rationale.
+        # LATER drand round arrive too late — drop with BATCH_FILLED.
+        # CRITICAL: we do NOT fire the seal here, even though we now
+        # know a later round has shown up. The queue may still contain
+        # other trigger-round submissions waiting on GRAIL; firing the
+        # seal now would make the worker's ``is_sealed`` check drop
+        # them. The seal fires only when the delayed coroutine confirms
+        # the queue has drained.
         if (
             self._seal_trigger_round is not None
             and request.drand_round > self._seal_trigger_round
         ):
-            if not self._seal_flag.is_set():
-                self._seal_flag.set()
-                if self._seal_event is not None:
-                    self._seal_event.set()
             return self._reject(RejectReason.BATCH_FILLED, hotkey=hk, prompt_idx=pi)
         if request.window_start != self.window_start:
             return self._reject(RejectReason.WINDOW_MISMATCH, hotkey=hk, prompt_idx=pi)
@@ -692,39 +702,54 @@ class GrpoWindowBatcher:
         )
 
     async def _delayed_seal_at_drand_boundary(self) -> None:
-        """Fire ``_seal_flag`` once the trigger drand round expires.
+        """Fire ``_seal_flag`` once (a) the trigger drand round expires
+        AND (b) the submit queue has drained.
 
-        Called via ``run_coroutine_threadsafe`` from the worker thread
-        when the B-th distinct prompt lands. Sleeps until the next drand
-        boundary plus a small margin, then sets the seal flag so the
-        service can transition the window to TRAINING.
+        Phase 1 — drand boundary wait. Sleep until ``seconds_until_next_drand_boundary``
+        passes. After this point HTTP cheap-reject starts rejecting
+        submissions whose ``drand_round > _seal_trigger_round`` as
+        BATCH_FILLED, so the queue can only lose items from here on.
 
-        Idempotent — re-firing ``_seal_flag.set()`` is a no-op. If a
-        late-drand submission arrives between trigger and boundary and
-        early-fires the seal via ``_accept_locked``, this coroutine
-        wakes up and sets an already-set flag.
+        Phase 2 — queue drain. Poll ``_queue_drained_predicate`` every
+        ~200 ms until it returns True. Only THEN do we fire the seal.
+        Without this phase, GRAIL-pending submissions queued during the
+        trigger drand round would be dropped at the worker's
+        ``is_sealed`` check the instant the seal fires — defeating the
+        entire boundary-fair-split design. The drain phase guarantees
+        every queued trigger-round submission contributes to the seal
+        batch's emission distribution.
 
         Defensive fallback: if the drand chain info isn't available
-        (synchronous tests that disable the drand check, or a cold
-        startup where no /submit has yet populated the cache), fire the
-        seal immediately. The extension is a "nice to have" only when we
-        can compute when the trigger drand round ends; without that, the
-        safe behaviour is to seal at the same instant the pre-v2.3 code
-        would have.
+        (synchronous tests that disable the drand check), the boundary
+        wait is skipped and seal fires immediately. If the predicate is
+        None (tests that don't wire one), the drain wait is also
+        skipped. Both fallbacks preserve pre-v2.3 timing for test
+        fixtures that don't exercise the full pipeline.
+
+        Cancellation: if the service swaps the active batcher (window
+        rolls over) while this coroutine is sleeping, the task is
+        cancelled by the loop teardown. That's fine — a stale batcher's
+        seal firing late is a no-op (the train step has already moved on).
         """
-        if self._drand_chain_info is None:
-            self._seal_flag.set()
-            if self._seal_event is not None:
-                self._seal_event.set()
-            return
-        from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
-        ci = self._drand_chain_info
-        delay = seconds_until_next_drand_boundary(
-            self._wall_clock(), ci["genesis_time"], ci["period"],
-        )
-        # Small margin past the boundary so a submission sent right at
-        # the boundary still resolves to the trigger round on arrival.
-        await asyncio.sleep(delay + 0.05)
+        # Phase 1 — wait for trigger drand round to expire.
+        if self._drand_chain_info is not None:
+            from reliquary.infrastructure.chain import seconds_until_next_drand_boundary
+            ci = self._drand_chain_info
+            delay = seconds_until_next_drand_boundary(
+                self._wall_clock(), ci["genesis_time"], ci["period"],
+            )
+            # Small margin past the boundary so a submission sent right
+            # at the boundary still resolves to the trigger round on
+            # arrival.
+            await asyncio.sleep(delay + 0.05)
+
+        # Phase 2 — drain the queue of trigger-round submissions still
+        # waiting on GRAIL. Without ``_queue_drained_predicate`` (test
+        # context), this phase is a no-op and the seal fires immediately.
+        if self._queue_drained_predicate is not None:
+            while not self._queue_drained_predicate():
+                await asyncio.sleep(0.2)
+
         self._seal_flag.set()
         if self._seal_event is not None:
             self._seal_event.set()

@@ -67,6 +67,11 @@ def _setup(*,
     batcher.env = MagicMock()
     batcher.env.__len__.return_value = env_len
     batcher.is_sealed.return_value = False
+    # MagicMock attribute access auto-creates truthy mocks; pin the seal
+    # extension's trigger round attribute to None so the BATCH_FILLED
+    # gate at the cheap-reject layer doesn't fire for tests that don't
+    # exercise the seal extension.
+    batcher._seal_trigger_round = None
     batcher.drand_round_check_enabled = drand_round_check_enabled
     batcher.validate_drand_round.return_value = validate_round_returns
     batcher.prompt_submission_count.return_value = prompt_count

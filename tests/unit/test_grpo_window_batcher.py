@@ -1334,3 +1334,88 @@ def test_seal_extension_disabled_when_no_chain_info():
         assert b._seal_flag.is_set()
 
     asyncio.run(_run())
+
+
+def test_seal_extension_waits_for_queue_drain():
+    """The delayed seal coroutine must wait for the submit queue to
+    finish draining before firing — otherwise GRAIL-pending trigger-
+    round submissions get dropped at the worker's ``is_sealed`` check
+    the instant the seal fires.
+
+    Pin: with a chain_info that puts us 0.05 s past the drand boundary
+    immediately AND a queue_drained_predicate that returns False the
+    first N calls, the seal must NOT fire until the predicate flips to
+    True.
+    """
+    import asyncio
+
+    poll_calls = [0]
+
+    def fake_queue_predicate():
+        poll_calls[0] += 1
+        # Pretend the queue is "draining" for the first 3 polls, then
+        # empty. Each poll happens ~0.2 s apart in the coroutine.
+        return poll_calls[0] > 3
+
+    async def _run():
+        # Use a chain_info whose boundary is essentially now (so phase 1
+        # of _delayed_seal_at_drand_boundary is a no-op): genesis at
+        # wall_clock and period = 1 ms means we're always at a boundary.
+        b = _make_batcher(
+            wall_clock_fn=lambda: 1000.0,  # fixed time
+            drand_chain_info={"genesis_time": 1000, "period": 1},
+            queue_drained_predicate=fake_queue_predicate,
+        )
+        _ = b.seal_event  # bind _loop
+        b.current_checkpoint_hash = ""
+        for i in range(B_BATCH):
+            req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+            req.drand_round = 100
+            b.accept_submission(req)
+        # The coroutine has been scheduled by accept_submission. Now we
+        # wait for the seal — should take ~0.6 s (3 poll calls × 0.2 s
+        # each + a tiny margin).
+        await asyncio.wait_for(b.seal_event.wait(), timeout=2.0)
+        assert b._seal_flag.is_set()
+        # Predicate was actually polled multiple times before flipping.
+        assert poll_calls[0] >= 4
+
+    asyncio.run(_run())
+
+
+def test_seal_extension_no_early_fire_on_late_drand_submission():
+    """Regression pin: when a submission with drand_round > trigger
+    arrives at ``_accept_locked`` (worker dequeued it before HTTP
+    cheap-reject caught it), it must be rejected as BATCH_FILLED
+    WITHOUT firing the seal. Firing the seal at this point would make
+    the worker drop any remaining trigger-round items still in the
+    queue at its ``is_sealed`` gate, defeating the boundary fair-split.
+    """
+    b = _make_batcher()
+    b.current_checkpoint_hash = ""
+    # Trigger the seal round at 100 (8 distinct).
+    for i in range(B_BATCH):
+        req = _request_v21(prompt_idx=i, hotkey=f"hk{i}", checkpoint_hash="")
+        req.drand_round = 100
+        b.accept_submission(req)
+    assert b._seal_trigger_round == 100
+    # If queue_drained_predicate is None (test default), the seal fires
+    # immediately on the next loop tick — but here we're synchronous
+    # and never started a loop, so _loop is None and the immediate-seal
+    # fallback fired inside accept_submission already. The previous test
+    # covers that path; here we explicitly reset to test the late-drand
+    # case without it being masked by the immediate-seal fallback.
+    b._seal_flag.clear()
+
+    # Now a worker-dequeued submission from round 101 arrives directly
+    # in _accept_locked (bypassing HTTP cheap-reject for the test).
+    late = _request_v21(prompt_idx=99, hotkey="hk_late", checkpoint_hash="")
+    late.drand_round = 101
+    resp = b.accept_submission(late)
+    assert resp.accepted is False
+    assert resp.reason == RejectReason.BATCH_FILLED
+    # CRITICAL: seal must NOT have fired from this path.
+    assert not b._seal_flag.is_set(), (
+        "late-drand item in worker path must reject without firing seal; "
+        "otherwise queued trigger-round items get dropped at is_sealed"
+    )

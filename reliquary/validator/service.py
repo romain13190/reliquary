@@ -102,12 +102,19 @@ def open_grpo_window(
     hash_set: RolloutHashSet | None,
     tokenizer,
     bootstrap: bool = False,
+    queue_drained_predicate=None,
 ) -> GrpoWindowBatcher:
     """Instantiate a GrpoWindowBatcher for this window.
 
     ``cooldown_map`` is the validator's long-lived CooldownMap, shared
     across windows. Each window's sealed batch updates it via
     ``GrpoWindowBatcher.seal_batch``.
+
+    ``queue_drained_predicate`` is wired by ``Service.run`` to the
+    server's submit-queue ``empty()`` check so the v2.3 seal extension
+    can wait for every queued trigger-round submission to be GRAIL-
+    validated before firing the seal. See
+    ``GrpoWindowBatcher._delayed_seal_at_drand_boundary``.
     """
     def _completion_text(rollout: RolloutSubmission) -> str:
         prompt_len = rollout.commit.get("rollout", {}).get("prompt_length", 0)
@@ -127,6 +134,7 @@ def open_grpo_window(
         bootstrap=bootstrap,
         completion_text_fn=_completion_text,
         canonical_prompt_tokens_fn=_canonical_prompt_tokens,
+        queue_drained_predicate=queue_drained_predicate,
     )
 
 
@@ -362,6 +370,9 @@ class ValidationService:
             hash_set=self._hash_set,
             tokenizer=self.tokenizer,
             bootstrap=bootstrap,
+            # Seal extension waits on this to confirm every queued
+            # trigger-round submission has finished GRAIL before firing.
+            queue_drained_predicate=lambda: self.server._submit_queue.empty(),
         )
         cp = self._checkpoint_store.current_manifest()
         self._active_batcher.current_checkpoint_hash = (
