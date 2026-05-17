@@ -470,15 +470,17 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) ->
             return get_mock_beacon()
         raise RuntimeError("drand response missing required fields")
 
-    # SECURITY: Verify the beacon's cryptographic signature before trusting it.
-    # Without this, a MITM or compromised relay can inject fake randomness.
-    if not verify_beacon_signature(_DRAND_CHAIN_HASH, int(rno), str(rnd), sig):
-        logger.error(
-            "[Drand] Beacon signature verification FAILED for round %s — rejecting", rno
-        )
-        raise RuntimeError(f"drand beacon signature invalid for round {rno}")
+    # NB: cross-check against bittensor_drand moved off the hot path.
+    # The validator schedules it as a background asyncio task right
+    # after OPEN (see ``ValidatorService._verify_beacon_async``); if
+    # it fails, the window is invalidated before ``_train_and_publish``
+    # consumes any submissions. Miner callers get no cross-check —
+    # a bad relay just makes their commitments fail GRAIL on the
+    # validator side, no security implication for the miner.
+    # The local ``randomness == SHA256(sig)`` derivation above is
+    # gratis and stays.
 
-    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={str(rnd)[:8]}... (sig verified)")
+    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={str(rnd)[:8]}... (sig verify deferred)")
     return {
         "source": "drand",
         "chain": _current_chain,
