@@ -12,6 +12,7 @@ Features:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -245,28 +246,55 @@ def _parse_chain_info_payload(
 
 
 def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
+    """Race all relays in parallel for the first valid JSON response.
+
+    For each path (in order), fire all relays simultaneously and return
+    as soon as any one yields a parsable 200 JSON body. If every relay
+    fails or returns a non-200 for the current path, fall through to
+    the next path. Returns None if no relay×path combination produces
+    a parsable 200.
+
+    Timeouts are tight (connect=0.5s, read=2.0s) because the other
+    relays in the race act as the fallback — we don't need a long
+    per-relay budget. This caps wall-clock cost at ~2s even when every
+    relay is degraded.
     """
-    Try all relays x all paths (v2-first, then v1) and return first JSON payload.
-    """
-    for base in _shuffle_urls():
-        for path in paths:
-            if not path:
-                continue
-            url = f"{base}{path}"
+    relays = list(DRAND_URLS)
+    if not relays:
+        return None
+
+    for path in paths:
+        if not path:
+            continue
+        urls = [f"{base}{path}" for base in relays]
+
+        def _try(url: str) -> dict[str, Any] | None:
             try:
-                r = _SESSION.get(url, timeout=(1.5, 3.5), headers=_HEADERS)
-                if r.status_code == 200:
-                    try:
-                        return r.json()  # type: ignore[no-any-return]
-                    except Exception as e:
-                        logger.debug(
-                            f"[Drand] JSON parse error for {url}: {e}; body[:160]={r.text[:160]!r}"
-                        )
-                        continue
-                else:
+                r = _SESSION.get(url, timeout=(0.5, 2.0), headers=_HEADERS)
+                if r.status_code != 200:
                     logger.debug(f"[Drand] GET {url} -> HTTP {r.status_code} {r.text[:160]!r}")
+                    return None
+                try:
+                    return r.json()  # type: ignore[no-any-return]
+                except Exception as e:
+                    logger.debug(f"[Drand] JSON parse error for {url}: {e}; body[:160]={r.text[:160]!r}")
+                    return None
             except Exception as e:
                 logger.debug(f"[Drand] GET {url} error: {e}")
+                return None
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(urls))
+        futures = {ex.submit(_try, u): u for u in urls}
+        # Shut down immediately so threads run but we don't block on __exit__.
+        ex.shutdown(wait=False, cancel_futures=False)
+        winner = None
+        for fut in concurrent.futures.as_completed(futures):
+            payload = fut.result()
+            if payload is not None:
+                winner = payload
+                break
+        if winner is not None:
+            return winner
     return None
 
 
