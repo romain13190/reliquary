@@ -254,6 +254,10 @@ class ValidationService:
             tokenizer=tokenizer,
         )
         self._active_batcher = None
+        # Stashed by ``_set_window_randomness`` after the drand fetch
+        # succeeds; consumed by the background verify task (Task 5).
+        # ``None`` on the mock-only path.
+        self._last_beacon: dict | None = None
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
@@ -414,9 +418,14 @@ class ValidationService:
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                self._active_batcher.randomness = await self._derive_randomness(
+                randomness, beacon = await self._derive_randomness(
                     subtensor, self._window_n,
                 )
+                self._active_batcher.randomness = randomness
+                # Beacon is None on the mock path; verify scheduling
+                # only fires in real-drand mode. Wired to the background
+                # task in the next commit (Task 5).
+                self._last_beacon = beacon
                 if attempt > 0:
                     logger.info(
                         "Window %d: randomness derived on attempt %d",
@@ -981,14 +990,21 @@ class ValidationService:
             )
             await asyncio.sleep(delay)
 
-    async def _derive_randomness(self, subtensor, target_window: int) -> str:
+    async def _derive_randomness(
+        self, subtensor, target_window: int,
+    ) -> tuple[str, dict | None]:
         """v2.3+: drand-only seed bound to the round publishing AT window OPEN.
+
+        Returns ``(window_randomness, beacon_or_None)``. ``beacon`` is the
+        raw drand beacon dict (``{round, randomness, signature, ...}``)
+        when the drand path is active, so the caller can schedule a
+        background bittensor_drand cross-check. ``None`` on the legacy
+        mock path (no cross-check possible).
 
         Called after ``_wait_for_next_drand_boundary`` so the wall-clock-
         current drand round corresponds to the one whose σ just became
         publicly available. Miners cannot pre-fetch this σ because it
-        didn't exist a few seconds ago. ``subtensor``/``target_window``
-        are kept in the signature for the legacy mock-only path.
+        didn't exist a few seconds ago.
         """
         if self.use_drand:
             import time
@@ -998,12 +1014,13 @@ class ValidationService:
                 time.time(), chain_info["genesis_time"], chain_info["period"],
             )
             beacon = get_beacon(round_id=str(drand_round), use_drand=True)
-            return chain.compute_window_randomness(
+            randomness = chain.compute_window_randomness(
                 None, beacon["randomness"], drand_round=beacon["round"],
             )
+            return randomness, beacon
         # Legacy mock-only path: still uses block_hash so tests that
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
-        return chain.compute_window_randomness(block_hash)
+        return chain.compute_window_randomness(block_hash), None
 
 
