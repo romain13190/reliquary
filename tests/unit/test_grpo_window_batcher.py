@@ -1425,3 +1425,13 @@ def test_seal_extension_no_early_fire_on_late_drand_submission():
         "late-drand item in worker path must reject without firing seal; "
         "otherwise queued trigger-round items get dropped at is_sealed"
     )
+
+
+def test_batcher_beacon_invalid_defaults_false():
+    """The background drand-verify task sets ``beacon_invalid`` to True
+    if the cross-check against bittensor_drand fails post-OPEN.
+    Default at construction must be False so an un-flagged batcher
+    proceeds to train+publish normally.
+    """
+    b = _make_batcher()
+    assert b.beacon_invalid is False
