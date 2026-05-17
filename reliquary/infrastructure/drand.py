@@ -286,7 +286,7 @@ def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
         ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(urls))
         futures = {ex.submit(_try, u): u for u in urls}
         # Shut down immediately so threads run but we don't block on __exit__.
-        ex.shutdown(wait=False, cancel_futures=False)
+        ex.shutdown(wait=False, cancel_futures=True)
         winner = None
         for fut in concurrent.futures.as_completed(futures):
             payload = fut.result()

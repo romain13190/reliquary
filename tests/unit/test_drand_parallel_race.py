@@ -19,6 +19,24 @@ import pytest
 from reliquary.infrastructure import drand as D
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _prewarm_drand_params():
+    """Cold-start protection. ``drand.py`` calls ``_ensure_params``
+    at import time which hits the real network for chain info. On
+    a fresh Python process this warms the urllib3/SSL/DNS state
+    *during* the parallel-race test, blowing the 300ms budget. By
+    pinning ``_ensure_params`` to a no-op for the test session we
+    avoid any real-network interference with the mocked
+    ``_SESSION.get``.
+    """
+    original = D._ensure_params
+    D._ensure_params = lambda refresh=False: None
+    try:
+        yield
+    finally:
+        D._ensure_params = original
+
+
 class _FakeResp:
     def __init__(self, status_code: int, payload: dict | None):
         self.status_code = status_code
