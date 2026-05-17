@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import threading
 from threading import Lock
 from typing import Any
 
@@ -53,6 +54,20 @@ _RETRY = Retry(
 _SESSION = requests.Session()
 _SESSION.mount("https://", HTTPAdapter(max_retries=_RETRY))
 _HEADERS = {"User-Agent": "Reliquary-drand/0.2"}
+
+# Per-thread sessions for _http_get_json's parallel race — avoids urllib3
+# HTTPConnectionPool contention when a straggler on a dead relay holds a slot.
+_thread_local = threading.local()
+
+
+def _get_thread_session() -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        # No retries — race siblings provide the fallback (matches _RETRY rationale).
+        s.mount("https://", HTTPAdapter(max_retries=0))
+        _thread_local.session = s
+    return s
 
 # ─────────────────────────────  CHAINS / STATE  ─────────────────────────────
 
@@ -276,7 +291,7 @@ def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
 
         def _try(url: str) -> dict[str, Any] | None:
             try:
-                r = _SESSION.get(url, timeout=(0.5, 2.0), headers=_HEADERS)
+                r = _get_thread_session().get(url, timeout=(0.5, 2.0), headers=_HEADERS)
                 if r.status_code != 200:
                     logger.debug(f"[Drand] GET {url} -> HTTP {r.status_code} {r.text[:160]!r}")
                     return None

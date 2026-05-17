@@ -19,6 +19,16 @@ import pytest
 from reliquary.infrastructure import drand as D
 
 
+def _patch_thread_sessions(monkeypatch, fake_get):
+    """Replace D._get_thread_session so every worker thread gets a session
+    whose .get is the supplied fake. Use this instead of patching D._SESSION.get
+    — the prod path uses thread-local sessions (post-tail-latency fix)."""
+    class _FakeSess:
+        def get(self, *a, **kw):
+            return fake_get(*a, **kw)
+    monkeypatch.setattr(D, "_get_thread_session", lambda: _FakeSess())
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _prewarm_drand_params():
     """Cold-start protection. ``drand.py`` calls ``_ensure_params``
@@ -66,7 +76,7 @@ def _make_relay_get(latency_by_base: dict[str, float], payload_by_base: dict[str
     return _fake_get
 
 
-def test_http_get_json_returns_fastest_relay():
+def test_http_get_json_returns_fastest_relay(monkeypatch):
     """All 5 relays fire in parallel; the one that returns first wins,
     regardless of shuffle order. Total wall-clock must be near the
     fastest relay's latency, not the sum."""
@@ -78,10 +88,10 @@ def test_http_get_json_returns_fastest_relay():
     latencies[relays[2]] = 0.05
     payloads = {r: {"randomness": "aa" * 32, "round": 1, "from": r} for r in relays}
 
-    with patch.object(D._SESSION, "get", side_effect=_make_relay_get(latencies, payloads)):
-        t0 = time.monotonic()
-        result = D._http_get_json(["/v2/chains/x/rounds/1"])
-        elapsed = time.monotonic() - t0
+    _patch_thread_sessions(monkeypatch, _make_relay_get(latencies, payloads))
+    t0 = time.monotonic()
+    result = D._http_get_json(["/v2/chains/x/rounds/1"])
+    elapsed = time.monotonic() - t0
 
     assert result is not None
     assert result["from"] == relays[2], f"expected winner {relays[2]}, got {result.get('from')}"
@@ -91,7 +101,7 @@ def test_http_get_json_returns_fastest_relay():
     )
 
 
-def test_http_get_json_survives_majority_failure():
+def test_http_get_json_survives_majority_failure(monkeypatch):
     """Four relays fail/timeout, one responds at 200ms. Result must
     arrive in ~200ms, NOT 4 × (connect_timeout + read_timeout)."""
     relays = D.DRAND_URLS
@@ -101,10 +111,10 @@ def test_http_get_json_survives_majority_failure():
     payloads = {r: None for r in relays}  # all fail by default
     payloads[relays[-1]] = {"randomness": "bb" * 32, "round": 2, "from": relays[-1]}
 
-    with patch.object(D._SESSION, "get", side_effect=_make_relay_get(latencies, payloads)):
-        t0 = time.monotonic()
-        result = D._http_get_json(["/v2/chains/x/rounds/2"])
-        elapsed = time.monotonic() - t0
+    _patch_thread_sessions(monkeypatch, _make_relay_get(latencies, payloads))
+    t0 = time.monotonic()
+    result = D._http_get_json(["/v2/chains/x/rounds/2"])
+    elapsed = time.monotonic() - t0
 
     assert result is not None
     assert result["from"] == relays[-1]
@@ -113,20 +123,20 @@ def test_http_get_json_survives_majority_failure():
     )
 
 
-def test_http_get_json_returns_none_when_all_fail():
+def test_http_get_json_returns_none_when_all_fail(monkeypatch):
     """Contract preserved: if every relay errors, return None (callers
     handle the fallback / raise themselves)."""
     relays = D.DRAND_URLS
     latencies = {r: 0.05 for r in relays}
     payloads = {r: None for r in relays}
 
-    with patch.object(D._SESSION, "get", side_effect=_make_relay_get(latencies, payloads)):
-        result = D._http_get_json(["/v2/chains/x/rounds/3"])
+    _patch_thread_sessions(monkeypatch, _make_relay_get(latencies, payloads))
+    result = D._http_get_json(["/v2/chains/x/rounds/3"])
 
     assert result is None
 
 
-def test_http_get_json_tries_all_paths_if_first_path_404s():
+def test_http_get_json_tries_all_paths_if_first_path_404s(monkeypatch):
     """The path-list fallback (v2 → v1 → root_v1) must still work.
     Per-base we race relays, but if every relay returns non-200 for
     path[0], the function must fall through to path[1]."""
@@ -142,21 +152,19 @@ def test_http_get_json_tries_all_paths_if_first_path_404s():
             raise RuntimeError("v2 endpoint down")
         return _FakeResp(200, {"randomness": "cc" * 32, "round": 4, "path": "v1"})
 
-    with patch.object(D._SESSION, "get", side_effect=_fake_get):
-        result = D._http_get_json(["/v2/chains/x/rounds/4", "/x/public/4"])
+    _patch_thread_sessions(monkeypatch, _fake_get)
+    result = D._http_get_json(["/v2/chains/x/rounds/4", "/x/public/4"])
 
     assert result is not None
     assert result["path"] == "v1"
 
 
-def test_http_get_json_fails_fast_on_all_relays_503():
+def test_http_get_json_fails_fast_on_all_relays_503(monkeypatch):
     """When every relay returns HTTP 503, the function must return
     None within ~2s (one timeout cycle), NOT ~11.5s (4 retries with
     backoff per relay). This pins the contract that _RETRY does not
     multiply the parallel race's worst-case latency.
     """
-    relays = D.DRAND_URLS
-
     class _Resp503:
         status_code = 503
         text = "service unavailable"
@@ -166,10 +174,10 @@ def test_http_get_json_fails_fast_on_all_relays_503():
     def _fake_get(url, timeout=None, headers=None):
         return _Resp503()
 
-    with patch.object(D._SESSION, "get", side_effect=_fake_get):
-        t0 = time.monotonic()
-        result = D._http_get_json(["/v2/chains/x/rounds/503"])
-        elapsed = time.monotonic() - t0
+    _patch_thread_sessions(monkeypatch, _fake_get)
+    t0 = time.monotonic()
+    result = D._http_get_json(["/v2/chains/x/rounds/503"])
+    elapsed = time.monotonic() - t0
 
     assert result is None
     assert elapsed < 1.0, (
