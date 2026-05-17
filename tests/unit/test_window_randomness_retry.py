@@ -34,6 +34,7 @@ class _FakeService:
 
     def __init__(self) -> None:
         self._active_batcher: _FakeBatcher | None = _FakeBatcher()
+        self._last_beacon: dict | None = None
         self._window_n = 100
         self._derive_call_count = 0
         self._derive_succeed_on_attempt = 1  # 1-indexed
@@ -42,7 +43,7 @@ class _FakeService:
     async def _derive_randomness(self, subtensor, window_n):
         self._derive_call_count += 1
         if self._derive_call_count >= self._derive_succeed_on_attempt:
-            return "0xdeadbeef"
+            return "0xdeadbeef", None  # mock-mode: no beacon
         raise self._derive_raise("simulated finney 503")
 
     async def _set_window_randomness(self, subtensor) -> None:
@@ -51,9 +52,11 @@ class _FakeService:
         last_exc: BaseException | None = None
         for attempt in range(3):
             try:
-                self._active_batcher.randomness = await self._derive_randomness(
+                randomness, beacon = await self._derive_randomness(
                     subtensor, self._window_n,
                 )
+                self._active_batcher.randomness = randomness
+                self._last_beacon = beacon
                 return
             except asyncio.CancelledError:
                 raise

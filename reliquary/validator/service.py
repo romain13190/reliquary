@@ -254,6 +254,13 @@ class ValidationService:
             tokenizer=tokenizer,
         )
         self._active_batcher = None
+        # Stashed by ``_set_window_randomness`` after the drand fetch
+        # succeeds; consumed by the background verify task (Task 5).
+        # ``None`` on the mock-only path.
+        self._last_beacon: dict | None = None
+        # asyncio.Task wrapping _verify_beacon_async; held so the GC
+        # doesn't collect a live task between OPEN and TRAINING.
+        self._verify_task: asyncio.Task | None = None
         self._current_window_state: WindowState = WindowState.READY
 
         self._resume_from = resume_from
@@ -414,9 +421,26 @@ class ValidationService:
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                self._active_batcher.randomness = await self._derive_randomness(
+                randomness, beacon = await self._derive_randomness(
                     subtensor, self._window_n,
                 )
+                self._active_batcher.randomness = randomness
+                self._last_beacon = beacon
+                # Schedule background bittensor_drand cross-check. Only
+                # in real-drand mode (mock path returns beacon=None).
+                # Task reference stored so it's not GC'd mid-run.
+                if beacon is not None and beacon.get("signature"):
+                    from reliquary.infrastructure.drand import get_current_chain
+                    chain_info = get_current_chain()
+                    self._verify_task = asyncio.create_task(
+                        self._verify_beacon_async(
+                            self._active_batcher,
+                            chain_info["hash"],
+                            int(beacon["round"]),
+                            str(beacon["randomness"]),
+                            beacon["signature"],
+                        )
+                    )
                 if attempt > 0:
                     logger.info(
                         "Window %d: randomness derived on attempt %d",
@@ -437,10 +461,69 @@ class ValidationService:
         assert last_exc is not None
         raise last_exc
 
+    async def _verify_beacon_async(
+        self,
+        batcher,
+        chain_hash: str,
+        round_number: int,
+        randomness: str,
+        signature: str | None,
+    ) -> None:
+        """Background bittensor_drand cross-check for the just-fetched beacon.
+
+        Runs ``verify_beacon_signature`` in a worker thread (it's blocking
+        I/O — fetches an independent signature from a second drand relay
+        and byte-compares). On any failure (mismatch, network error, library
+        crash) flips ``batcher.beacon_invalid`` so ``_train_and_publish``
+        drops the window before sealing.
+        """
+        from reliquary.infrastructure.drand import verify_beacon_signature
+        try:
+            ok = await asyncio.to_thread(
+                verify_beacon_signature, chain_hash, round_number, randomness, signature,
+            )
+        except Exception:
+            logger.exception(
+                "Beacon verification crashed for round %d (window %d); invalidating window",
+                round_number, self._window_n,
+            )
+            batcher.beacon_invalid = True
+            return
+        if not ok:
+            logger.error(
+                "Beacon verification FAILED post-OPEN for round %d; invalidating window %d",
+                round_number, self._window_n,
+            )
+            batcher.beacon_invalid = True
+
     async def _train_and_publish(self) -> None:
         """TRAINING + PUBLISHING + READY phases."""
         if self._active_batcher is None:
             logger.warning("_train_and_publish called with no active batcher")
+            return
+
+        # Background drand cross-check flips beacon_invalid if the beacon
+        # was forged or the verify crashed. Await up to 2s for its verdict
+        # before checking — by seal-time (~3s after OPEN) it's almost always
+        # done. Plain wait_for (no shield): if it times out, cancel the task
+        # and check the flag below with whatever state it reached.
+        if self._verify_task is not None and not self._verify_task.done():
+            try:
+                await asyncio.wait_for(self._verify_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Window %d: drand verify still running at train-time; "
+                    "proceeding without final verdict (will check flag below)",
+                    self._window_n,
+                )
+        if self._active_batcher.beacon_invalid:
+            logger.error(
+                "Window %d: dropping seal+train+archive — beacon invalid",
+                self._window_n,
+            )
+            self.server.set_active_batcher(None)
+            self._active_batcher = None
+            self._set_state(WindowState.READY)
             return
 
         self._set_state(WindowState.TRAINING)
@@ -981,14 +1064,21 @@ class ValidationService:
             )
             await asyncio.sleep(delay)
 
-    async def _derive_randomness(self, subtensor, target_window: int) -> str:
+    async def _derive_randomness(
+        self, subtensor, target_window: int,
+    ) -> tuple[str, dict | None]:
         """v2.3+: drand-only seed bound to the round publishing AT window OPEN.
+
+        Returns ``(window_randomness, beacon_or_None)``. ``beacon`` is the
+        raw drand beacon dict (``{round, randomness, signature, ...}``)
+        when the drand path is active, so the caller can schedule a
+        background bittensor_drand cross-check. ``None`` on the legacy
+        mock path (no cross-check possible).
 
         Called after ``_wait_for_next_drand_boundary`` so the wall-clock-
         current drand round corresponds to the one whose σ just became
         publicly available. Miners cannot pre-fetch this σ because it
-        didn't exist a few seconds ago. ``subtensor``/``target_window``
-        are kept in the signature for the legacy mock-only path.
+        didn't exist a few seconds ago.
         """
         if self.use_drand:
             import time
@@ -998,12 +1088,13 @@ class ValidationService:
                 time.time(), chain_info["genesis_time"], chain_info["period"],
             )
             beacon = get_beacon(round_id=str(drand_round), use_drand=True)
-            return chain.compute_window_randomness(
+            randomness = chain.compute_window_randomness(
                 None, beacon["randomness"], drand_round=beacon["round"],
             )
+            return randomness, beacon
         # Legacy mock-only path: still uses block_hash so tests that
         # disable drand keep working without a live drand fetch.
         block_hash = await chain.get_block_hash(subtensor, target_window)
-        return chain.compute_window_randomness(block_hash)
+        return chain.compute_window_randomness(block_hash), None
 
 

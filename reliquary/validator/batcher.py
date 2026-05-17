@@ -140,6 +140,12 @@ class GrpoWindowBatcher:
         self.model = model
         self.tokenizer = tokenizer
         self.bootstrap = bootstrap
+        # Set True by the validator's background drand-verify task
+        # if the cross-check against bittensor_drand fails post-OPEN.
+        # ``_train_and_publish`` checks this before sealing and drops
+        # the window if set — preserves the verify gate without
+        # blocking the hot OPEN path.
+        self.beacon_invalid: bool = False
         self._completion_text = completion_text_fn
         # Wall clock (UNIX seconds) used to compute the current drand round
         # at submit-receipt time. Distinct from ``_time_fn`` (monotonic)

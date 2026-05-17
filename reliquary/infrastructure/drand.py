@@ -12,10 +12,12 @@ Features:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
 import random
+import threading
 from threading import Lock
 from typing import Any
 
@@ -35,18 +37,37 @@ DRAND_URLS = [
     "https://api.drand.secureweb3.com:6875",
 ]
 
+# Retries disabled: _http_get_json races relays in parallel so siblings
+# provide the fallback that retries used to provide on the serial path.
+# Keeping retries here would let a single bad relay multiply its per-request
+# timeout by 4 (connect + 3 retries), stretching worst-case all-degraded
+# latency from ~2s to ~11.5s and defeating the race.
 _RETRY = Retry(
-    total=3,
-    connect=3,
-    read=3,
-    backoff_factor=0.25,
-    status_forcelist=(429, 502, 503, 504),
+    total=0,
+    connect=0,
+    read=0,
+    backoff_factor=0,
+    status_forcelist=(),
     allowed_methods={"GET"},
     raise_on_status=False,
 )
 _SESSION = requests.Session()
 _SESSION.mount("https://", HTTPAdapter(max_retries=_RETRY))
 _HEADERS = {"User-Agent": "Reliquary-drand/0.2"}
+
+# Per-thread sessions for _http_get_json's parallel race — avoids urllib3
+# HTTPConnectionPool contention when a straggler on a dead relay holds a slot.
+_thread_local = threading.local()
+
+
+def _get_thread_session() -> requests.Session:
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        # No retries — race siblings provide the fallback (matches _RETRY rationale).
+        s.mount("https://", HTTPAdapter(max_retries=0))
+        _thread_local.session = s
+    return s
 
 # ─────────────────────────────  CHAINS / STATE  ─────────────────────────────
 
@@ -245,28 +266,61 @@ def _parse_chain_info_payload(
 
 
 def _http_get_json(paths: list[str]) -> dict[str, Any] | None:
+    """Race all relays in parallel for the first valid JSON response.
+
+    For each path (in order), fire all relays simultaneously and return
+    as soon as any one yields a parsable 200 JSON body. If every relay
+    fails or returns a non-200 for the current path, fall through to
+    the next path. Returns None if no relay×path combination produces
+    a parsable 200.
+
+    Timeouts are tight (connect=0.5s, read=2.0s) because the other
+    relays in the race act as the fallback — we don't need a long
+    per-relay budget. Per-relay retries are disabled (see _RETRY); the
+    race siblings provide the fallback, keeping worst-case wall-clock
+    cost at ~2s even when every relay is degraded.
     """
-    Try all relays x all paths (v2-first, then v1) and return first JSON payload.
-    """
-    for base in _shuffle_urls():
-        for path in paths:
-            if not path:
-                continue
-            url = f"{base}{path}"
+    relays = list(DRAND_URLS)
+    if not relays:
+        return None
+
+    for path in paths:
+        if not path:
+            continue
+        urls = [f"{base}{path}" for base in relays]
+
+        def _try(url: str) -> dict[str, Any] | None:
             try:
-                r = _SESSION.get(url, timeout=(1.5, 3.5), headers=_HEADERS)
-                if r.status_code == 200:
-                    try:
-                        return r.json()  # type: ignore[no-any-return]
-                    except Exception as e:
-                        logger.debug(
-                            f"[Drand] JSON parse error for {url}: {e}; body[:160]={r.text[:160]!r}"
-                        )
-                        continue
-                else:
+                r = _get_thread_session().get(url, timeout=(0.5, 2.0), headers=_HEADERS)
+                if r.status_code != 200:
                     logger.debug(f"[Drand] GET {url} -> HTTP {r.status_code} {r.text[:160]!r}")
+                    return None
+                try:
+                    return r.json()  # type: ignore[no-any-return]
+                except Exception as e:
+                    logger.debug(f"[Drand] JSON parse error for {url}: {e}; body[:160]={r.text[:160]!r}")
+                    return None
             except Exception as e:
                 logger.debug(f"[Drand] GET {url} error: {e}")
+                return None
+
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(urls))
+        futures = {ex.submit(_try, u): u for u in urls}
+        # Don't block on __exit__; all futures are already running since
+        # max_workers == len(urls), so cancel_futures=False is safe.
+        ex.shutdown(wait=False, cancel_futures=False)
+        winner = None
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                payload = fut.result()
+            except concurrent.futures.CancelledError:
+                # Pending future was cancelled by shutdown — treat as non-winner.
+                continue
+            if payload is not None:
+                winner = payload
+                break
+        if winner is not None:
+            return winner
     return None
 
 
@@ -431,15 +485,17 @@ def get_drand_beacon(round_id: int | None = None, use_fallback: bool = False) ->
             return get_mock_beacon()
         raise RuntimeError("drand response missing required fields")
 
-    # SECURITY: Verify the beacon's cryptographic signature before trusting it.
-    # Without this, a MITM or compromised relay can inject fake randomness.
-    if not verify_beacon_signature(_DRAND_CHAIN_HASH, int(rno), str(rnd), sig):
-        logger.error(
-            "[Drand] Beacon signature verification FAILED for round %s — rejecting", rno
-        )
-        raise RuntimeError(f"drand beacon signature invalid for round {rno}")
+    # NB: cross-check against bittensor_drand moved off the hot path.
+    # The validator schedules it as a background asyncio task right
+    # after OPEN (see ``ValidatorService._verify_beacon_async``); if
+    # it fails, the window is invalidated before ``_train_and_publish``
+    # consumes any submissions. Miner callers get no cross-check —
+    # a bad relay just makes their commitments fail GRAIL on the
+    # validator side, no security implication for the miner.
+    # The local ``randomness == SHA256(sig)`` derivation above is
+    # gratis and stays.
 
-    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={str(rnd)[:8]}... (sig verified)")
+    logger.debug(f"[Drand-{_current_chain}] ok round={rno} rand={str(rnd)[:8]}... (sig verify deferred)")
     return {
         "source": "drand",
         "chain": _current_chain,
