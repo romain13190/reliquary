@@ -223,6 +223,41 @@ HASH_DEDUP_RETENTION_WINDOWS = 10000
 # — one slot per prompt a hotkey can credibly win in a window.
 MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW = 8
 
+# Per-hotkey cap on BAD_ENVELOPE_SIGNATURE rejects per window. The
+# envelope-signature gate (PR #35) deliberately does NOT bump
+# ``_per_window_counts`` on bad-sig rejects so an anonymous spoofer
+# cannot drain a victim's legitimate quota by spamming bogus packets
+# under the victim's hotkey — that anti-DoS property is preserved.
+#
+# This cap closes a follow-on side-channel discovered in the wild: the
+# zero-quota bad-envelope channel was being used by the LEGITIMATE
+# hotkey owner to warm HTTP/1.1 keep-alive connections at zero quota
+# cost (fire ~24 bogus POSTs to prime sockets, then ride the warm
+# connections for the real signed POSTs and gain a ~20-30 ms RTT edge
+# on the seal-trigger race against honest single-instance miners).
+#
+# Two defences combine in the fix:
+#   1. ``Connection: close`` is set on every BAD_ENVELOPE_SIGNATURE
+#      response, so the warm-up cannot happen (server tears the socket
+#      down immediately; attacker pays handshake on the next packet).
+#   2. This per-hotkey cap bounds bandwidth and verdict-ring noise even
+#      against an attacker who doesn't care about priming — past the cap
+#      the response is still BAD_ENVELOPE_SIGNATURE but the verdict is
+#      no longer appended to the per-hotkey ring (which would otherwise
+#      let a spoofer flood the victim's ``/verdicts/{hotkey}`` history
+#      with junk that displaces legitimate entries).
+#
+# Crucially the per-hotkey rate-limit quota is never moved by these
+# rejects, so PR #35's invariant holds end-to-end: an anonymous spoofer
+# firing N bad packets against victim V's hotkey writes at most
+# ``MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW`` verdict-ring entries and
+# burns N handshakes, but V's full legitimate quota is untouched.
+#
+# Cap of 2 is low because honest miners have no reason to emit multiple
+# bad envelopes per window — anything beyond a single accidental signing
+# bug strongly suggests intent.
+MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW = 2
+
 # When True, /submit verifies ``envelope_signature`` before any per-hotkey
 # rate-limit increment, and rejects unsigned / malformed / wrong-signer
 # requests as BAD_ENVELOPE_SIGNATURE. This closes the trivial DoS where

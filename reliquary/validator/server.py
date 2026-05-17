@@ -21,12 +21,13 @@ import logging
 import time
 from typing import Any, Callable
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel
 import uvicorn
 
 from reliquary.constants import (
     ENFORCE_ENVELOPE_SIGNATURE,
+    MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW,
     MAX_SUBMISSIONS_PER_HOTKEY_PER_WINDOW,
     VALIDATOR_HTTP_PORT,
 )
@@ -74,6 +75,13 @@ class ValidatorServer:
         # heavier check so a saturated miner trip the rate limit on the
         # cheapest possible path.
         self._per_window_counts: dict[str, int] = {}
+        # Per-hotkey BAD_ENVELOPE_SIGNATURE counter. Reset on batcher
+        # swap alongside ``_per_window_counts``. Caps how many bad
+        # packets one hotkey can burn per window — see
+        # ``MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW`` for the rationale
+        # (closes the connection-priming side-channel without re-opening
+        # the spoof-DoS that PR #35 closed).
+        self._bad_envelope_counts: dict[str, int] = {}
         # Per-hotkey ring buffer of recent verdicts. Keys are miner ss58
         # addresses; values are deques of ``Verdict``-shaped dicts (stored
         # as plain dicts to keep the hot path serialization-free).
@@ -85,6 +93,7 @@ class ValidatorServer:
         # New batcher → new window → reset per-hotkey counters.
         if batcher is not self.active_batcher:
             self._per_window_counts = {}
+            self._bad_envelope_counts = {}
         self.active_batcher = batcher
 
     def set_current_state(self, state) -> None:
@@ -180,6 +189,7 @@ class ValidatorServer:
         async def submit(
             request: BatchSubmissionRequest,
             http_request: Request,
+            response: Response,
         ) -> BatchSubmissionResponse:
             from reliquary.protocol.submission import WindowState
             # ASGI middleware stamped this. Falls back to time.time() if a
@@ -236,16 +246,54 @@ class ValidatorServer:
                     nonce=request.nonce,
                     envelope_signature=request.envelope_signature,
                 ):
-                    # NB: we still record the verdict against the
-                    # CLAIMED hotkey — that's what the rejected packet
-                    # carried — but we do NOT increment its rate-limit
-                    # counter. Recording lets a legitimate miner see in
-                    # /verdicts that someone's spoofing them.
-                    self.record_verdict(
-                        hk, request.merkle_root, False,
-                        RejectReason.BAD_ENVELOPE_SIGNATURE,
-                        window_n=request.window_start,
-                    )
+                    # CONNECTION-PRIMING DEFENCE — force socket teardown.
+                    #
+                    # Without this header, an HTTP/1.1 keep-alive client
+                    # can fire a burst of cheap BAD_ENVELOPE_SIGNATURE
+                    # packets to warm a pool of TCP (+ TLS) connections
+                    # at zero quota cost — those PR #35 made deliberately
+                    # quota-free — then dispatch the real signed POSTs
+                    # over the already-warm sockets. The observed pattern
+                    # is 24 unsigned packets followed by 8 valid signed
+                    # ones, giving the exploiter a ~20-30 ms RTT edge on
+                    # the seal-trigger race against honest single-instance
+                    # miners. Setting ``Connection: close`` makes uvicorn
+                    # close the socket after the response — the attacker
+                    # pays a fresh handshake on every bad packet and the
+                    # warm-up is no longer free.
+                    response.headers["Connection"] = "close"
+
+                    # PER-HOTKEY BAD-ENVELOPE CAP — bandwidth + ring guard.
+                    #
+                    # The quota counter is STILL never bumped here (that
+                    # is the invariant PR #35 added to keep an anonymous
+                    # spoofer from draining a victim's legitimate
+                    # 8-submission budget). What we add is a strict cap
+                    # on how many BAD_ENVELOPE_SIGNATURE verdicts get
+                    # written into the per-hotkey verdict ring. Past the
+                    # cap we still return BAD_ENVELOPE_SIGNATURE — the
+                    # response shape is unchanged — but we silently
+                    # drop the ring write so a spoofer cannot flood a
+                    # victim's ``/verdicts/{hotkey}`` history and
+                    # displace legitimate verdicts.
+                    #
+                    # The first ``MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW``
+                    # bad packets per hotkey per window still surface in
+                    # /verdicts so a legitimate miner being spoofed
+                    # learns about it.
+                    bn = self._bad_envelope_counts.get(hk, 0)
+                    if bn < MAX_BAD_ENVELOPE_PER_HOTKEY_PER_WINDOW:
+                        self._bad_envelope_counts[hk] = bn + 1
+                        # NB: we still record the verdict against the
+                        # CLAIMED hotkey — that's what the rejected packet
+                        # carried — but we do NOT increment its rate-limit
+                        # counter. Recording lets a legitimate miner see
+                        # in /verdicts that someone's spoofing them.
+                        self.record_verdict(
+                            hk, request.merkle_root, False,
+                            RejectReason.BAD_ENVELOPE_SIGNATURE,
+                            window_n=request.window_start,
+                        )
                     return BatchSubmissionResponse(
                         accepted=False,
                         reason=RejectReason.BAD_ENVELOPE_SIGNATURE,
