@@ -865,13 +865,17 @@ from reliquary.validator.verifier import ProofResult
 
 
 def _grail_with_logits(seq_len: int, eos_id: int = 99):
-    """Stub that returns logits where EOS is highly probable everywhere."""
+    """Stub that opts into behavioural checks with high EOS probability
+    at the termination position. The actual EOS pass/fail depends on
+    whether the surrounding model/tokenizer stub declares ``eos_id`` —
+    this fixture leaves that to the test setup so we can exercise both
+    the EOS-present and EOS-missing termination paths.
+    """
     def _fn(commit, model, randomness):
-        logits = torch.zeros(seq_len, 100)
-        logits[:, eos_id] = 5.0
         return ProofResult(
-            all_passed=True, passed=1, checked=1, logits=logits,
-            sketch_diff_max=0,
+            all_passed=True, passed=1, checked=1, sketch_diff_max=0,
+            has_sparse_outputs=True,
+            p_stop=0.99,
         )
     return _fn
 

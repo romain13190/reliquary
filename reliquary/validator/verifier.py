@@ -5,7 +5,7 @@ exposes the per-commit checks that touch the model or the signature scheme.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -13,6 +13,8 @@ import torch
 from reliquary.constants import (
     CHALLENGE_K,
     LAYER_INDEX,
+    MIN_EOS_PROBABILITY,
+    T_PROTO,
 )
 
 logger = logging.getLogger(__name__)
@@ -22,22 +24,49 @@ logger = logging.getLogger(__name__)
 class ProofResult:
     """Return value of verify_commitment_proofs.
 
-    The ``logits`` field is the cached per-token logits tensor from the
-    validator's forward pass at LAYER_INDEX. Downstream behavioural
-    validators (logprob / distribution) read it to avoid re-running the
-    forward pass.
+    ``has_sparse_outputs`` discriminates the production path from legacy
+    test stubs. When True, the sparse fields below carry the validator's
+    precomputed values from the forward pass — used by the behavioural
+    checks (termination / logprob / distribution) instead of round-tripping
+    the full logits tensor through PCIe. When False the batcher skips
+    behavioural checks; this preserves the prior contract under which a
+    stub returning empty logits opted the rollout out of behavioural
+    enforcement.
 
     ``sketch_diff_max`` is the worst per-position |miner_sketch -
-    validator_sketch| across the K challenge positions (mod PRIME_Q),
-    surfaced for post-hoc threshold calibration even when the proof
-    passed the current tolerance.
+    validator_sketch| across the K sketch-challenge positions, surfaced
+    for post-hoc threshold calibration even when the proof passed the
+    current tolerance.
     """
 
     all_passed: bool
     passed: int
     checked: int
-    logits: torch.Tensor  # shape: [seq_len, vocab_size], on CPU
     sketch_diff_max: int = 0
+    has_sparse_outputs: bool = False
+    # Accepted for backwards-compatibility with stubs that constructed
+    # ``ProofResult(..., logits=torch.empty(0))`` before the keep-on-GPU
+    # refactor. Production never populates this — sparse fields below
+    # carry everything the behavioural checks need. Default is a tiny
+    # empty tensor; stubs that opt into behavioural enforcement should
+    # set has_sparse_outputs=True and populate the sparse fields.
+    logits: Any = field(default_factory=lambda: torch.empty(0))
+    # Termination: EOS probability mass at logits[seq_len - 2]. None when
+    # the model has no eos_token_id configured or seq_len < 2.
+    p_stop: float | None = None
+    # Logprob challenge: absolute token positions sampled by
+    # indices_from_root_in_range, paired with the validator's
+    # log-softmax(logits[idx - 1])[tokens[idx]] for each. Empty when
+    # completion_length < CHALLENGE_K or any sampled index is out of
+    # range — the logprob check treats that as a deterministic fail.
+    challenge_lp_indices: list[int] = field(default_factory=list)
+    challenge_lp_values: list[float] = field(default_factory=list)
+    # Distribution check: chosen-token probability under T_PROTO at each
+    # valid completion-producing position. One float per (t-1, t) pair
+    # where prompt_length <= t < prompt_length + completion_length. May
+    # be shorter than completion_length when boundary positions are
+    # skipped (t == 0, t - 1 >= seq_len, t >= len(tokens)).
+    completion_chosen_probs: list[float] = field(default_factory=list)
 
 
 def verify_signature(commit: dict, hotkey: str) -> bool:
@@ -47,8 +76,32 @@ def verify_signature(commit: dict, hotkey: str) -> bool:
     return verify_commit_signature(commit, hotkey)
 
 
+def _eos_set_from_model(model: Any, tokenizer: Any) -> set[int]:
+    """Resolve the EOS token set the way termination/p_stop both expect.
+
+    Tries ``model.generation_config.eos_token_id`` first (production
+    Qwen3 ships [151645, 151643] there), then falls back to the
+    tokenizer's ``eos_token_id``. Returns an empty set when nothing is
+    declared — callers should treat that as "no EOS gate available".
+    """
+    eos_ids: Any = None
+    gen_cfg = getattr(model, "generation_config", None) if model is not None else None
+    if gen_cfg is not None:
+        eos_ids = getattr(gen_cfg, "eos_token_id", None)
+    if eos_ids is None:
+        eos_ids = getattr(tokenizer, "eos_token_id", None)
+    if eos_ids is None:
+        return set()
+    if isinstance(eos_ids, int):
+        eos_ids = [eos_ids]
+    return {int(e) for e in eos_ids if e is not None}
+
+
 def verify_termination(
-    commit: dict, tokenizer: Any, logits: torch.Tensor, model: Any = None,
+    commit: dict,
+    tokenizer: Any,
+    proof: "ProofResult | None" = None,
+    model: Any = None,
 ) -> bool:
     """Two paths to a valid termination, both gaming-safe:
 
@@ -58,60 +111,31 @@ def verify_termination(
     We check the *total* length rather than ``completion_length`` alone
     because honest miners running under a ``max_model_len`` ceiling
     (e.g. vLLM, where prompt + generation ≤ max_model_len) can never
-    satisfy ``completion_length ≥ cap`` — the prompt eats part of the
-    budget. ``prompt_length`` is verified against the canonical prompt
-    upstream (PROMPT_MISMATCH check), so a miner cannot inflate it to
-    cheat. A miner who'd try to game this path by truncating early can't:
-    anything below the cap fails Path 1, and a ``tokens[-1]`` that wasn't
-    actually sampled by the model fails Path 2's p_stop check (the GRAIL
-    forward replays the logits, so forged stops are detected).
+    satisfy ``completion_length ≥ cap``.
 
-    Path 2 — natural EOS termination: ``tokens[-1]`` is one of the stop
-    tokens declared in ``model.generation_config.eos_token_id`` (Qwen3-Instruct
-    has ``[151645, 151643]``) AND its probability mass at ``logits[-2]`` is at
-    least ``MIN_EOS_PROBABILITY``. The probability gate catches sampler-forced
-    stops at near-zero probability that wouldn't pass an honest decode.
-
-    Anything else (truncation at an intermediate length without EOS) is
-    artificial and rejected.
+    Path 2 — natural EOS termination: ``tokens[-1]`` is one of the
+    configured stop tokens AND its probability mass at the previous
+    position's softmax (``p_stop``) is at least ``MIN_EOS_PROBABILITY``.
+    The probability gate catches sampler-forced stops at near-zero
+    probability that wouldn't pass an honest decode. ``p_stop`` is
+    precomputed on GPU by ``verify_commitment_proofs`` and carried on
+    ``proof`` — there's no per-call softmax on a CPU logits tensor.
     """
-    from reliquary.constants import (
-        MAX_NEW_TOKENS_PROTOCOL_CAP,
-        MIN_EOS_PROBABILITY,
-    )
+    from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 
     tokens = commit["tokens"]
     rollout_meta = commit.get("rollout", {}) or {}
     completion_length = int(rollout_meta.get("completion_length", 0))
     prompt_length = int(rollout_meta.get("prompt_length", 0))
 
-    # Path 1: max-length termination — check total length, not completion
-    # alone (see docstring for the max_model_len rationale).
     if prompt_length + completion_length >= MAX_NEW_TOKENS_PROTOCOL_CAP:
         return True
 
-    # Path 2: natural EOS with non-trivial probability.
-    eos_ids: Any = None
-    gen_cfg = getattr(model, "generation_config", None) if model is not None else None
-    if gen_cfg is not None:
-        eos_ids = getattr(gen_cfg, "eos_token_id", None)
-    if eos_ids is None:
-        eos_ids = getattr(tokenizer, "eos_token_id", None)
+    eos_set = _eos_set_from_model(model, tokenizer)
     total_length = prompt_length + completion_length
-    if eos_ids is None:
-        logger.warning(
-            "termination_fail reason=no_eos_ids prompt_length=%d "
-            "completion_length=%d total=%d cap=%d",
-            prompt_length, completion_length, total_length,
-            MAX_NEW_TOKENS_PROTOCOL_CAP,
-        )
-        return False
-    if isinstance(eos_ids, int):
-        eos_ids = [eos_ids]
-    eos_set = {int(e) for e in eos_ids if e is not None}
     if not eos_set:
         logger.warning(
-            "termination_fail reason=empty_eos_set prompt_length=%d "
+            "termination_fail reason=no_eos_set prompt_length=%d "
             "completion_length=%d total=%d cap=%d",
             prompt_length, completion_length, total_length,
             MAX_NEW_TOKENS_PROTOCOL_CAP,
@@ -120,8 +144,16 @@ def verify_termination(
 
     last_tok = int(tokens[-1])
     in_eos = last_tok in eos_set
-    probs = torch.softmax(logits[-2].float(), dim=-1)
-    p_stop = float(sum(probs[eid].item() for eid in eos_set))
+    p_stop = proof.p_stop if proof is not None else None
+    if p_stop is None:
+        logger.warning(
+            "termination_fail reason=no_p_stop prompt_length=%d "
+            "completion_length=%d total=%d cap=%d last_token=%d",
+            prompt_length, completion_length, total_length,
+            MAX_NEW_TOKENS_PROTOCOL_CAP, last_tok,
+        )
+        return False
+
     ok = in_eos and p_stop >= MIN_EOS_PROBABILITY
     if not ok:
         logger.warning(
@@ -139,26 +171,41 @@ def verify_commitment_proofs(
     commit: dict,
     model: Any,
     window_randomness: str,
+    *,
+    tokenizer: Any = None,
 ) -> ProofResult:
-    """Hard check: verify GRAIL sketch commitments against model forward pass.
+    """Hard check: verify GRAIL sketch commitments against the model
+    forward pass, AND precompute the sparse values the behavioural
+    checks consume downstream.
 
-    Returns a ``ProofResult`` whose ``logits`` field carries the full-vocab
-    logits tensor from the validator's forward pass. Downstream behavioural
-    validators (logprob / distribution) read it without re-forwarding.
+    The body forward runs once on GPU. The lm_head runs once on GPU.
+    Everything the behavioural checks need (p_stop for termination, the
+    validator's logprob at K logprob-challenge positions, the chosen-
+    token probability under T_PROTO at every completion position) is
+    computed on GPU and transferred to CPU as a handful of floats —
+    NOT as a [seq_len, vocab] tensor (which would dominate the wall-clock
+    cost via PCIe). Only the per-position hidden states needed by the
+    sketch verification move to CPU as a [seq_len, hidden_dim] tensor,
+    which is two orders of magnitude smaller than the logits would be.
     """
-    from reliquary.protocol.crypto import indices_from_root
+    from reliquary.protocol.crypto import (
+        indices_from_root, indices_from_root_in_range,
+    )
     from reliquary.protocol.grail_verifier import GRAILVerifier
     from reliquary.shared.forward import forward_single_layer
     from reliquary.shared.hf_compat import resolve_hidden_size
 
     tokens = commit["tokens"]
     commitments = commit["commitments"]
+    rollout_meta = commit.get("rollout", {}) or {}
+    prompt_length = int(rollout_meta.get("prompt_length", 0))
+    completion_length = int(rollout_meta.get("completion_length", 0))
 
     seq_len = len(tokens)
 
     # SECURITY: Always use the validator's independently-computed randomness.
-    # Never trust the miner's claimed beacon — a miner who controls the
-    # randomness can predict which positions are challenged and only forge those.
+    # A miner who controls the randomness can predict which positions are
+    # challenged and only forge those.
     randomness = window_randomness
 
     hidden_dim = resolve_hidden_size(model)
@@ -170,14 +217,27 @@ def verify_commitment_proofs(
         tokens, randomness, seq_len, expected_challenges
     )
 
-    input_ids = torch.tensor([tokens], device=next(model.parameters()).device)
+    device = next(model.parameters()).device
+    input_ids = torch.tensor([tokens], device=device)
     with torch.no_grad():
-        hidden_states, logits_batch = forward_single_layer(
+        hidden_states_gpu, logits_batch = forward_single_layer(
             model, input_ids, None, LAYER_INDEX
         )
 
-    hidden_states = hidden_states[0]  # Remove batch dim: [seq_len, hidden_dim]
-    logits = logits_batch[0].detach().to("cpu")
+    hidden_states_gpu = hidden_states_gpu[0]  # [seq_len, hidden_dim]
+    logits_gpu = logits_batch[0]  # [seq_len, vocab_size], kept on GPU
+
+    p_stop = _gpu_p_stop(
+        logits_gpu, seq_len, _eos_set_from_model(model, tokenizer), device,
+    )
+    challenge_lp_indices, challenge_lp_values = _gpu_challenge_logprobs(
+        logits_gpu, tokens, prompt_length, completion_length, randomness, device,
+    )
+    completion_chosen_probs = _gpu_completion_chosen_probs(
+        logits_gpu, tokens, prompt_length, completion_length, seq_len, device,
+    )
+
+    hidden_states = hidden_states_gpu.detach().to("cpu")
 
     passed = 0
     checked = 0
@@ -201,9 +261,112 @@ def verify_commitment_proofs(
     # A miner cannot benefit from having fewer positions verified.
     all_passed = passed == checked and checked >= expected_challenges
     return ProofResult(
-        all_passed=all_passed, passed=passed, checked=checked, logits=logits,
+        all_passed=all_passed,
+        passed=passed,
+        checked=checked,
         sketch_diff_max=sketch_diff_max,
+        has_sparse_outputs=True,
+        p_stop=p_stop,
+        challenge_lp_indices=challenge_lp_indices,
+        challenge_lp_values=challenge_lp_values,
+        completion_chosen_probs=completion_chosen_probs,
     )
+
+
+def _gpu_p_stop(
+    logits_gpu: torch.Tensor,
+    seq_len: int,
+    eos_set: set[int],
+    device: Any,
+) -> float | None:
+    if seq_len < 2 or not eos_set:
+        return None
+    probs_last = torch.softmax(logits_gpu[seq_len - 2].float(), dim=-1)
+    eos_idx_tensor = torch.tensor(
+        sorted(eos_set), device=device, dtype=torch.long,
+    )
+    return float(probs_last[eos_idx_tensor].sum().item())
+
+
+def _gpu_challenge_logprobs(
+    logits_gpu: torch.Tensor,
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    randomness: str,
+    device: Any,
+) -> tuple[list[int], list[float]]:
+    """Recompute the validator's log-prob at each logprob-challenge index.
+
+    Returns ``(indices, values)`` of equal length. Both empty when the
+    completion is too short to sample CHALLENGE_K positions, when the
+    sampler returns fewer than K indices (defensive), or when any
+    sampled position would read out-of-range — the logprob check treats
+    that as a fail at the call site.
+    """
+    from reliquary.protocol.crypto import indices_from_root_in_range
+
+    if completion_length < CHALLENGE_K:
+        return [], []
+    challenge_idxs = indices_from_root_in_range(
+        tokens, randomness,
+        prompt_length, prompt_length + completion_length,
+        CHALLENGE_K,
+    )
+    if len(challenge_idxs) != CHALLENGE_K:
+        return [], []
+
+    positions = [i - 1 for i in challenge_idxs]
+    seq_len = logits_gpu.size(0)
+    if any(p < 0 or p >= seq_len for p in positions):
+        return [], []
+
+    pos_tensor = torch.tensor(positions, device=device, dtype=torch.long)
+    tok_tensor = torch.tensor(
+        [tokens[i] for i in challenge_idxs], device=device, dtype=torch.long,
+    )
+    selected = logits_gpu[pos_tensor].float()
+    log_probs = torch.log_softmax(selected, dim=-1)
+    chosen = log_probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
+    return list(challenge_idxs), chosen.tolist()
+
+
+def _gpu_completion_chosen_probs(
+    logits_gpu: torch.Tensor,
+    tokens: list[int],
+    prompt_length: int,
+    completion_length: int,
+    seq_len: int,
+    device: Any,
+) -> list[float]:
+    """Compute chosen-token probability under T_PROTO at each valid
+    completion-producing position, on GPU, vectorised.
+
+    Mirrors the per-step loop in the legacy CPU implementation: for each
+    ``t in [prompt_length, prompt_length + completion_length)``, skip
+    when ``t == 0`` or ``t - 1`` lies outside ``logits``'s range or
+    ``t`` lies outside ``tokens``. The remaining (t-1, tokens[t]) pairs
+    are gathered in a single softmax + gather pass and shipped to CPU
+    as one Python float per surviving step.
+    """
+    if completion_length <= 0:
+        return []
+    t_start = prompt_length
+    t_end = min(prompt_length + completion_length, len(tokens), seq_len + 1)
+    valid_t = [t for t in range(t_start, t_end) if t > 0 and t - 1 < seq_len]
+    if not valid_t:
+        return []
+
+    pos_tensor = torch.tensor(
+        [t - 1 for t in valid_t], device=device, dtype=torch.long,
+    )
+    tok_tensor = torch.tensor(
+        [tokens[t] for t in valid_t], device=device, dtype=torch.long,
+    )
+    scaled = logits_gpu[pos_tensor].float() / float(T_PROTO)
+    probs = scaled.softmax(dim=-1)
+    chosen = probs.gather(1, tok_tensor.unsqueeze(1)).squeeze(1)
+    return chosen.tolist()
 
 
 def verify_reward_claim(
@@ -269,38 +432,41 @@ def verify_logprobs_claim(
     prompt_length: int,
     completion_length: int,
     claimed_logprobs: list[float],
-    logits: torch.Tensor,
-    challenge_randomness: str,
+    proof: "ProofResult",
 ) -> tuple[bool, float]:
     """Hard check: validate miner-claimed per-token logprobs against the
-    validator's re-computation on K=CHALLENGE_K challenged positions.
+    validator's precomputed log-probs at K=CHALLENGE_K challenged
+    positions.
 
-    For each challenge position ``i``, compute the validator's logprob of
-    ``tokens[i]`` from ``log_softmax(logits[i - 1])``, then
-    ``dev_i = exp(|model_lp - miner_lp|) - 1``. The **median** deviation
-    across the K positions is compared against ``LOGPROB_IS_EPS``.
+    For each challenge position ``i`` carried on ``proof``, compute
+    ``dev_i = exp(|validator_lp - miner_lp|) - 1`` and compare the
+    **median** across the K positions against ``LOGPROB_IS_EPS``.
 
     Median (not mean) is robust to the bf16 outliers honest miners see
-    on cross-GPU runs. Threshold 0.10 was calibrated at 0 % FP on ~430k
-    honest trials in the original GRAIL repo.
+    on cross-GPU runs.
 
     ``claimed_logprobs`` accepts two layouts:
-    - Full-sequence (length == len(tokens)): prompt positions are
-      ignored, completion positions read directly by absolute index.
+    - Full-sequence (length == len(tokens)): prompt positions ignored,
+      completion positions read directly by absolute index.
     - Completion-only (length == completion_length): position-j entry
       corresponds to absolute index ``prompt_length + j``.
 
     Returns ``(is_valid, median_dev)``. ``median_dev`` is ``inf`` when
     the check cannot be executed (completion too short, malformed
-    payload, out-of-range index).
+    payload, or the proof carries no challenge values).
     """
     import math
     from statistics import median
 
-    from reliquary.constants import CHALLENGE_K, LOGPROB_IS_EPS
-    from reliquary.protocol.crypto import indices_from_root_in_range
+    from reliquary.constants import LOGPROB_IS_EPS
 
     if completion_length < CHALLENGE_K:
+        return False, float("inf")
+    if not proof.challenge_lp_indices or not proof.challenge_lp_values:
+        return False, float("inf")
+    if len(proof.challenge_lp_indices) != CHALLENGE_K:
+        return False, float("inf")
+    if len(proof.challenge_lp_values) != CHALLENGE_K:
         return False, float("inf")
 
     if len(claimed_logprobs) == len(tokens):
@@ -312,24 +478,11 @@ def verify_logprobs_claim(
     else:
         return False, float("inf")
 
-    challenge_idxs = indices_from_root_in_range(
-        tokens,
-        challenge_randomness,
-        prompt_length,
-        prompt_length + completion_length,
-        CHALLENGE_K,
-    )
-    if len(challenge_idxs) != CHALLENGE_K:
-        return False, float("inf")
-
     devs: list[float] = []
-    for abs_idx in challenge_idxs:
-        pos = abs_idx - 1
-        if pos < 0 or pos >= logits.size(0):
-            return False, float("inf")
-        dist = torch.log_softmax(logits[pos].float(), dim=-1)
-        model_lp = float(dist[tokens[abs_idx]].item())
-        devs.append(math.exp(abs(model_lp - miner_lp_at(abs_idx))) - 1.0)
+    for abs_idx, model_lp in zip(
+        proof.challenge_lp_indices, proof.challenge_lp_values
+    ):
+        devs.append(math.exp(abs(float(model_lp) - miner_lp_at(abs_idx))) - 1.0)
 
     median_dev = float(median(devs))
     return median_dev <= LOGPROB_IS_EPS, median_dev
@@ -339,24 +492,21 @@ def evaluate_token_distribution(
     tokens: list[int],
     prompt_length: int,
     completion_length: int,
-    logits: torch.Tensor,
-    temperature: float,
+    proof: "ProofResult",
 ) -> tuple[bool | None, dict]:
     """Soft check: detect suspicious chosen-token probability distributions.
 
-    For each completion step ``t``, apply ``temperature`` to
-    ``logits[t - 1]``, softmax, and read the probability the validator's
-    model would have assigned to the token the miner actually emitted
-    at position ``t``. Collect those probabilities and compute summary
-    stats.
+    Reads ``proof.completion_chosen_probs`` — the validator's per-step
+    probability of the token the miner emitted, computed on GPU during
+    the forward pass — and compares summary stats against the
+    SAMPLING_* thresholds.
 
     Returns ``(is_valid, metrics)``:
       - ``True``   — distribution is consistent with sampling from the
-                     validator's model at ``temperature``
-      - ``False``  — suspicious (median or q10 collapsed below threshold
-                     → miner likely sampled from a different model)
+                     validator's model at T_PROTO
+      - ``False``  — suspicious (median or q10 collapsed below threshold)
       - ``None``   — insufficient steps (< SAMPLING_MIN_STEPS) — caller
-                     defaults to accept (not enough signal)
+                     defaults to accept
 
     ``metrics`` carries ``mean``, ``median``, ``q10``, ``low_frac``,
     ``high_frac`` regardless of the decision (empty dict only when
@@ -374,14 +524,7 @@ def evaluate_token_distribution(
 
     if completion_length < SAMPLING_MIN_STEPS:
         return None, {}
-
-    probs: list[float] = []
-    for t in range(prompt_length, prompt_length + completion_length):
-        if t == 0 or t - 1 >= logits.size(0) or t >= len(tokens):
-            continue
-        step = (logits[t - 1].float() / float(temperature)).softmax(dim=-1)
-        probs.append(float(step[tokens[t]].item()))
-
+    probs = proof.completion_chosen_probs
     if len(probs) < SAMPLING_MIN_STEPS:
         return None, {}
 

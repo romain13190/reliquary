@@ -566,11 +566,12 @@ class GrpoWindowBatcher:
                 )
 
             # Termination check: rollout must end with EOS at p(EOS) >= threshold.
-            # Reuses cached logits from the GRAIL forward — zero extra compute.
-            # Skipped when grail stub returns empty logits (legacy test fixtures).
-            if proof.logits.numel() > 0:
+            # Reads precomputed p_stop on ``proof`` — no logits round-trip.
+            # Skipped when the stub didn't populate sparse outputs (legacy
+            # test fixtures that opted out of behavioural enforcement).
+            if proof.has_sparse_outputs:
                 if not verify_termination(
-                    rollout.commit, self.tokenizer, proof.logits, self.model
+                    rollout.commit, self.tokenizer, proof, self.model
                 ):
                     truncated_count += 1
                     if truncated_count > MAX_TRUNCATED_PER_SUBMISSION:
@@ -579,15 +580,9 @@ class GrpoWindowBatcher:
                             hotkey=hk, prompt_idx=pi,
                             sketch_diff_max=sketch_diff_max,
                         )
-                    # Skip the per-rollout behavioural checks below (logprobs,
-                    # distribution) for this truncated rollout — they assume a
-                    # completed sequence. The reward is still counted in the
-                    # group's σ for the out_of_zone gate.
                     continue
 
-            # Behavioural checks (use cached logits from the GRAIL forward pass).
-            # Skip gracefully if the logits tensor is empty (legacy stubs in tests).
-            if proof.logits.numel() == 0:
+            if not proof.has_sparse_outputs:
                 continue
 
             rollout_dict = rollout.commit.get("rollout", {}) or {}
@@ -600,8 +595,7 @@ class GrpoWindowBatcher:
                 prompt_length=prompt_len,
                 completion_length=completion_len,
                 claimed_logprobs=claimed_lp,
-                logits=proof.logits,
-                challenge_randomness=self.randomness,
+                proof=proof,
             )
             if lp_dev is not None and lp_dev != float("inf"):
                 if lp_dev_max is None or lp_dev > lp_dev_max:
@@ -618,13 +612,11 @@ class GrpoWindowBatcher:
                     lp_dev_max=lp_dev_max,
                 )
 
-            from reliquary.constants import T_PROTO
             dist_ok, dist_metrics = evaluate_token_distribution(
                 tokens=rollout.commit["tokens"],
                 prompt_length=prompt_len,
                 completion_length=completion_len,
-                logits=proof.logits,
-                temperature=T_PROTO,
+                proof=proof,
             )
             if dist_metrics and "q10" in dist_metrics:
                 q10 = float(dist_metrics["q10"])

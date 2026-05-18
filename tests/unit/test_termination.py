@@ -4,13 +4,19 @@ The miner must end every rollout with the tokenizer's EOS token, AND the
 model must have assigned probability >= MIN_EOS_PROBABILITY to EOS at the
 position that produced it. No max-tokens-fallback branch — see spec for
 RL-context rationale.
+
+After the keep-logits-on-GPU refactor, ``verify_termination`` reads a
+precomputed ``p_stop`` carried on ``ProofResult`` rather than slicing a
+CPU logits tensor itself. The fake-logits helper below computes the
+same value test-side so each test pins the contract without having to
+recompute the softmax inside the verifier.
 """
 
 import pytest
 import torch
 
 from reliquary.constants import MIN_EOS_PROBABILITY
-from reliquary.validator.verifier import verify_termination
+from reliquary.validator.verifier import ProofResult, verify_termination
 
 
 class _FakeTokenizer:
@@ -29,44 +35,66 @@ def _make_logits(seq_len: int, vocab_size: int = 100, eos_logit: float = 5.0):
     return logits
 
 
+def _proof_from_logits(logits: torch.Tensor, eos_token_id: int) -> ProofResult:
+    """Build a ProofResult whose ``p_stop`` mirrors what
+    ``verify_commitment_proofs`` would have precomputed on GPU from the
+    given fake logits — softmax of the second-to-last row, mass at eos."""
+    if logits.size(0) < 2:
+        p_stop = None
+    else:
+        probs = torch.softmax(logits[-2].float(), dim=-1)
+        p_stop = float(probs[eos_token_id].item())
+    return ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        p_stop=p_stop,
+    )
+
+
 def test_accepts_when_ends_with_eos_at_high_prob():
     tokens = [10, 20, 30, 99]  # last token = EOS
     logits = _make_logits(seq_len=4, eos_logit=5.0)  # p(EOS) ~ 0.97
-    assert verify_termination(_commit(tokens), _FakeTokenizer(), logits) is True
+    proof = _proof_from_logits(logits, eos_token_id=99)
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is True
 
 
 def test_rejects_when_does_not_end_with_eos():
     tokens = [10, 20, 30, 40]  # last token != EOS
     logits = _make_logits(seq_len=4)
-    assert verify_termination(_commit(tokens), _FakeTokenizer(), logits) is False
+    proof = _proof_from_logits(logits, eos_token_id=99)
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is False
 
 
 def test_rejects_when_eos_prob_below_threshold():
     tokens = [10, 20, 30, 99]
-    # logits where EOS is wildly improbable: id 99 gets large negative logit
     logits = torch.zeros(4, 100)
-    logits[:, 99] = -10.0  # p(EOS) ~ 4.5e-5, well below 0.02
-    assert verify_termination(_commit(tokens), _FakeTokenizer(), logits) is False
+    logits[:, 99] = -10.0  # p(EOS) ~ 4.5e-5, well below MIN_EOS_PROBABILITY
+    proof = _proof_from_logits(logits, eos_token_id=99)
+    assert proof.p_stop < MIN_EOS_PROBABILITY
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is False
 
 
 def test_rejects_when_tokenizer_has_no_eos():
     tokens = [10, 20, 30, 99]
     logits = _make_logits(seq_len=4)
+    proof = _proof_from_logits(logits, eos_token_id=99)
 
     class NoEosTokenizer:
         eos_token_id = None
 
-    assert verify_termination(_commit(tokens), NoEosTokenizer(), logits) is False
+    assert verify_termination(_commit(tokens), NoEosTokenizer(), proof) is False
 
 
-def test_uses_logits_at_second_to_last_position():
-    """The probability is read from logits[-2] (the position that PRODUCED tokens[-1])."""
+def test_uses_p_stop_at_second_to_last_position():
+    """p_stop is the EOS probability at logits[seq_len - 2] (the position
+    that PRODUCED tokens[-1]). The helper above mirrors that contract;
+    here we just confirm a strong probability there passes."""
     tokens = [10, 20, 30, 99]
-    # Make EOS unlikely everywhere EXCEPT at position -2
     logits = torch.zeros(4, 100)
     logits[:, 99] = -10.0
     logits[-2, 99] = 5.0  # p(EOS|context-at-pos-2) ~ 0.97
-    assert verify_termination(_commit(tokens), _FakeTokenizer(), logits) is True
+    proof = _proof_from_logits(logits, eos_token_id=99)
+    assert verify_termination(_commit(tokens), _FakeTokenizer(), proof) is True
 
 
 # ---------------------------------------------------------------------
@@ -90,21 +118,22 @@ def _commit_with_lengths(tokens: list[int], prompt_length: int, completion_lengt
 
 def test_path1_accepts_max_model_len_bound_termination():
     """Miner with max_model_len=cap and prompt_length>0 hits prompt+compl=cap.
-    Last token is not EOS (model drifted), p_stop is ~0 — Path 2 fails — but
-    Path 1 must accept on total-length grounds."""
+    Last token is not EOS, p_stop is ~0 — Path 2 fails — but Path 1 must
+    accept on total-length grounds, regardless of what's in the proof."""
     from reliquary.constants import MAX_NEW_TOKENS_PROTOCOL_CAP
 
     prompt_length = 33
-    completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP - prompt_length  # exactly fills the cap
+    completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP - prompt_length
     seq_len = prompt_length + completion_length
-    # Token 42 is not EOS (eos_token_id=99 in _FakeTokenizer)
     tokens = [42] * seq_len
-    # Logits assign vanishing probability to EOS — Path 2 would reject
-    logits = torch.zeros(seq_len, 100)
-    logits[:, 99] = -20.0
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        p_stop=1e-10,  # Path 2 would fail; Path 1 must short-circuit before
+    )
     assert verify_termination(
         _commit_with_lengths(tokens, prompt_length, completion_length),
-        _FakeTokenizer(), logits,
+        _FakeTokenizer(), proof,
     ) is True
 
 
@@ -117,11 +146,14 @@ def test_path1_accepts_when_completion_alone_meets_cap():
     completion_length = MAX_NEW_TOKENS_PROTOCOL_CAP
     seq_len = completion_length
     tokens = [42] * seq_len
-    logits = torch.zeros(seq_len, 100)
-    logits[:, 99] = -20.0  # Path 2 fails
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        p_stop=1e-10,
+    )
     assert verify_termination(
         _commit_with_lengths(tokens, prompt_length, completion_length),
-        _FakeTokenizer(), logits,
+        _FakeTokenizer(), proof,
     ) is True
 
 
@@ -134,10 +166,13 @@ def test_path1_rejects_short_truncation_below_cap():
     completion_length = 100  # total = 133, way below the cap
     seq_len = prompt_length + completion_length
     tokens = [42] * seq_len  # last token NOT EOS
-    logits = torch.zeros(seq_len, 100)
-    logits[:, 99] = -20.0  # p_stop ~ 0
+    proof = ProofResult(
+        all_passed=True, passed=1, checked=1,
+        has_sparse_outputs=True,
+        p_stop=1e-10,
+    )
     assert prompt_length + completion_length < MAX_NEW_TOKENS_PROTOCOL_CAP
     assert verify_termination(
         _commit_with_lengths(tokens, prompt_length, completion_length),
-        _FakeTokenizer(), logits,
+        _FakeTokenizer(), proof,
     ) is False
